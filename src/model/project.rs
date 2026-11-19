@@ -876,6 +876,8 @@ pub struct Project {
     pub active_pattern: usize,
     pub song_mode: bool,
     pub song_sections: Vec<SongSection>,
+    pub party_mode: bool,
+    pub party_seed: u32,
 }
 
 impl Default for Project {
@@ -1006,6 +1008,8 @@ impl Project {
                 bass_drop: false,
                 fill: false,
             }],
+            party_mode: false,
+            party_seed: 0xF00D_5EED,
         };
 
         match preset {

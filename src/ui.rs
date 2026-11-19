@@ -11,6 +11,7 @@ pub struct FunKeySynthApp {
     status: String,
     page_view: PageView,
     selected_step: usize,
+    groove: BuiltInGroove,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum PageView {
@@ -21,6 +22,42 @@ enum PageView {
     Global,
     Sound,
     Effects,
+    Grooves,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum BuiltInGroove {
+    DeepHouse,
+    ChicagoHouse,
+    ElectroSoul,
+    DubPads,
+    PostalService,
+    MelodicProgressive,
+    SoulfulRhodes,
+    SunriseEuphoria,
+}
+impl BuiltInGroove {
+    const ALL: [Self; 8] = [
+        Self::DeepHouse,
+        Self::ChicagoHouse,
+        Self::ElectroSoul,
+        Self::DubPads,
+        Self::PostalService,
+        Self::MelodicProgressive,
+        Self::SoulfulRhodes,
+        Self::SunriseEuphoria,
+    ];
+    const fn name(self) -> &'static str {
+        match self {
+            Self::DeepHouse => "Deep House • Am9",
+            Self::ChicagoHouse => "Chicago House • Gm9",
+            Self::ElectroSoul => "Electro Soul • Gm11",
+            Self::DubPads => "Hypnotic Dub • Dm11",
+            Self::PostalService => "Postal Service • Fm9",
+            Self::MelodicProgressive => "Melodic Progressive • Bbm9",
+            Self::SoulfulRhodes => "Soulful Rhodes • Em9",
+            Self::SunriseEuphoria => "Sunrise Euphoria • F#m9",
+        }
+    }
 }
 impl FunKeySynthApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
@@ -31,6 +68,7 @@ impl FunKeySynthApp {
             status: String::new(),
             page_view: PageView::Sequencer,
             selected_step: 0,
+            groove: BuiltInGroove::DeepHouse,
         };
         app.style();
         app
@@ -362,6 +400,10 @@ impl FunKeySynthApp {
             &mut p.song_mode,
             "Play arrangement instead of looping the selected pattern",
         );
+        ui.checkbox(
+            &mut p.party_mode,
+            "Party Mode: generate scale-safe bass, pad, lead, and drum variations during playback",
+        );
         if ui
             .button("✨ Auto make party song from this pattern")
             .clicked()
@@ -550,6 +592,222 @@ impl FunKeySynthApp {
             },
         ];
         p.song_mode = true;
+    }
+
+    fn load_builtin_groove(p: &mut Project, groove: BuiltInGroove, target: usize) {
+        use crate::model::{ChordType, MelodicStep, Pattern, Scale, StepCount};
+        let (name, root, scale, roots, chords) = match groove {
+            BuiltInGroove::DeepHouse => (
+                "Deep House",
+                9,
+                Scale::Minor,
+                [0, 8, 5, 7],
+                [
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Minor7,
+                    ChordType::Minor7,
+                ],
+            ),
+            BuiltInGroove::ChicagoHouse => (
+                "Chicago House",
+                7,
+                Scale::Minor,
+                [0, 5, 8, 7],
+                [
+                    ChordType::Minor7,
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Major7,
+                ],
+            ),
+            BuiltInGroove::ElectroSoul => (
+                "Electro Soul",
+                7,
+                Scale::Dorian,
+                [0, 5, 8, 7],
+                [
+                    ChordType::Minor7,
+                    ChordType::Major,
+                    ChordType::Major7,
+                    ChordType::Major7,
+                ],
+            ),
+            BuiltInGroove::DubPads => (
+                "Hypnotic Dub",
+                2,
+                Scale::Dorian,
+                [0, 0, 8, 10],
+                [
+                    ChordType::Minor7,
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Minor7,
+                ],
+            ),
+            BuiltInGroove::PostalService => (
+                "Postal Service",
+                5,
+                Scale::Minor,
+                [0, 8, 3, 10],
+                [
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Major,
+                    ChordType::Major7,
+                ],
+            ),
+            BuiltInGroove::MelodicProgressive => (
+                "Melodic Progressive",
+                10,
+                Scale::Minor,
+                [0, 8, 3, 10],
+                [
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Major7,
+                    ChordType::Major,
+                ],
+            ),
+            BuiltInGroove::SoulfulRhodes => (
+                "Soulful Rhodes",
+                4,
+                Scale::Dorian,
+                [0, 8, 5, 7],
+                [
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Minor7,
+                    ChordType::Major,
+                ],
+            ),
+            BuiltInGroove::SunriseEuphoria => (
+                "Sunrise Euphoria",
+                6,
+                Scale::Minor,
+                [0, 8, 3, 10],
+                [
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Major,
+                    ChordType::Major,
+                ],
+            ),
+        };
+        p.root_note = root;
+        p.scale = scale;
+        let mut pat = Pattern::named(name);
+        for seq in [
+            &mut pat.moog,
+            &mut pat.moog_pad,
+            &mut pat.monologue,
+            &mut pat.tb303,
+            &mut pat.sampler,
+        ] {
+            seq.step_count = StepCount::Steps64;
+        }
+        pat.drums.set_all_step_counts(StepCount::Steps64, false);
+        for i in 0..64 {
+            let bar = i / 16;
+            let beat = i % 16;
+            let chord_root = roots[bar % 4];
+            let bass = 36 + root + chord_root;
+            let bass_hit = match groove {
+                BuiltInGroove::DeepHouse => matches!(beat, 0 | 3 | 6 | 8 | 10 | 14),
+                BuiltInGroove::ChicagoHouse => matches!(beat, 0 | 4 | 7 | 8 | 12 | 15),
+                BuiltInGroove::ElectroSoul => matches!(beat, 0 | 3 | 6 | 8 | 11 | 14),
+                BuiltInGroove::DubPads => matches!(beat, 0 | 6 | 8 | 14),
+                _ => matches!(beat, 0 | 3 | 6 | 8 | 10 | 14),
+            };
+            if bass_hit {
+                pat.moog.steps[i] = MelodicStep {
+                    active: true,
+                    note: (bass
+                        + if matches!(beat, 3 | 7 | 11 | 15) {
+                            7
+                        } else {
+                            0
+                        }) as u8,
+                    velocity: if beat % 4 == 0 { 0.9 } else { 0.75 },
+                    gate: 0.72,
+                    accent: beat % 4 == 0,
+                    ..Default::default()
+                };
+            }
+            if beat == 0 {
+                pat.moog_pad.steps[i] = MelodicStep {
+                    active: true,
+                    note: (48 + root + chord_root) as u8,
+                    velocity: 0.74,
+                    gate: 1.0,
+                    chord: chords[bar % 4],
+                    ..Default::default()
+                };
+            }
+            if matches!(beat, 2 | 6 | 10 | 14) {
+                let arp = [0, 3, 7, 10][(beat / 4) % 4];
+                pat.monologue.steps[i] = MelodicStep {
+                    active: true,
+                    note: (60 + root + chord_root + arp) as u8,
+                    velocity: 0.64,
+                    gate: 0.44,
+                    ..Default::default()
+                };
+            }
+            if matches!(beat, 3 | 7 | 11 | 14) {
+                pat.tb303.steps[i] = MelodicStep {
+                    active: true,
+                    note: (36 + root + chord_root + if beat == 14 { 7 } else { 0 }) as u8,
+                    velocity: 0.76,
+                    gate: 0.5,
+                    accent: beat == 14,
+                    slide: beat == 7,
+                    ..Default::default()
+                };
+            }
+            if beat == 8 && bar % 2 == 1 {
+                pat.sampler.steps[i] = MelodicStep {
+                    active: true,
+                    note: (60 + root + chord_root) as u8,
+                    velocity: 0.58,
+                    gate: 0.7,
+                    ..Default::default()
+                };
+            }
+            let kick = match groove {
+                BuiltInGroove::ChicagoHouse => matches!(beat, 0 | 4 | 8 | 12 | 14),
+                BuiltInGroove::DubPads => matches!(beat, 0 | 8),
+                _ => matches!(beat, 0 | 4 | 8 | 12),
+            };
+            if kick {
+                pat.drums.lanes[0].steps[i].active = true;
+                pat.drums.lanes[0].steps[i].velocity = if beat % 8 == 0 { 0.98 } else { 0.82 };
+            }
+            if matches!(beat, 4 | 12) {
+                pat.drums.lanes[1].steps[i].active = true;
+                pat.drums.lanes[1].steps[i].velocity = 0.85;
+            }
+            if groove == BuiltInGroove::ElectroSoul && beat == 12 {
+                pat.drums.lanes[2].steps[i].active = true;
+            }
+            if beat % 2 == 0 {
+                pat.drums.lanes[4].steps[i].active = true;
+                pat.drums.lanes[4].steps[i].velocity = if beat % 4 == 2 { 0.52 } else { 0.72 };
+            }
+            if matches!(beat, 6 | 14) && groove != BuiltInGroove::DubPads {
+                pat.drums.lanes[5].steps[i].active = true;
+            }
+            if matches!(beat, 3 | 11) && groove == BuiltInGroove::ChicagoHouse {
+                pat.drums.lanes[3].steps[i].active = true;
+            }
+            if i == 0 || i == 32 {
+                pat.drums.lanes[7].steps[i].active = true;
+            }
+        }
+        pat.name = name.into();
+        pat.normalize();
+        let target = target.min(p.patterns.len() - 1);
+        p.patterns[target] = pat;
     }
 
     fn mixer_panel(ui: &mut egui::Ui, p: &mut Project) {
@@ -892,6 +1150,16 @@ impl eframe::App for FunKeySynthApp {
                 {
                     p.song_mode = !p.song_mode;
                 }
+                if ui
+                    .button(if p.party_mode {
+                        "PARTY ON"
+                    } else {
+                        "PARTY MODE"
+                    })
+                    .clicked()
+                {
+                    p.party_mode = !p.party_mode;
+                }
                 ui.label("BPM");
                 ui.add(
                     egui::DragValue::new(&mut p.bpm)
@@ -938,6 +1206,7 @@ impl eframe::App for FunKeySynthApp {
                     (PageView::Sound, "SOUND"),
                     (PageView::Effects, "EFFECTS"),
                     (PageView::Global, "GLOBAL"),
+                    (PageView::Grooves, "GROOVE LIBRARY"),
                 ] {
                     if ui.selectable_label(self.page_view == view, label).clicked() {
                         self.page_view = view;
@@ -989,6 +1258,14 @@ impl eframe::App for FunKeySynthApp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 Self::effects_panel(ui, &mut p);
+            } else if self.page_view == PageView::Grooves {
+                let mut p=self.engine.project.lock().unwrap_or_else(|e|e.into_inner());
+                ui.heading("PREBUILT GROOVES");ui.label("Each groove loads four bars of bass, chords/pads, an arp, 303 accents, and a matching drum line.");
+                egui::ComboBox::from_id_salt("builtin_groove").selected_text(self.groove.name()).show_ui(ui,|ui|for groove in BuiltInGroove::ALL{ui.selectable_value(&mut self.groove,groove,groove.name());});
+                ui.separator();ui.label(format!("Target pattern: {}",p.patterns[p.active_pattern].name));
+                if ui.button("Load groove into selected pattern").clicked(){let target=p.active_pattern;Self::load_builtin_groove(&mut p,self.groove,target);self.status=format!("Loaded {}",self.groove.name());}
+                if ui.button("Add groove in an empty pattern bank").clicked(){if let Some(target)=(0..p.patterns.len()).find(|i|*i!=p.active_pattern&&!Self::pattern_has_content(&p.patterns[*i])){Self::load_builtin_groove(&mut p,self.groove,target);p.active_pattern=target;p.song_sections.push(crate::model::SongSection{name:self.groove.name().to_string(),pattern:target,bars:4,bass_drop:false,fill:false});self.status=format!("Added {} to Bank {}",self.groove.name(),target+1);}else{self.status="No empty pattern bank is available".into();}}
+                ui.separator();ui.checkbox(&mut p.party_mode,"Enable Party Mode");ui.label("Party Mode keeps kick and backbeat anchors, then adds scale-safe note variations, pads, syncopation, and fills as the song plays.");
             } else {
                 ui.horizontal(|ui| {
                     ui.heading(self.track.name());

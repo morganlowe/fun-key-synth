@@ -8,6 +8,8 @@ Fun Key Synth is a Linux desktop groovebox written in Rust. It combines analog-s
 - Monologue-style and TB-303-style synth voices, plus 808/909 drums and an SK-1-inspired sampler
 - 16, 32, 48, and 64-step patterns with per-step note, velocity, gate, chord, accent, and slide controls
 - Song arranger with pattern sections, bass drops, fills, and an automatic party-song arrangement
+- Built-in chord, pad, bass, arp, and drum grooves across eight styles
+- Party Mode generates scale-safe variations live while retaining kick and backbeat anchors
 - Global filter, tempo-synced delay, reverb, chop, repeat, glitch, circuit bend, and output waveform display
 - JSON project save and load
 

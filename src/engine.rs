@@ -10,6 +10,151 @@ pub struct OutputScope {
     samples: Box<[AtomicU32]>,
     cursor: AtomicUsize,
 }
+
+fn party_random(seed: u32, step: usize, lane: u32) -> f32 {
+    let mut x = seed ^ (step as u32).wrapping_mul(0x9E37_79B9) ^ lane.wrapping_mul(0x85EB_CA6B);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x as f32 / u32::MAX as f32
+}
+
+fn party_note(
+    root: u8,
+    scale: crate::model::Scale,
+    base: u8,
+    progression: i16,
+    degree: usize,
+) -> u8 {
+    let ints = scale.intervals();
+    let n = base as i16 + root as i16 + progression + ints[degree % ints.len()] as i16;
+    n.clamp(12, 108) as u8
+}
+
+fn party_melodic_step(
+    seq: &crate::model::MelodicTrackSeq,
+    pos: usize,
+    global: usize,
+    lane: u32,
+    root: u8,
+    scale: crate::model::Scale,
+    seed: u32,
+) -> crate::model::MelodicStep {
+    use crate::model::ChordType;
+    let len = seq.step_count.as_usize();
+    let phase = pos % 16;
+    let bar = (global / 16) % 4;
+    let progression = [0, 7, 5, 9][(global / 64) % 4];
+    let mut step = seq.steps[pos % len];
+    let has_pattern = seq.steps[..len].iter().any(|s| s.active);
+    if step.active {
+        if lane == 1 {
+            if step.chord == ChordType::Single {
+                step.chord = [
+                    ChordType::Minor7,
+                    ChordType::Major7,
+                    ChordType::Minor7,
+                    ChordType::Minor7,
+                ][bar];
+            }
+        } else if party_random(seed, global, lane) < 0.16 {
+            step.note = party_note(
+                root,
+                scale,
+                if lane == 2 { 60 } else { 36 },
+                progression,
+                (party_random(seed, global, lane + 19) * 7.0) as usize,
+            );
+        }
+        return step;
+    }
+    let hit = match lane {
+        0 => {
+            matches!(phase, 0 | 3 | 6 | 8 | 10 | 14)
+                && (!has_pattern || party_random(seed, global, lane) < 0.20)
+        }
+        1 => phase == 0 && (!has_pattern || party_random(seed, global, lane) < 0.32),
+        2 => {
+            matches!(phase, 2 | 6 | 10 | 14)
+                && (!has_pattern || party_random(seed, global, lane) < 0.72)
+        }
+        3 => {
+            matches!(phase, 0 | 3 | 7 | 10 | 14)
+                && (!has_pattern || party_random(seed, global, lane) < 0.62)
+        }
+        _ => matches!(phase, 0 | 8) && (!has_pattern || party_random(seed, global, lane) < 0.28),
+    };
+    if !hit {
+        return step;
+    }
+    let base = match lane {
+        0 | 3 => 36,
+        1 => 48,
+        2 => 60,
+        _ => 60,
+    };
+    let degree = match lane {
+        0 => {
+            if matches!(phase, 3 | 10 | 14) {
+                2
+            } else {
+                0
+            }
+        }
+        1 => 0,
+        2 => (phase / 2) % 7,
+        3 => (phase / 3) % 5,
+        _ => 3,
+    };
+    step.active = true;
+    step.note = party_note(root, scale, base, progression, degree);
+    step.velocity = if phase % 4 == 0 { 0.86 } else { 0.68 };
+    step.gate = if lane == 1 { 1.0 } else { 0.62 };
+    step.accent = phase % 4 == 0;
+    step.slide = lane == 3 && phase % 4 == 3;
+    if lane == 1 {
+        step.chord = [
+            ChordType::Minor7,
+            ChordType::Major7,
+            ChordType::Minor7,
+            ChordType::Minor7,
+        ][bar];
+    }
+    step
+}
+
+fn party_drum_step(
+    lane: usize,
+    seq: &crate::model::DrumLane,
+    pos: usize,
+    global: usize,
+    seed: u32,
+) -> crate::model::DrumStep {
+    let mut step = seq.steps[pos % seq.step_count.as_usize()];
+    let phase = pos % 16;
+    let has_pattern = seq.steps[..seq.step_count.as_usize()]
+        .iter()
+        .any(|s| s.active);
+    if step.active {
+        return step;
+    }
+    let r = party_random(seed, global, lane as u32 + 43);
+    step.active = match lane {
+        0 => matches!(phase, 0 | 4 | 8 | 12) && !has_pattern,
+        1 => matches!(phase, 4 | 12) && !has_pattern,
+        2 => matches!(phase, 4 | 12) && r < 0.28,
+        3 => matches!(phase, 3 | 11 | 14) && r < 0.28,
+        4 => phase % 2 == 0 || r < 0.16,
+        5 => matches!(phase, 6 | 14) && r < 0.55,
+        6 => global % 64 >= 48 && matches!(phase, 12 | 14 | 15) && r < 0.48,
+        _ => phase == 0 && global % 64 == 0,
+    };
+    if step.active {
+        step.velocity = if phase % 4 == 0 { 0.82 } else { 0.55 };
+        step.accent = phase == 0;
+    }
+    step
+}
 impl OutputScope {
     fn new(size: usize) -> Self {
         Self {
@@ -199,10 +344,23 @@ fn render(
                         (p.current_pattern(), rt.step, false, false)
                     };
                 let drop_silence = drop_section && step <= 4;
-                let note = |seq: &crate::model::MelodicTrackSeq| {
-                    seq.steps[step % seq.step_count.as_usize()]
+                let global_step = rt.step;
+                let note = |seq: &crate::model::MelodicTrackSeq, lane: u32| {
+                    if p.party_mode {
+                        party_melodic_step(
+                            seq,
+                            step,
+                            global_step,
+                            lane,
+                            p.root_note,
+                            p.scale,
+                            p.party_seed,
+                        )
+                    } else {
+                        seq.steps[step % seq.step_count.as_usize()]
+                    }
                 };
-                let pad = note(&pat.moog_pad);
+                let pad = note(&pat.moog_pad, 1);
                 for n in rt.moog_chord_notes.iter().take(rt.moog_chord_len) {
                     rt.moog.note_off(*n);
                 }
@@ -214,7 +372,7 @@ fn render(
                 rt.mono.note_off(rt.notes[1]);
                 rt.acid.note_off(rt.notes[2]);
                 rt.sampler.note_off(rt.notes[3]);
-                let a = note(&pat.moog);
+                let a = note(&pat.moog, 0);
                 if a.active && !drop_silence {
                     rt.notes[0] = a.note;
                     rt.gate_left[0] = 60.0 / p.bpm.max(1.0) / 4.0 * rt.sr * a.gate;
@@ -228,7 +386,7 @@ fn render(
                     }
                 }
                 if pad.active && !drop_silence {
-                    rt.pad_gate_left = 60.0 / p.bpm.max(1.0) / 4.0 * rt.sr * pad.gate * 4.0;
+                    rt.pad_gate_left = 60.0 / p.bpm.max(1.0) / 4.0 * rt.sr * pad.gate * 16.0;
                     let intervals = pad.chord.intervals();
                     rt.pad_chord_len = intervals.len().min(4);
                     for (i, interval) in intervals.iter().take(rt.pad_chord_len).enumerate() {
@@ -238,27 +396,31 @@ fn render(
                             .note_on(n, pad.velocity, pad.accent, pad.slide, &p.moog_pad);
                     }
                 }
-                let a = note(&pat.monologue);
+                let a = note(&pat.monologue, 2);
                 if a.active && !drop_silence {
                     rt.notes[1] = a.note;
                     rt.gate_left[1] = 60.0 / p.bpm.max(1.0) / 4.0 * rt.sr * a.gate;
                     rt.mono
                         .note_on(a.note, a.velocity, a.accent, a.slide, &p.monologue);
                 }
-                let a = note(&pat.tb303);
+                let a = note(&pat.tb303, 3);
                 if a.active && !drop_silence {
                     rt.notes[2] = a.note;
                     rt.gate_left[2] = 60.0 / p.bpm.max(1.0) / 4.0 * rt.sr * a.gate;
                     rt.acid.note_on(a.note, a.velocity, a.accent, a.slide);
                 }
-                let a = note(&pat.sampler);
+                let a = note(&pat.sampler, 4);
                 if a.active && !drop_silence {
                     rt.notes[3] = a.note;
                     rt.gate_left[3] = 60.0 / p.bpm.max(1.0) / 4.0 * rt.sr * a.gate;
                     rt.sampler.note_on(a.note, a.velocity, &p.sampler);
                 }
                 for (i, lane) in pat.drums.lanes.iter().enumerate() {
-                    let s = lane.steps[step % lane.step_count.as_usize()];
+                    let s = if p.party_mode {
+                        party_drum_step(i, lane, step, global_step, p.party_seed)
+                    } else {
+                        lane.steps[step % lane.step_count.as_usize()]
+                    };
                     if s.active && !drop_silence {
                         if let Some(v) = DrumVoiceId::ALL.get(i) {
                             rt.drums.trigger(*v, s.velocity, s.accent, s.flam, &p.drums);
