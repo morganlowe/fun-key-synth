@@ -45,6 +45,7 @@ pub struct FunKeySynthApp {
     toast: Option<(String, f64)>,
     // Sampler visual waveform state (Volca 8-part)
     volca_ui: crate::volca_ui::VolcaUiState,
+    app_icon: egui::TextureHandle,
     // Sound Lab / Sampler Auto-Repeat Test Note
     test_repeat_on: bool,
     test_repeat_mode: TestRepeatMode,
@@ -57,6 +58,8 @@ pub struct FunKeySynthApp {
 impl FunKeySynthApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_studio_theme(&cc.egui_ctx);
+        let icon_img = egui::ColorImage::from_rgba_unmultiplied([64, 64], include_bytes!("icon_64.rgba"));
+        let app_icon = cc.egui_ctx.load_texture("app_icon", icon_img, egui::TextureOptions::LINEAR);
         let project = Project::default();
         let engine = AudioEngine::start(project);
         Self {
@@ -75,6 +78,7 @@ impl FunKeySynthApp {
             roll_counter: 1,
             toast: None,
             volca_ui: crate::volca_ui::VolcaUiState::default(),
+            app_icon,
             test_repeat_on: false,
             test_repeat_mode: TestRepeatMode::Quarter,
             test_repeat_next_t: 0.0,
@@ -404,7 +408,12 @@ impl eframe::App for FunKeySynthApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
 
-                    // Brand pill
+                    // Top-left Bear Paw on Keys App Icon + Brand Title
+                    ui.add(
+                        egui::Image::new(&self.app_icon)
+                            .fit_to_exact_size(Vec2::new(28.0, 28.0))
+                            .rounding(Rounding::same(5.0)),
+                    );
                     ui.label(
                         RichText::new("FUN KEY SYNTH")
                             .strong()
