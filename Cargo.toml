@@ -1,0 +1,28 @@
+[package]
+name = "retrobox"
+version = "0.1.0"
+edition = "2021"
+description = "Native Linux Analog & Lo-Fi Groovebox Synthesizer (Moog, Monologue, 303, 808/909, Casio SK-1, MIDI)"
+
+[lib]
+name = "retrobox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "retrobox"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+cpal = "0.15"
+midir = "0.10"
+crossbeam-channel = "0.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hound = "3.5"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
