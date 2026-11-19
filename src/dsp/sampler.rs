@@ -2,7 +2,7 @@ use std::f32::consts::TAU;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::model::{GlobalFilterMode, LoopMode, MotionLocks, SamplerMode, SamplerParams};
+use crate::model::{GlobalFilterMode, LoopMode, MotionLocks, SamplePart, SamplerMode, SamplerParams};
 
 use super::{soft_tanh, AdsrEnv, Svf12Filter};
 
@@ -136,9 +136,12 @@ impl Sk1Sampler {
                     .unwrap_or(0)
             });
 
-        let semitones = (note as f32 - params.root_note as f32)
-            + params.transpose as f32
-            + (params.tune_cents / 100.0);
+        let note_semi = if params.key_pitch {
+            note as f32 - params.root_note as f32
+        } else {
+            0.0
+        };
+        let semitones = note_semi + params.transpose as f32 + (params.tune_cents / 100.0);
         let pitch_ratio = 2.0_f64.powf(semitones as f64 / 12.0);
         let sr_ratio = self.buffer_sr as f64 / self.sample_rate as f64;
 
@@ -261,8 +264,9 @@ impl Sk1Sampler {
             };
             mix += filtered * env * v.velocity * 0.65;
 
-            // Advance position
-            v.pos += v.rate * v.dir;
+            // Advance position (live speed multiplier so you can pitch/varispeed in real time!)
+            let live_speed = params.speed.clamp(0.15, 3.0) as f64;
+            v.pos += v.rate * live_speed * v.dir;
             match params.loop_mode {
                 LoopMode::OneShot => {
                     if v.pos >= end_f || v.pos < start_f {
@@ -484,8 +488,8 @@ pub fn load_audio_to_mono_f32(path: &Path, target_sr: u32) -> Result<Vec<f32>, S
         .default_track()
         .ok_or_else(|| "No audio track found in file".to_string())?;
     let track_id = track.id;
-    let src_sr = track.codec_params.sample_rate.unwrap_or(44_100).max(4000);
-    let max_src_frames = (src_sr as f32 * MAX_SAMPLE_SECONDS) as usize;
+    let mut src_sr = track.codec_params.sample_rate.unwrap_or(44_100).max(4000);
+    let mut max_src_frames = (src_sr as f32 * MAX_SAMPLE_SECONDS) as usize;
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -513,6 +517,10 @@ pub fn load_audio_to_mono_f32(path: &Path, target_sr: u32) -> Result<Vec<f32>, S
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 let spec = *decoded.spec();
+                if spec.rate >= 4000 {
+                    src_sr = spec.rate;
+                    max_src_frames = (src_sr as f32 * MAX_SAMPLE_SECONDS) as usize;
+                }
                 let channels = spec.channels.count().max(1);
                 let frames = decoded.frames();
                 let sb = sample_buf.get_or_insert_with(|| {
@@ -584,4 +592,142 @@ pub fn normalize_peak(input: &[f32]) -> Vec<f32> {
     }
     let gain = (0.94 / peak).min(12.0);
     input.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
+}
+
+/// 8-part Korg Volca Sample 2-inspired multi-track performance sampler bank
+/// with per-part buffers, choke groups, stereo panning, reverb send, and a
+/// master 2-band Analog Isolator (Bass & Treble kill/boost EQ).
+pub struct VolcaSamplerBank {
+    sr: f32,
+    parts: [Sk1Sampler; 8],
+    loaded_gen: [u64; 8],
+    // Stereo 2-band Isolator EQ state (low ~260 Hz, high ~3200 Hz)
+    lp_l: f32,
+    lp_r: f32,
+    hp_lp_l: f32,
+    hp_lp_r: f32,
+    low_alpha: f32,
+    high_alpha: f32,
+}
+
+impl VolcaSamplerBank {
+    pub fn new(sr: f32) -> Self {
+        let sr = sr.max(8_000.0);
+        let low_alpha = (TAU * 260.0 / sr).clamp(0.001, 0.5);
+        let high_alpha = (TAU * 3200.0 / sr).clamp(0.01, 0.9);
+        Self {
+            sr,
+            parts: std::array::from_fn(|_| Sk1Sampler::new(sr)),
+            loaded_gen: [u64::MAX; 8],
+            lp_l: 0.0,
+            lp_r: 0.0,
+            hp_lp_l: 0.0,
+            hp_lp_r: 0.0,
+            low_alpha,
+            high_alpha,
+        }
+    }
+
+    pub fn sync_parts(&mut self, parts: &[SamplePart]) {
+        for (i, part) in parts.iter().take(8).enumerate() {
+            if self.loaded_gen[i] == part.generation {
+                continue;
+            }
+            self.loaded_gen[i] = part.generation;
+            if let Some(samples) = part.sample.decode_f32_pcm() {
+                if !samples.is_empty() {
+                    let _ = self.parts[i].swap_buffer(
+                        Arc::new(samples),
+                        part.sample.sample_rate.max(8_000),
+                    );
+                    continue;
+                }
+            }
+            let bid = part.sample.builtin_id.unwrap_or(3);
+            let buf = generate_builtin_sample(bid, self.sr as u32);
+            let _ = self.parts[i].swap_buffer(Arc::new(buf), self.sr as u32);
+        }
+    }
+
+    pub fn trigger_part(&mut self, idx: usize, velocity: f32, parts: &[SamplePart]) {
+        if idx >= 8 || idx >= parts.len() {
+            return;
+        }
+        let grp = parts[idx].choke_group;
+        if grp > 0 {
+            for (other_i, other) in parts.iter().take(8).enumerate() {
+                if other_i != idx && other.choke_group == grp {
+                    self.parts[other_i].all_notes_off();
+                }
+            }
+        }
+        let sp = parts[idx].to_sampler_params();
+        self.parts[idx].note_on(60, velocity, &sp);
+    }
+
+    pub fn release_part(&mut self, idx: usize) {
+        if idx < 8 {
+            self.parts[idx].all_notes_off();
+        }
+    }
+
+    pub fn all_notes_off(&mut self) {
+        for p in &mut self.parts {
+            p.all_notes_off();
+        }
+    }
+
+    pub fn playhead_norm(&self, idx: usize) -> Option<f32> {
+        self.parts.get(idx).and_then(|p| p.latest_playhead_norm())
+    }
+
+    /// Renders all 8 sample parts in stereo + Volca Analog Isolator (Bass & Treble).
+    /// Returns `(dry_l, dry_r, rev_l, rev_r)`.
+    #[inline]
+    pub fn process_stereo(
+        &mut self,
+        parts: &[SamplePart],
+        iso_bass: f32,
+        iso_treble: f32,
+    ) -> (f32, f32, f32, f32) {
+        let mut sum_l = 0.0_f32;
+        let mut sum_r = 0.0_f32;
+        let mut rev_l = 0.0_f32;
+        let mut rev_r = 0.0_f32;
+
+        for (i, part) in parts.iter().take(8).enumerate() {
+            let sp = part.to_sampler_params();
+            let s = self.parts[i].process_sample(&sp);
+            if part.mute || s.abs() < 1e-7 {
+                continue;
+            }
+            let p = (part.pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
+            let angle = p * std::f32::consts::FRAC_PI_2;
+            let sl = s * part.level * angle.cos() * 1.15;
+            let sr = s * part.level * angle.sin() * 1.15;
+            sum_l += sl;
+            sum_r += sr;
+            rev_l += sl * part.reverb_send;
+            rev_r += sr * part.reverb_send;
+        }
+
+        // Volca Analog Isolator (3-band split: Low < 260 Hz, Mid, High > 3200 Hz)
+        self.lp_l += self.low_alpha * (sum_l - self.lp_l);
+        self.lp_r += self.low_alpha * (sum_r - self.lp_r);
+        self.hp_lp_l += self.high_alpha * (sum_l - self.hp_lp_l);
+        self.hp_lp_r += self.high_alpha * (sum_r - self.hp_lp_r);
+
+        let low_l = self.lp_l;
+        let low_r = self.lp_r;
+        let high_l = sum_l - self.hp_lp_l;
+        let high_r = sum_r - self.hp_lp_r;
+        let mid_l = sum_l - low_l - high_l;
+        let mid_r = sum_r - low_r - high_r;
+
+        let b = iso_bass.clamp(0.0, 2.0);
+        let t = iso_treble.clamp(0.0, 2.0);
+        let out_l = (low_l * b + mid_l + high_l * t).tanh();
+        let out_r = (low_r * b + mid_r + high_r * t).tanh();
+        (out_l, out_r, rev_l, rev_r)
+    }
 }

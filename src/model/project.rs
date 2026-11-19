@@ -572,6 +572,8 @@ pub struct SamplerParams {
     pub mode: SamplerMode,
     pub loop_mode: LoopMode,
     pub reverse: bool,
+    pub key_pitch: bool,
+    pub speed: f32,     // 0.25..=2.0 playback speed multiplier
     pub root_note: u8,
     pub transpose: i8,  // -24..=+24 semitones
     pub tune_cents: f32,
@@ -593,6 +595,8 @@ impl Default for SamplerParams {
             mode: SamplerMode::Sk1LoFi,
             loop_mode: LoopMode::OneShot,
             reverse: false,
+            key_pitch: true,
+            speed: 1.0,
             root_note: 60,
             transpose: 0,
             tune_cents: 0.0,
@@ -661,6 +665,122 @@ impl SavedSample {
             out.push(v as f32 / 32768.0);
         }
         Some(out)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SamplePart {
+    pub name: String,
+    pub sample: SavedSample,
+    pub generation: u64,
+    pub start: f32,
+    pub end: f32,
+    pub speed: f32,
+    pub transpose: i8,
+    pub tune_cents: f32,
+    pub reverse: bool,
+    pub loop_mode: LoopMode,
+    pub mode: SamplerMode,
+    pub bit_crush: f32,
+    pub filter_mode: GlobalFilterMode,
+    pub cutoff: f32,
+    pub resonance: f32,
+    pub attack: f32,
+    pub decay: f32,
+    pub sustain: f32,
+    pub release: f32,
+    pub level: f32,
+    pub pan: f32,
+    pub reverb_send: f32,
+    pub mute: bool,
+    pub choke_group: u8, // 0 = off, 1..=2 = choke group
+}
+
+impl Default for SamplePart {
+    fn default() -> Self {
+        Self {
+            name: "Pad".into(),
+            sample: SavedSample::default(),
+            generation: 1,
+            start: 0.0,
+            end: 1.0,
+            speed: 1.0,
+            transpose: 0,
+            tune_cents: 0.0,
+            reverse: false,
+            loop_mode: LoopMode::OneShot,
+            mode: SamplerMode::HiFi,
+            bit_crush: 0.0,
+            filter_mode: GlobalFilterMode::LowPass,
+            cutoff: 16_000.0,
+            resonance: 0.12,
+            attack: 0.002,
+            decay: 0.55,
+            sustain: 0.85,
+            release: 0.18,
+            level: 0.85,
+            pan: 0.0,
+            reverb_send: 0.22,
+            mute: false,
+            choke_group: 0,
+        }
+    }
+}
+
+impl SamplePart {
+    pub fn to_sampler_params(&self) -> SamplerParams {
+        SamplerParams {
+            mode: self.mode,
+            loop_mode: self.loop_mode,
+            reverse: self.reverse,
+            key_pitch: false,
+            speed: self.speed,
+            root_note: 60,
+            transpose: self.transpose,
+            tune_cents: self.tune_cents,
+            start: self.start,
+            end: self.end,
+            bit_crush: self.bit_crush,
+            filter_mode: self.filter_mode,
+            cutoff: self.cutoff,
+            resonance: self.resonance,
+            attack: self.attack,
+            decay: self.decay,
+            sustain: self.sustain,
+            release: self.release,
+        }
+    }
+
+    pub fn default_bank() -> Vec<Self> {
+        let defs: [(&str, u8, i8, bool, f32, SamplerMode); 8] = [
+            ("Rhodes m9", 3, 0, false, -0.20, SamplerMode::Vintage12Bit),
+            ("Brass Stab", 1, 0, false, 0.22, SamplerMode::Vintage12Bit),
+            ("Choir Ahh", 0, 0, false, -0.35, SamplerMode::Sk1LoFi),
+            ("FM Bell", 4, 0, false, 0.35, SamplerMode::HiFi),
+            ("Toy Piano", 2, 0, false, -0.15, SamplerMode::Sk1LoFi),
+            ("Rhodes +7", 3, 7, false, 0.18, SamplerMode::Vintage12Bit),
+            ("Rev Brass", 1, 0, true, -0.28, SamplerMode::Vintage12Bit),
+            ("Hi Bell", 4, 12, false, 0.40, SamplerMode::HiFi),
+        ];
+        defs.iter()
+            .enumerate()
+            .map(|(i, &(name, bid, trans, rev, pan, mode))| Self {
+                name: name.into(),
+                sample: SavedSample {
+                    name: name.into(),
+                    sample_rate: 48_000,
+                    pcm_i16_b64: String::new(),
+                    builtin_id: Some(bid),
+                },
+                generation: (i as u64) + 1,
+                transpose: trans,
+                reverse: rev,
+                pan,
+                mode,
+                ..Self::default()
+            })
+            .collect()
     }
 }
 
@@ -919,6 +1039,9 @@ pub struct Project {
     pub drums: DrumKitParams,
     pub sampler: SamplerParams,
     pub sample_data: SavedSample,
+    pub sample_parts: Vec<SamplePart>,
+    pub sampler_iso_bass: f32,
+    pub sampler_iso_treble: f32,
     pub mixer: MixerParams,
     pub fx: FxParams,
     pub midi: MidiSettings,
@@ -1003,6 +1126,14 @@ impl Project {
         self.bpm = self.bpm.clamp(40.0, 240.0);
         self.swing = self.swing.clamp(0.0, 0.45);
         self.root_note %= 12;
+        while self.sample_parts.len() < 8 {
+            let defaults = SamplePart::default_bank();
+            let idx = self.sample_parts.len();
+            self.sample_parts.push(defaults[idx % defaults.len()].clone());
+        }
+        self.sample_parts.truncate(8);
+        self.sampler_iso_bass = self.sampler_iso_bass.clamp(0.0, 2.0);
+        self.sampler_iso_treble = self.sampler_iso_treble.clamp(0.0, 2.0);
         while self.patterns.len() < NUM_PATTERNS {
             let idx = self.patterns.len();
             let bank = (b'A' + idx as u8) as char;
@@ -1114,6 +1245,9 @@ impl Project {
             drums: DrumKitParams::default(),
             sampler: SamplerParams::default(),
             sample_data: SavedSample::default(),
+            sample_parts: SamplePart::default_bank(),
+            sampler_iso_bass: 1.0,
+            sampler_iso_treble: 1.0,
             mixer: MixerParams::default(),
             fx: FxParams::default(),
             midi: MidiSettings::default(),

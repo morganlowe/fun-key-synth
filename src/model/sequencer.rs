@@ -641,11 +641,16 @@ pub struct Pattern {
     pub tb303: MelodicTrackSeq,
     pub drums: DrumTrackSeq,
     pub sampler: MelodicTrackSeq,
+    pub sample_lanes: Vec<DrumLane>,
     pub midi_out: MidiTrackSeq,
 }
 
 impl Default for Pattern {
     fn default() -> Self {
+        let mut sample_lanes = vec![DrumLane::default(); 8];
+        for l in &mut sample_lanes {
+            l.step_count = StepCount::Steps64;
+        }
         Self {
             name: "Pattern".to_string(),
             moog: MelodicTrackSeq::with_default_note(48, StepCount::Steps16),
@@ -654,6 +659,7 @@ impl Default for Pattern {
             tb303: MelodicTrackSeq::with_default_note(36, StepCount::Steps16),
             drums: DrumTrackSeq::default(),
             sampler: MelodicTrackSeq::with_default_note(60, StepCount::Steps16),
+            sample_lanes,
             midi_out: MidiTrackSeq::default(),
         }
     }
@@ -685,6 +691,15 @@ impl Pattern {
         self.tb303.normalize();
         self.drums.normalize();
         self.sampler.normalize();
+        while self.sample_lanes.len() < 8 {
+            let mut l = DrumLane::default();
+            l.step_count = StepCount::Steps64;
+            self.sample_lanes.push(l);
+        }
+        self.sample_lanes.truncate(8);
+        for l in &mut self.sample_lanes {
+            l.normalize();
+        }
         self.midi_out.normalize();
     }
 }

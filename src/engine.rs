@@ -1,6 +1,6 @@
 use crate::{
     dsp::{
-        sampler::generate_builtin_sample,
+        sampler::{generate_builtin_sample, VolcaSamplerBank},
         DrumMachine, MasterFx, MonologueSynth, MoogSynth, Sk1Sampler, Tb303Synth,
     },
     model::{
@@ -69,6 +69,13 @@ pub enum LiveEvent {
     TriggerBassDrop,
     TriggerFill,
     NextPartySection,
+    TriggerSamplePart {
+        part: usize,
+        velocity: f32,
+    },
+    ReleaseSamplePart {
+        part: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -208,6 +215,7 @@ struct Runtime {
     acid: Tb303Synth,
     drums: DrumMachine,
     sampler: Sk1Sampler,
+    volca: VolcaSamplerBank,
     fx: MasterFx,
     pad_widener: StereoWidener,
     arp_widener: StereoWidener,
@@ -233,8 +241,9 @@ struct Runtime {
     drop_env: f32,
     drop_pitch: f32,
     drop_target_hz: f32,
-    // Drum ratchets & fills
+    // Drum & Volca ratchets & fills
     ratchets: Vec<RatchetEvent>,
+    volca_ratchets: Vec<RatchetEvent>,
     force_fill_steps: usize,
     // Live chord override
     live_chord_held: bool,
@@ -266,6 +275,7 @@ impl Runtime {
             acid: Tb303Synth::new(sr),
             drums: DrumMachine::new(sr),
             sampler: Sk1Sampler::new(sr),
+            volca: VolcaSamplerBank::new(sr),
             fx: MasterFx::new(sr),
             pad_widener: StereoWidener::new(sr, 11.5),
             arp_widener: StereoWidener::new(sr, 7.2),
@@ -288,6 +298,7 @@ impl Runtime {
             drop_pitch: 65.0,
             drop_target_hz: 32.7,
             ratchets: Vec::with_capacity(16),
+            volca_ratchets: Vec::with_capacity(16),
             force_fill_steps: 0,
             live_chord_held: false,
             live_slot: None,
@@ -421,6 +432,13 @@ impl Runtime {
                     self.trigger_bass_drop(p.root_note);
                 }
             }
+            LiveEvent::TriggerSamplePart { part, velocity } => {
+                self.volca.sync_parts(&p.sample_parts);
+                self.volca.trigger_part(part, velocity, &p.sample_parts);
+            }
+            LiveEvent::ReleaseSamplePart { part } => {
+                self.volca.release_part(part);
+            }
         }
     }
 
@@ -430,12 +448,14 @@ impl Runtime {
         self.mono.all_notes_off();
         self.acid.all_notes_off();
         self.sampler.all_notes_off();
+        self.volca.all_notes_off();
         self.gate_moog = 0.0;
         self.gate_pad = 0.0;
         self.gate_mono = 0.0;
         self.gate_acid = 0.0;
         self.gate_sampler = 0.0;
         self.ratchets.clear();
+        self.volca_ratchets.clear();
     }
 
     fn step_duration_samples(&self, p: &Project, step_index: usize) -> f32 {
@@ -794,7 +814,7 @@ impl Runtime {
             }
         }
 
-        // --- 6. SAMPLER / TEXTURE (bit 5) ---
+        // --- 6. SAMPLER / 8-PART VOLCA BANK (bit 5) ---
         if (section_mask & 0b100000) != 0 {
             let seq = &pat.sampler;
             let st = seq.steps[global % seq.step_count.as_usize()];
@@ -812,6 +832,31 @@ impl Runtime {
                 self.sampler.note_on(note, st.velocity, &p.sampler);
                 self.gate_sampler = base_step_samples * st.gate.clamp(0.25, 16.0);
             }
+
+            // 8-Part Volca Sample Lanes!
+            for (part_idx, lane) in pat.sample_lanes.iter().take(8).enumerate() {
+                let len = lane.step_count.as_usize();
+                let dst = lane.steps[global % len];
+                if dst.active
+                    && (dst.probability >= 0.999
+                        || hash_f32(seed, global, 200 + part_idx as u32) <= dst.probability)
+                {
+                    let vel = (dst.velocity * if dst.accent { 1.15 } else { 1.0 }).clamp(0.1, 1.0);
+                    self.volca.trigger_part(part_idx, vel, &p.sample_parts);
+                    if dst.ratchet > 1 {
+                        let n = dst.ratchet.min(4) as usize;
+                        let sub_len = base_step_samples / n as f32;
+                        for r in 1..n {
+                            self.volca_ratchets.push(RatchetEvent {
+                                lane: part_idx,
+                                samples_left: sub_len * r as f32,
+                                vel: vel * (0.86 - r as f32 * 0.12).max(0.35),
+                                accent: false,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -821,9 +866,11 @@ impl Runtime {
         playing: bool,
         drum_cut: bool,
         snare_build: bool,
+        selected_part: usize,
         telemetry: &mut EngineTelemetry,
     ) -> (f32, f32) {
         self.sync_sampler_if_needed(p);
+        self.volca.sync_parts(&p.sample_parts);
 
         if playing && !self.was_playing {
             self.step = 0;
@@ -858,6 +905,18 @@ impl Runtime {
                     }
                 } else {
                     i += 1;
+                }
+            }
+
+            // Process Volca sample ratchets
+            let mut vi = 0;
+            while vi < self.volca_ratchets.len() {
+                self.volca_ratchets[vi].samples_left -= 1.0;
+                if self.volca_ratchets[vi].samples_left <= 0.0 {
+                    let ev = self.volca_ratchets.swap_remove(vi);
+                    self.volca.trigger_part(ev.lane, ev.vel, &p.sample_parts);
+                } else {
+                    vi += 1;
                 }
             }
         }
@@ -999,13 +1058,17 @@ impl Runtime {
             }
         }
 
-        // 4: Sampler / Texture — stereo widened + gentle sidechain
+        // 4: Sampler + 8-Part Volca Bank — true stereo + Isolator EQ + gentle sidechain
         let samp_s = self.sampler.process_sample(&p.sampler) * (0.35 + 0.65 * duck);
+        let (vl, vr, vrev_l, vrev_r) =
+            self.volca
+                .process_stereo(&p.sample_parts, p.sampler_iso_bass, p.sampler_iso_treble);
+        let v_duck = 0.40 + 0.60 * duck;
         if audible(ch[4].mute, ch[4].solo) {
             let (wl, wr) = self.sampler_widener.process(samp_s, 0.58);
             let (gl, gr) = pan_gains(ch[4].pan);
-            let sl = wl * ch[4].volume * gl * 0.52;
-            let sr_v = wr * ch[4].volume * gr * 0.52;
+            let sl = (wl * gl * 0.52 + vl * v_duck * 0.72) * ch[4].volume;
+            let sr_v = (wr * gr * 0.52 + vr * v_duck * 0.72) * ch[4].volume;
             mix_l += sl;
             mix_r += sr_v;
             if ch[4].delay_enabled {
@@ -1013,8 +1076,8 @@ impl Runtime {
                 del_r += sr_v * ch[4].delay_send;
             }
             if ch[4].reverb_enabled {
-                rev_l += sl * ch[4].reverb_send;
-                rev_r += sr_v * ch[4].reverb_send;
+                rev_l += sl * ch[4].reverb_send + vrev_l * ch[4].volume * 0.55;
+                rev_r += sr_v * ch[4].reverb_send + vrev_r * ch[4].volume * 0.55;
             }
         }
 
@@ -1063,7 +1126,10 @@ impl Runtime {
         self.peak_r = (self.peak_r * 0.9992).max(out_r.abs());
         telemetry.peak_l = self.peak_l;
         telemetry.peak_r = self.peak_r;
-        telemetry.sampler_playhead = self.sampler.latest_playhead_norm();
+        telemetry.sampler_playhead = self
+            .volca
+            .playhead_norm(selected_part)
+            .or_else(|| self.sampler.latest_playhead_norm());
         (out_l, out_r)
     }
 }
@@ -1077,6 +1143,7 @@ pub struct AudioEngine {
     pub status: String,
     pub drum_cut: Arc<AtomicBool>,
     pub snare_build: Arc<AtomicBool>,
+    pub selected_sample_part: Arc<AtomicUsize>,
     live_queue: Arc<Mutex<VecDeque<LiveEvent>>>,
     telemetry: Arc<Mutex<EngineTelemetry>>,
 }
@@ -1089,6 +1156,7 @@ impl AudioEngine {
         let scope = Arc::new(OutputScope::new(256));
         let drum_cut = Arc::new(AtomicBool::new(false));
         let snare_build = Arc::new(AtomicBool::new(false));
+        let selected_sample_part = Arc::new(AtomicUsize::new(0));
         let live_queue = Arc::new(Mutex::new(VecDeque::new()));
         let telemetry = Arc::new(Mutex::new(EngineTelemetry::default()));
 
@@ -1103,6 +1171,7 @@ impl AudioEngine {
                 status: "No audio output device".into(),
                 drum_cut,
                 snare_build,
+                selected_sample_part,
                 live_queue,
                 telemetry,
             };
@@ -1117,6 +1186,7 @@ impl AudioEngine {
                 status: "No default output config".into(),
                 drum_cut,
                 snare_build,
+                selected_sample_part,
                 live_queue,
                 telemetry,
             };
@@ -1130,6 +1200,7 @@ impl AudioEngine {
         let scope_ref = scope.clone();
         let cut_ref = drum_cut.clone();
         let build_ref = snare_build.clone();
+        let part_ref = selected_sample_part.clone();
         let q_ref = live_queue.clone();
         let tel_ref = telemetry.clone();
 
@@ -1155,10 +1226,11 @@ impl AudioEngine {
                 let is_playing = play_ref.load(Ordering::Relaxed);
                 let is_cut = cut_ref.load(Ordering::Relaxed);
                 let is_build = build_ref.load(Ordering::Relaxed);
+                let sel_part = part_ref.load(Ordering::Relaxed);
 
                 for frame in data.chunks_mut(channels.max(1)) {
                     let (out_l, out_r) =
-                        rt.process_sample(&p, is_playing, is_cut, is_build, &mut local_tel);
+                        rt.process_sample(&p, is_playing, is_cut, is_build, sel_part, &mut local_tel);
                     scope_decim = (scope_decim + 1) % 6;
                     if scope_decim == 0 {
                         scope_ref.push((out_l + out_r) * 0.5);
@@ -1193,6 +1265,7 @@ impl AudioEngine {
                     status: format!("Stereo Audio Live @ {} Hz", sr as u32),
                     drum_cut,
                     snare_build,
+                    selected_sample_part,
                     live_queue,
                     telemetry,
                 },
@@ -1205,6 +1278,7 @@ impl AudioEngine {
                     status: format!("Audio play error: {e}"),
                     drum_cut,
                     snare_build,
+                    selected_sample_part,
                     live_queue,
                     telemetry,
                 },
@@ -1218,6 +1292,7 @@ impl AudioEngine {
                 status: format!("Audio stream error: {e}"),
                 drum_cut,
                 snare_build,
+                selected_sample_part,
                 live_queue,
                 telemetry,
             },
@@ -1255,7 +1330,7 @@ pub fn export_wav(project: &Project, path: &Path, bars: usize) -> Result<(), Str
     let total_samples = (total_seconds * sr as f32).round() as usize;
 
     for _ in 0..total_samples {
-        let (l, r) = rt.process_sample(project, true, false, false, &mut tel);
+        let (l, r) = rt.process_sample(project, true, false, false, 0, &mut tel);
         let il = (l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         let ir = (r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
         writer.write_sample(il).map_err(|e| e.to_string())?;
@@ -1279,7 +1354,7 @@ mod tests {
             let mut max_amp = 0.0_f32;
             let mut stereo_diff = 0.0_f32;
             for _ in 0..22_050 {
-                let (l, r) = rt.process_sample(&p, true, false, false, &mut tel);
+                let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
                 assert!(l.is_finite() && r.is_finite(), "NaN in vibe {:?}", vibe);
                 assert!(l.abs() <= 1.0 && r.abs() <= 1.0, "Hard clip in vibe {:?}", vibe);
                 max_amp = max_amp.max(l.abs()).max(r.abs());
@@ -1299,7 +1374,7 @@ mod tests {
         let mut tel = EngineTelemetry::default();
         let mut max_amp = 0.0_f32;
         for _ in 0..44_100 {
-            let (l, r) = rt.process_sample(&p, true, false, false, &mut tel);
+            let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
             assert!(l.is_finite() && r.is_finite());
             max_amp = max_amp.max(l.abs()).max(r.abs());
         }

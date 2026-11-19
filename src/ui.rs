@@ -1,15 +1,13 @@
 use crate::{
-    dsp::sampler::{
-        generate_builtin_sample, load_audio_to_mono_f32, normalize_peak,
-        trim_silence_and_normalize, BUILTIN_SAMPLE_NAMES,
-    },
-    engine::{export_wav, AudioEngine, EngineTelemetry, LiveEvent},
+    dsp::sampler::{load_audio_to_mono_f32, BUILTIN_SAMPLE_NAMES},
+    engine::{export_wav, AudioEngine, LiveEvent},
     model::{
         apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads, generate_auto_beat,
         generate_melodic_tracks, load_project, note_name, root_name, save_project,
         voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId,
-        GlobalFilterMode, LoopMode, MonologueOscWave, MoogWave, Project, SamplerMode, SavedSample,
-        SongSection, Tb303Wave, TrackId, Vibe, NOTE_NAMES, PROGRESSIONS,
+        EgTarget, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MonologueOscWave,
+        MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, SongSection, Tb303Wave, TrackId,
+        Vibe, NOTE_NAMES, PROGRESSIONS,
     },
 };
 use eframe::egui::{self, Color32, Key, RichText, Rounding, Sense, Stroke, Vec2};
@@ -21,6 +19,13 @@ enum StudioTab {
     Sampler,
     ArrangeParty,
     SoundLab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestRepeatMode {
+    Quarter,
+    Eighth,
+    Drone,
 }
 
 pub struct FunKeySynthApp {
@@ -38,12 +43,15 @@ pub struct FunKeySynthApp {
     scope_buf: Vec<f32>,
     roll_counter: u32,
     toast: Option<(String, f64)>,
-    // Sampler visual waveform state
-    sampler_peaks: Vec<(f32, f32)>,
-    sampler_duration_secs: f32,
-    cached_sample_gen: u64,
-    sampler_drag_handle: Option<u8>, // 0 = start, 1 = end
-    sampler_audition_note: Option<u8>,
+    // Sampler visual waveform state (Volca 8-part)
+    volca_ui: crate::volca_ui::VolcaUiState,
+    // Sound Lab / Sampler Auto-Repeat Test Note
+    test_repeat_on: bool,
+    test_repeat_mode: TestRepeatMode,
+    test_repeat_next_t: f64,
+    test_repeat_off_t: Option<f64>,
+    test_repeat_step: usize,
+    test_repeat_active: Option<(TrackId, u8, bool)>, // (track, note, is_chord)
 }
 
 impl FunKeySynthApp {
@@ -66,26 +74,158 @@ impl FunKeySynthApp {
             scope_buf: Vec::with_capacity(256),
             roll_counter: 1,
             toast: None,
-            sampler_peaks: Vec::new(),
-            sampler_duration_secs: 0.0,
-            cached_sample_gen: u64::MAX,
-            sampler_drag_handle: None,
-            sampler_audition_note: None,
+            volca_ui: crate::volca_ui::VolcaUiState::default(),
+            test_repeat_on: false,
+            test_repeat_mode: TestRepeatMode::Quarter,
+            test_repeat_next_t: 0.0,
+            test_repeat_off_t: None,
+            test_repeat_step: 0,
+            test_repeat_active: None,
         }
     }
 
-    fn sync_waveform_cache(&mut self, proj: &Project) {
-        if self.cached_sample_gen == proj.sample_generation && !self.sampler_peaks.is_empty() {
+    fn stop_test_repeat_note(&mut self) {
+        if let Some((tr, note, is_chord)) = self.test_repeat_active.take() {
+            if is_chord {
+                self.engine.send_live(LiveEvent::ReleaseChord);
+            } else {
+                self.engine.send_live(LiveEvent::ReleaseNote { track: tr, note });
+            }
+        }
+        self.test_repeat_off_t = None;
+    }
+
+    fn update_test_repeat(&mut self, ctx: &egui::Context, proj: &Project, playing: bool) {
+        // Auto-pause test repeater if main transport starts playing
+        if playing || !self.test_repeat_on {
+            if self.test_repeat_active.is_some() {
+                self.stop_test_repeat_note();
+            }
             return;
         }
-        self.cached_sample_gen = proj.sample_generation;
-        let sr = proj.sample_data.sample_rate.max(8_000);
-        let pcm = proj.sample_data.decode_f32_pcm().unwrap_or_else(|| {
-            let id = proj.sample_data.builtin_id.unwrap_or(3);
-            generate_builtin_sample(id, sr)
-        });
-        self.sampler_duration_secs = pcm.len() as f32 / sr as f32;
-        self.sampler_peaks = compute_waveform_peaks(&pcm, 320);
+        let now = ctx.input(|i| i.time);
+        let target = if self.tab == StudioTab::Sampler {
+            TrackId::Sampler
+        } else {
+            self.selected_track
+        };
+
+        // If user switched target track while holding drone/note, release previous cleanly
+        if let Some((prev_tr, _, _)) = self.test_repeat_active {
+            if prev_tr != target {
+                self.stop_test_repeat_note();
+                self.test_repeat_next_t = now;
+            }
+        }
+
+        if self.test_repeat_mode == TestRepeatMode::Drone && target != TrackId::Drums {
+            if self.test_repeat_active.is_none() {
+                let note = match target {
+                    TrackId::Moog | TrackId::Tb303 => 36 + (proj.root_note % 12),
+                    TrackId::Sampler => proj.sampler.root_note,
+                    _ => 60 + (proj.root_note % 12),
+                };
+                if target == TrackId::MoogPad {
+                    let pads = build_auto_chord_pads(proj.root_note, proj.scale);
+                    if let Some(pad) = pads.first() {
+                        self.engine.send_live(LiveEvent::PlayChord {
+                            notes: pad.chord_notes.clone(),
+                            bass: None,
+                            velocity: 0.85,
+                            slot: pad.slot,
+                        });
+                        self.test_repeat_active = Some((target, note, true));
+                    }
+                } else {
+                    self.engine.send_live(LiveEvent::PlayNote {
+                        track: target,
+                        note,
+                        velocity: 0.88,
+                    });
+                    self.test_repeat_active = Some((target, note, false));
+                }
+            }
+            return;
+        }
+
+        // Release gate if due
+        if let Some(off_t) = self.test_repeat_off_t {
+            if now >= off_t {
+                self.stop_test_repeat_note();
+            }
+        }
+
+        // Trigger next repeating hit
+        if now >= self.test_repeat_next_t {
+            self.stop_test_repeat_note();
+            let beat_secs = 60.0 / proj.bpm.clamp(40.0, 240.0) as f64;
+            let interval = match self.test_repeat_mode {
+                TestRepeatMode::Quarter | TestRepeatMode::Drone => beat_secs,
+                TestRepeatMode::Eighth => beat_secs * 0.5,
+            };
+            self.test_repeat_next_t = now + interval;
+            let step = self.test_repeat_step;
+            self.test_repeat_step = self.test_repeat_step.wrapping_add(1);
+
+            match target {
+                TrackId::Drums => {
+                    // Cycle Kick -> ClosedHat -> Snare -> ClosedHat so you hear kit tuning live
+                    let lane = [0u8, 4, 1, 4][step % 4];
+                    self.engine.send_live(LiveEvent::PlayNote {
+                        track: TrackId::Drums,
+                        note: lane,
+                        velocity: 0.90,
+                    });
+                }
+                TrackId::MoogPad => {
+                    let pads = build_auto_chord_pads(proj.root_note, proj.scale);
+                    if let Some(pad) = pads.get((step / 2) % 4) {
+                        self.engine.send_live(LiveEvent::PlayChord {
+                            notes: pad.chord_notes.clone(),
+                            bass: None,
+                            velocity: 0.84,
+                            slot: pad.slot,
+                        });
+                        self.test_repeat_active = Some((target, 60, true));
+                        self.test_repeat_off_t = Some(now + interval * 0.82);
+                    }
+                }
+                TrackId::Sampler => {
+                    if self.tab == StudioTab::Sampler {
+                        let p_idx = self.volca_ui.selected_part;
+                        self.engine.send_live(LiveEvent::TriggerSamplePart {
+                            part: p_idx,
+                            velocity: 0.92,
+                        });
+                    } else {
+                        let note = proj.sampler.root_note;
+                        self.engine.send_live(LiveEvent::PlayNote {
+                            track: TrackId::Sampler,
+                            note,
+                            velocity: 0.90,
+                        });
+                        self.test_repeat_active = Some((target, note, false));
+                        self.test_repeat_off_t = Some(now + interval * 0.78);
+                    }
+                }
+                _ => {
+                    // Musical 4-note test phrase: Root, 5th, Octave, 7th/Root
+                    let base = match target {
+                        TrackId::Moog | TrackId::Tb303 => 36 + (proj.root_note % 12),
+                        _ => 60 + (proj.root_note % 12),
+                    };
+                    let offset = [0u8, 7, 12, 3][step % 4];
+                    let note = (base + offset).min(96);
+                    self.engine.send_live(LiveEvent::PlayNote {
+                        track: target,
+                        note,
+                        velocity: 0.88,
+                    });
+                    self.test_repeat_active = Some((target, note, false));
+                    self.test_repeat_off_t = Some(now + interval * 0.65);
+                }
+            }
+        }
     }
 
     fn set_toast(&mut self, ctx: &egui::Context, msg: impl Into<String>) {
@@ -246,6 +386,7 @@ impl eframe::App for FunKeySynthApp {
         let accent = vibe_color(proj.vibe);
 
         self.handle_keyboard(ctx, &mut proj, &pads, playing, cur_step);
+        self.update_test_repeat(ctx, &proj, playing);
 
         if playing && self.follow_playhead {
             self.bar_page = (cur_step / 16) % 4;
@@ -616,7 +757,26 @@ impl eframe::App for FunKeySynthApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
                     StudioTab::Studio => self.ui_studio(ui, &mut proj, playing, cur_step, accent),
-                    StudioTab::Sampler => self.ui_sampler(ui, ctx, &mut proj, &telemetry, accent),
+                    StudioTab::Sampler => {
+                        if let Some(msg) = crate::volca_ui::render_volca_sampler(
+                            ui,
+                            ctx,
+                            &mut self.volca_ui,
+                            &self.engine,
+                            &mut proj,
+                            &telemetry,
+                            playing,
+                            cur_step,
+                            &mut self.bar_page,
+                            &mut self.follow_playhead,
+                            self.record_live,
+                            &mut self.test_repeat_on,
+                            &mut self.test_repeat_next_t,
+                            accent,
+                        ) {
+                            self.set_toast(ctx, msg);
+                        }
+                    }
                     StudioTab::ArrangeParty => {
                         self.ui_arrange_party(ui, &mut proj, &telemetry, playing, accent)
                     }
@@ -750,32 +910,197 @@ impl FunKeySynthApp {
                             ))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    // Select button with color badge
+                                    // Select button with color badge (Double-click = Sound Lab, Right-click = options)
+                                    let is_muted_now = if track == TrackId::MoogPad {
+                                        proj.mixer.moog_pad_mute
+                                    } else {
+                                        proj.mixer.channels[track.index()].mute
+                                    };
                                     let sel_btn = egui::Button::new(
-                                        RichText::new(track.role_name())
-                                            .strong()
-                                            .size(12.0)
-                                            .color(if selected { tc } else { Color32::from_rgb(220, 226, 240) }),
+                                        RichText::new(if is_muted_now {
+                                            format!("🔇 {}", track.role_name())
+                                        } else {
+                                            track.role_name().to_string()
+                                        })
+                                        .strong()
+                                        .size(12.0)
+                                        .color(if is_muted_now {
+                                            Color32::from_rgb(120, 128, 148)
+                                        } else if selected {
+                                            tc
+                                        } else {
+                                            Color32::from_rgb(220, 226, 240)
+                                        }),
                                     )
                                     .fill(Color32::TRANSPARENT)
-                                    .min_size(Vec2::new(82.0, 22.0));
-                                    if ui.add(sel_btn).clicked() {
+                                    .min_size(Vec2::new(86.0, 22.0));
+                                    let sel_resp = ui
+                                        .add(sel_btn)
+                                        .on_hover_text("Click: select  •  Double-click: open full synth  •  Right-click: instrument menu");
+                                    if sel_resp.clicked() {
                                         self.selected_track = track;
                                     }
-
-                                    // Instant Voice Preset Picker
-                                    let presets = voice_preset_names(track);
-                                    let cur_preset = proj.voice_presets[row_idx] % presets.len().max(1);
-                                    egui::ComboBox::from_id_salt(("vp", row_idx))
-                                        .width(108.0)
-                                        .selected_text(presets[cur_preset])
-                                        .show_ui(ui, |ui| {
-                                            for (pi, &pname) in presets.iter().enumerate() {
-                                                if ui.selectable_label(cur_preset == pi, pname).clicked() {
-                                                    apply_voice_preset(proj, track, pi);
+                                    if sel_resp.double_clicked() {
+                                        self.selected_track = track;
+                                        self.tab = if track == TrackId::Sampler {
+                                            StudioTab::Sampler
+                                        } else {
+                                            StudioTab::SoundLab
+                                        };
+                                    }
+                                    sel_resp.context_menu(|ui| {
+                                        ui.set_min_width(210.0);
+                                        ui.label(RichText::new(track.role_name()).strong().color(tc));
+                                        ui.separator();
+                                        let open_lbl = if track == TrackId::Sampler {
+                                            "🎛 Open Pro Sampler Workbench"
+                                        } else {
+                                            "🎛 Open Full Synth in Sound Lab"
+                                        };
+                                        if ui.button(open_lbl).clicked() {
+                                            self.selected_track = track;
+                                            self.tab = if track == TrackId::Sampler {
+                                                StudioTab::Sampler
+                                            } else {
+                                                StudioTab::SoundLab
+                                            };
+                                            ui.close_menu();
+                                        }
+                                        {
+                                            let (_, mute, solo) = track_mixer_mut(proj, track);
+                                            if ui.button(if *mute { "🔊 Unmute Track" } else { "🔇 Mute Track" }).clicked() {
+                                                *mute = !*mute;
+                                                ui.close_menu();
+                                            }
+                                            if ui.button(if *solo { "★ Unsolo Track" } else { "☆ Solo Track" }).clicked() {
+                                                *solo = !*solo;
+                                                ui.close_menu();
+                                            }
+                                        }
+                                        ui.separator();
+                                        // Quick tone / pan / sends right in context menu!
+                                        match track {
+                                            TrackId::Moog => {
+                                                ui.add(egui::Slider::new(&mut proj.moog.cutoff, 60.0..=16_000.0).logarithmic(true).text("Cutoff"));
+                                                ui.add(egui::Slider::new(&mut proj.moog.resonance, 0.0..=0.92).text("Res"));
+                                                ui.add(egui::Slider::new(&mut proj.moog.drive, 0.0..=1.0).text("Drive"));
+                                            }
+                                            TrackId::MoogPad => {
+                                                ui.add(egui::Slider::new(&mut proj.moog_pad.cutoff, 60.0..=16_000.0).logarithmic(true).text("Cutoff"));
+                                                ui.add(egui::Slider::new(&mut proj.moog_pad.resonance, 0.0..=0.92).text("Res"));
+                                                ui.add(egui::Slider::new(&mut proj.moog_pad.amp_release, 0.05..=2.5).text("Release"));
+                                            }
+                                            TrackId::Monologue => {
+                                                ui.add(egui::Slider::new(&mut proj.monologue.cutoff, 60.0..=16_000.0).logarithmic(true).text("Cutoff"));
+                                                ui.add(egui::Slider::new(&mut proj.monologue.resonance, 0.0..=0.92).text("Res"));
+                                                ui.add(egui::Slider::new(&mut proj.monologue.eg_decay, 0.02..=2.0).text("Decay"));
+                                            }
+                                            TrackId::Tb303 => {
+                                                ui.add(egui::Slider::new(&mut proj.tb303.cutoff, 80.0..=6000.0).logarithmic(true).text("Cutoff"));
+                                                ui.add(egui::Slider::new(&mut proj.tb303.resonance, 0.0..=0.96).text("Res"));
+                                                ui.add(egui::Slider::new(&mut proj.tb303.env_mod, 0.0..=1.0).text("Env Mod"));
+                                            }
+                                            TrackId::Sampler => {
+                                                ui.add(egui::Slider::new(&mut proj.sampler.cutoff, 120.0..=18_000.0).logarithmic(true).text("Cutoff"));
+                                                ui.add(egui::Slider::new(&mut proj.sampler.transpose, -24..=24).text("Pitch"));
+                                            }
+                                            TrackId::Drums => {
+                                                ui.horizontal(|ui| {
+                                                    if ui.small_button("808 Kit").clicked() {
+                                                        proj.drums.set_all_model(DrumModel::Tr808);
+                                                    }
+                                                    if ui.small_button("909 Kit").clicked() {
+                                                        proj.drums.set_all_model(DrumModel::Tr909);
+                                                    }
+                                                    if ui.small_button("Hybrid").clicked() {
+                                                        proj.drums.set_hybrid();
+                                                    }
+                                                });
+                                            }
+                                            TrackId::MidiOut => {}
+                                        }
+                                        if track != TrackId::MoogPad {
+                                            let ch = &mut proj.mixer.channels[track.index()];
+                                            ui.add(egui::Slider::new(&mut ch.pan, -1.0..=1.0).text("Pan"));
+                                            ui.add(egui::Slider::new(&mut ch.delay_send, 0.0..=1.0).text("Delay"));
+                                            ui.add(egui::Slider::new(&mut ch.reverb_send, 0.0..=1.0).text("Reverb"));
+                                        } else {
+                                            ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_delay_send, 0.0..=1.0).text("Delay"));
+                                            ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_reverb_send, 0.0..=1.0).text("Reverb"));
+                                        }
+                                        ui.separator();
+                                        if ui.button("🎲 Randomize Pattern").clicked() {
+                                            let seed = self.next_seed();
+                                            if track == TrackId::Drums {
+                                                let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                                                proj.current_pattern_mut().drums = drums;
+                                            } else {
+                                                let (bass, pad, arp, acid, samp) = generate_melodic_tracks(
+                                                    proj.vibe,
+                                                    proj.root_note,
+                                                    proj.progression_idx,
+                                                    seed,
+                                                );
+                                                let pat = proj.current_pattern_mut();
+                                                match track {
+                                                    TrackId::Moog => pat.moog = bass,
+                                                    TrackId::MoogPad => pat.moog_pad = pad,
+                                                    TrackId::Monologue => pat.monologue = arp,
+                                                    TrackId::Tb303 => pat.tb303 = acid,
+                                                    TrackId::Sampler => pat.sampler = samp,
+                                                    _ => {}
                                                 }
                                             }
-                                        });
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("✕ Clear Pattern").clicked() {
+                                            let pat = proj.current_pattern_mut();
+                                            if track == TrackId::Drums {
+                                                for lane in &mut pat.drums.lanes {
+                                                    lane.clear();
+                                                }
+                                            } else if let Some(seq) = pat.melodic_mut(track) {
+                                                seq.clear();
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    });
+
+                                    // Instant Voice Preset Picker (or Volca 8-Pad shortcut for Sampler)
+                                    if track == TrackId::Sampler {
+                                        let label = if proj.sample_parts[0].sample.builtin_id.is_none() {
+                                            format!("{} →", proj.sample_parts[0].name)
+                                        } else {
+                                            "8-Part Volca →".to_string()
+                                        };
+                                        let vbtn = egui::Button::new(
+                                            RichText::new(label)
+                                                .size(11.5)
+                                                .color(Color32::from_rgb(255, 214, 110)),
+                                        )
+                                        .fill(Color32::from_rgb(36, 34, 46))
+                                        .min_size(Vec2::new(112.0, 22.0));
+                                        if ui
+                                            .add(vbtn)
+                                            .on_hover_text("Open 8-Part Volca Performance Sampler (load MP3/WAV, auto-chop, Isolator EQ)")
+                                            .clicked()
+                                        {
+                                            self.tab = StudioTab::Sampler;
+                                        }
+                                    } else {
+                                        let presets = voice_preset_names(track);
+                                        let cur_preset = proj.voice_presets[row_idx] % presets.len().max(1);
+                                        egui::ComboBox::from_id_salt(("vp", row_idx))
+                                            .width(108.0)
+                                            .selected_text(presets[cur_preset])
+                                            .show_ui(ui, |ui| {
+                                                for (pi, &pname) in presets.iter().enumerate() {
+                                                    if ui.selectable_label(cur_preset == pi, pname).clicked() {
+                                                        apply_voice_preset(proj, track, pi);
+                                                    }
+                                                }
+                                            });
+                                    }
 
                                     // Mute / Solo / Volume
                                     let (vol, mute, solo) = track_mixer_mut(proj, track);
@@ -818,11 +1143,26 @@ impl FunKeySynthApp {
                                     );
 
                                     // Per-track Randomize & Clear
-                                    if ui.small_button("🎲").on_hover_text("Generate fresh pattern for this track").clicked() {
+                                    if ui.small_button("RND").on_hover_text("Generate fresh pattern for this track").clicked() {
                                         let seed = self.next_seed();
                                         if track == TrackId::Drums {
                                             let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
                                             proj.current_pattern_mut().drums = drums;
+                                        } else if track == TrackId::Sampler {
+                                            let pat = proj.current_pattern_mut();
+                                            for l in &mut pat.sample_lanes {
+                                                l.clear();
+                                            }
+                                            for bar in 0..4 {
+                                                let base = bar * 16;
+                                                for &(step, pad_i) in &[(0, 0), (3, 1), (6, 2), (8, 3), (10, 4), (12, 5), (14, 6), (15, 7)] {
+                                                    let p = (pad_i + bar + (seed as usize)) % 8;
+                                                    let s = &mut pat.sample_lanes[p].steps[base + step];
+                                                    s.active = true;
+                                                    s.velocity = if step % 4 == 0 { 0.92 } else { 0.78 };
+                                                }
+                                            }
+                                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
                                         } else {
                                             let (bass, pad, arp, acid, samp) = generate_melodic_tracks(
                                                 proj.vibe,
@@ -841,10 +1181,15 @@ impl FunKeySynthApp {
                                             }
                                         }
                                     }
-                                    if ui.small_button("✕").on_hover_text("Clear track pattern").clicked() {
+                                    if ui.small_button("X").on_hover_text("Clear track pattern").clicked() {
                                         let pat = proj.current_pattern_mut();
                                         if track == TrackId::Drums {
                                             for lane in &mut pat.drums.lanes {
+                                                lane.clear();
+                                            }
+                                        } else if track == TrackId::Sampler {
+                                            pat.sampler.clear();
+                                            for lane in &mut pat.sample_lanes {
                                                 lane.clear();
                                             }
                                         } else if let Some(seq) = pat.melodic_mut(track) {
@@ -918,23 +1263,129 @@ impl FunKeySynthApp {
                             if ui.small_button("⚡ Fill Now").clicked() {
                                 self.engine.send_live(LiveEvent::TriggerFill);
                             }
-                            ui.label(RichText::new("Right-click step = 2x/3x/4x ratchet").size(10.5).weak());
+                            ui.label(RichText::new("Click drum name = Mute  •  Right-click drum = Tune/Options  •  Right-click step = Ratchet").size(10.5).weak());
                         });
                         ui.add_space(4.0);
 
                         // 8-lane compact Drum Beat Grid (16 steps per bar page)
-                        let pat = proj.current_pattern_mut();
-                        let cell_w = ((ui.available_width() - 56.0 - 15.0 * 3.0) / 16.0).clamp(18.0, 34.0);
+                        let active_pat = proj.active_pattern;
+                        let cell_w = ((ui.available_width() - 62.0 - 15.0 * 3.0) / 16.0).clamp(18.0, 34.0);
                         let cell_h = 22.0;
+                        let mut solo_drum_lane: Option<usize> = None;
+                        let mut unmute_all_drums = false;
+
                         for lane_idx in 0..8 {
                             let voice = DrumVoiceId::from_index(lane_idx).unwrap();
-                            let lane = &mut pat.drums.lanes[lane_idx];
+                            let is_muted = proj.drums.voices[lane_idx].mute;
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;
-                                ui.add_sized(
-                                    Vec2::new(48.0, cell_h),
-                                    egui::Label::new(RichText::new(voice.short_name()).size(10.5).strong()),
-                                );
+
+                                // Clickable drum voice label: Left-click = Mute, Right-click = Full Voice Options & Tuning!
+                                let lbl_btn = egui::Button::new(
+                                    RichText::new(if is_muted {
+                                        format!("✕ {}", voice.short_name())
+                                    } else {
+                                        voice.short_name().to_string()
+                                    })
+                                    .size(10.5)
+                                    .strong()
+                                    .color(if is_muted {
+                                        Color32::from_rgb(115, 122, 140)
+                                    } else {
+                                        Color32::from_rgb(228, 234, 248)
+                                    }),
+                                )
+                                .fill(if is_muted {
+                                    Color32::from_rgb(38, 22, 28)
+                                } else {
+                                    Color32::from_rgb(24, 29, 42)
+                                })
+                                .min_size(Vec2::new(54.0, cell_h));
+
+                                let lbl_resp = ui
+                                    .add(lbl_btn)
+                                    .on_hover_text("Left-click: Mute/Unmute  •  Right-click: Tune, 808/909 & Fill options");
+                                if lbl_resp.clicked() {
+                                    proj.drums.voices[lane_idx].mute = !proj.drums.voices[lane_idx].mute;
+                                }
+                                lbl_resp.context_menu(|ui| {
+                                    ui.set_min_width(220.0);
+                                    ui.label(RichText::new(voice.full_name()).strong().color(tc));
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        if ui.button("🔊 Audition").clicked() {
+                                            proj.drums.voices[lane_idx].mute = false;
+                                            self.engine.send_live(LiveEvent::PlayNote {
+                                                track: TrackId::Drums,
+                                                note: lane_idx as u8,
+                                                velocity: 0.92,
+                                            });
+                                        }
+                                        if ui.button(if proj.drums.voices[lane_idx].mute { "Unmute" } else { "Mute" }).clicked() {
+                                            proj.drums.voices[lane_idx].mute = !proj.drums.voices[lane_idx].mute;
+                                        }
+                                        if ui.button("Solo").clicked() {
+                                            solo_drum_lane = Some(lane_idx);
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("All On").clicked() {
+                                            unmute_all_drums = true;
+                                            ui.close_menu();
+                                        }
+                                    });
+                                    ui.separator();
+                                    let vp = &mut proj.drums.voices[lane_idx];
+                                    ui.horizontal(|ui| {
+                                        ui.label("Model:");
+                                        ui.selectable_value(&mut vp.model, DrumModel::Tr808, "TR-808");
+                                        ui.selectable_value(&mut vp.model, DrumModel::Tr909, "TR-909");
+                                    });
+                                    ui.add(egui::Slider::new(&mut vp.level, 0.0..=1.25).text("Level"));
+                                    ui.add(egui::Slider::new(&mut vp.tune, -12.0..=12.0).text("Tune"));
+                                    ui.add(egui::Slider::new(&mut vp.decay, 0.05..=1.0).text("Decay"));
+                                    ui.add(egui::Slider::new(&mut vp.tone, 0.0..=1.0).text("Tone"));
+                                    ui.add(egui::Slider::new(&mut vp.snappy, 0.0..=1.0).text("Snappy"));
+                                    ui.add(egui::Slider::new(&mut vp.pan, -1.0..=1.0).text("Pan"));
+                                    ui.separator();
+                                    ui.label(RichText::new("Quick Fill (current bar):").size(11.0).weak());
+                                    let lane = &mut proj.patterns[active_pat].drums.lanes[lane_idx];
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("4x4").clicked() {
+                                            for c in [0, 4, 8, 12] {
+                                                let s = &mut lane.steps[(page_start + c) % 64];
+                                                s.active = true;
+                                                s.velocity = 0.94;
+                                            }
+                                        }
+                                        if ui.small_button("2 & 4").clicked() {
+                                            for c in [4, 12] {
+                                                let s = &mut lane.steps[(page_start + c) % 64];
+                                                s.active = true;
+                                                s.velocity = 0.90;
+                                            }
+                                        }
+                                        if ui.small_button("Offbeats").clicked() {
+                                            for c in [2, 6, 10, 14] {
+                                                let s = &mut lane.steps[(page_start + c) % 64];
+                                                s.active = true;
+                                                s.velocity = 0.76;
+                                            }
+                                        }
+                                        if ui.small_button("8ths").clicked() {
+                                            for c in (0..16).step_by(2) {
+                                                let s = &mut lane.steps[(page_start + c) % 64];
+                                                s.active = true;
+                                                s.velocity = 0.72;
+                                            }
+                                        }
+                                        if ui.small_button("Clear").clicked() {
+                                            lane.clear();
+                                            ui.close_menu();
+                                        }
+                                    });
+                                });
+
+                                let lane = &mut proj.patterns[active_pat].drums.lanes[lane_idx];
                                 for col in 0..16 {
                                     let idx = (page_start + col) % lane.step_count.as_usize();
                                     let st = &mut lane.steps[idx];
@@ -945,7 +1396,9 @@ impl FunKeySynthApp {
                                         Color32::from_rgb(20, 24, 35)
                                     };
                                     let fill = if st.active {
-                                        if is_play {
+                                        if is_muted {
+                                            Color32::from_rgb(70, 56, 60)
+                                        } else if is_play {
                                             Color32::WHITE
                                         } else if st.ratchet > 1 {
                                             Color32::from_rgb(255, 118, 192)
@@ -966,6 +1419,107 @@ impl FunKeySynthApp {
                                         if st.active {
                                             st.velocity = 0.85;
                                             st.ratchet = 1;
+                                        }
+                                    }
+                                    if resp.secondary_clicked() {
+                                        st.active = true;
+                                        st.ratchet = (st.ratchet % 4) + 1;
+                                    }
+                                    let painter = ui.painter();
+                                    painter.rect_filled(rect, Rounding::same(4.0), fill);
+                                    if st.active && st.ratchet > 1 {
+                                        painter.text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("{}x", st.ratchet),
+                                            egui::FontId::proportional(9.5),
+                                            Color32::from_rgb(12, 14, 20),
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                        if let Some(s_idx) = solo_drum_lane {
+                            for (i, vp) in proj.drums.voices.iter_mut().enumerate() {
+                                vp.mute = i != s_idx;
+                            }
+                        }
+                        if unmute_all_drums {
+                            for vp in &mut proj.drums.voices {
+                                vp.mute = false;
+                            }
+                        }
+                    } else if self.selected_track == TrackId::Sampler {
+                        // 8-Lane Volca Sampler Grid right inside STUDIO!
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Open Volca Sampler Workbench →").clicked() {
+                                self.tab = StudioTab::Sampler;
+                            }
+                            ui.label(RichText::new("Click P1–P8 = Mute  •  Right-click step = Ratchet").size(10.5).weak());
+                        });
+                        ui.add_space(4.0);
+                        let active_pat = proj.active_pattern;
+                        let cell_w = ((ui.available_width() - 62.0 - 15.0 * 3.0) / 16.0).clamp(18.0, 34.0);
+                        let cell_h = 22.0;
+                        for part_idx in 0..8 {
+                            let is_muted = proj.sample_parts[part_idx].mute;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                let lbl = egui::Button::new(
+                                    RichText::new(if is_muted {
+                                        format!("X P{}", part_idx + 1)
+                                    } else {
+                                        format!("P{}", part_idx + 1)
+                                    })
+                                    .size(10.5)
+                                    .strong()
+                                    .color(if is_muted { Color32::GRAY } else { tc }),
+                                )
+                                .fill(if is_muted {
+                                    Color32::from_rgb(38, 22, 28)
+                                } else {
+                                    Color32::from_rgb(24, 29, 42)
+                                })
+                                .min_size(Vec2::new(54.0, cell_h));
+                                if ui
+                                    .add(lbl)
+                                    .on_hover_text(format!("{} — Click to Mute/Unmute", proj.sample_parts[part_idx].name))
+                                    .clicked()
+                                {
+                                    proj.sample_parts[part_idx].mute = !proj.sample_parts[part_idx].mute;
+                                }
+                                let lane = &mut proj.patterns[active_pat].sample_lanes[part_idx];
+                                for col in 0..16 {
+                                    let idx = (page_start + col) % lane.step_count.as_usize();
+                                    let st = &mut lane.steps[idx];
+                                    let is_play = play_step == Some(page_start + col);
+                                    let beat_tint = if (col / 4) % 2 == 0 {
+                                        Color32::from_rgb(26, 31, 44)
+                                    } else {
+                                        Color32::from_rgb(20, 24, 35)
+                                    };
+                                    let fill = if st.active {
+                                        if is_muted {
+                                            Color32::from_rgb(70, 56, 60)
+                                        } else if is_play {
+                                            Color32::WHITE
+                                        } else if st.ratchet > 1 {
+                                            Color32::from_rgb(255, 118, 192)
+                                        } else {
+                                            tc.gamma_multiply(0.84)
+                                        }
+                                    } else if is_play {
+                                        Color32::from_rgb(56, 68, 96)
+                                    } else {
+                                        beat_tint
+                                    };
+                                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(cell_w, cell_h), Sense::click());
+                                    if resp.clicked() {
+                                        st.active = !st.active;
+                                        if st.active {
+                                            st.velocity = 0.88;
+                                            st.ratchet = 1;
+                                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
                                         }
                                     }
                                     if resp.secondary_clicked() {
@@ -1240,458 +1794,19 @@ impl FunKeySynthApp {
                     proj.sample_data = SavedSample::from_f32_pcm(sname.clone(), 48_000, &pcm, None);
                     proj.sampler.start = 0.0;
                     proj.sampler.end = 1.0;
+                    proj.sampler.speed = 1.0;
+                    proj.sampler.transpose = 0;
+                    proj.sampler.tune_cents = 0.0;
+                    proj.sampler.key_pitch = false; // Play loaded MP3/WAV at exact 1.0x natural speed!
                     proj.sampler.mode = SamplerMode::HiFi;
-                    proj.sampler.cutoff = 14_000.0;
+                    proj.sampler.cutoff = 16_000.0;
                     proj.mixer.channels[TrackId::Sampler.index()].mute = false;
                     proj.sample_generation = proj.sample_generation.wrapping_add(1);
-                    self.set_toast(ctx, format!("Loaded {sname} ({secs:.2}s)"));
+                    self.set_toast(ctx, format!("Loaded {sname} ({secs:.2}s) @ 1.0x speed"));
                 }
                 Err(e) => self.set_toast(ctx, format!("Sample load error: {e}")),
             }
         }
-    }
-
-    fn ui_sampler(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        proj: &mut Project,
-        tel: &EngineTelemetry,
-        accent: Color32,
-    ) {
-        self.sync_waveform_cache(proj);
-        let samp_color = track_color(TrackId::Sampler);
-
-        // 1. SAMPLE LOADER & ACTIONS BAR
-        card_frame(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new("PRO SAMPLER WORKBENCH")
-                        .strong()
-                        .size(14.0)
-                        .color(samp_color),
-                );
-                ui.separator();
-
-                let load_btn = egui::Button::new(
-                    RichText::new("📂 Load MP3 / WAV / FLAC / OGG")
-                        .strong()
-                        .color(Color32::from_rgb(12, 14, 20)),
-                )
-                .fill(samp_color);
-                if ui.add(load_btn).clicked() {
-                    self.load_sample_dialog(ctx, proj);
-                }
-
-                egui::ComboBox::from_id_salt("sampler_tab_builtin")
-                    .width(165.0)
-                    .selected_text(&proj.sample_data.name)
-                    .show_ui(ui, |ui| {
-                        for (i, &sname) in BUILTIN_SAMPLE_NAMES.iter().enumerate() {
-                            if ui
-                                .selectable_label(proj.sample_data.builtin_id == Some(i as u8), sname)
-                                .clicked()
-                            {
-                                proj.sample_data.builtin_id = Some(i as u8);
-                                proj.sample_data.name = sname.to_string();
-                                proj.sample_data.pcm_i16_b64.clear();
-                                proj.sampler.start = 0.0;
-                                proj.sampler.end = 1.0;
-                                proj.sample_generation = proj.sample_generation.wrapping_add(1);
-                            }
-                        }
-                    });
-
-                if ui
-                    .button("✂ Auto-Trim")
-                    .on_hover_text("Trim leading/trailing silence & normalize peak")
-                    .clicked()
-                {
-                    let sr = proj.sample_data.sample_rate.max(8_000);
-                    let pcm = proj.sample_data.decode_f32_pcm().unwrap_or_else(|| {
-                        generate_builtin_sample(proj.sample_data.builtin_id.unwrap_or(3), sr)
-                    });
-                    let trimmed = trim_silence_and_normalize(&pcm, sr);
-                    proj.sample_data =
-                        SavedSample::from_f32_pcm(proj.sample_data.name.clone(), sr, &trimmed, None);
-                    proj.sampler.start = 0.0;
-                    proj.sampler.end = 1.0;
-                    proj.sample_generation = proj.sample_generation.wrapping_add(1);
-                    self.set_toast(ctx, "Trimmed silence & normalized!");
-                }
-
-                if ui
-                    .button("📊 Normalize")
-                    .on_hover_text("Normalize sample volume to full scale")
-                    .clicked()
-                {
-                    let sr = proj.sample_data.sample_rate.max(8_000);
-                    let pcm = proj.sample_data.decode_f32_pcm().unwrap_or_else(|| {
-                        generate_builtin_sample(proj.sample_data.builtin_id.unwrap_or(3), sr)
-                    });
-                    let norm = normalize_peak(&pcm);
-                    proj.sample_data =
-                        SavedSample::from_f32_pcm(proj.sample_data.name.clone(), sr, &norm, None);
-                    proj.sample_generation = proj.sample_generation.wrapping_add(1);
-                    self.set_toast(ctx, "Normalized sample!");
-                }
-
-                // Audition button (hold to play at root note!)
-                let root = proj.sampler.root_note;
-                let aud_resp = ui.add(
-                    egui::Button::new(
-                        RichText::new("▶ HOLD AUDITION")
-                            .strong()
-                            .color(Color32::from_rgb(12, 14, 20)),
-                    )
-                    .fill(Color32::from_rgb(72, 224, 148)),
-                );
-                if aud_resp.is_pointer_button_down_on() && self.sampler_audition_note != Some(root) {
-                    proj.mixer.channels[TrackId::Sampler.index()].mute = false;
-                    self.engine.send_live(LiveEvent::PlayNote {
-                        track: TrackId::Sampler,
-                        note: root,
-                        velocity: 0.92,
-                    });
-                    self.sampler_audition_note = Some(root);
-                } else if !aud_resp.is_pointer_button_down_on()
-                    && self.sampler_audition_note == Some(root)
-                {
-                    self.engine.send_live(LiveEvent::ReleaseNote {
-                        track: TrackId::Sampler,
-                        note: root,
-                    });
-                    self.sampler_audition_note = None;
-                }
-
-                // Track Volume + Mute right in the workbench
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let ch = &mut proj.mixer.channels[TrackId::Sampler.index()];
-                    ui.add(egui::Slider::new(&mut ch.volume, 0.0..=1.15).text("Vol").max_decimals(2));
-                    let m_btn = egui::Button::new(
-                        RichText::new(if ch.mute { "MUTED" } else { "ACTIVE" })
-                            .strong()
-                            .size(11.0)
-                            .color(Color32::WHITE),
-                    )
-                    .fill(if ch.mute {
-                        Color32::from_rgb(200, 62, 74)
-                    } else {
-                        Color32::from_rgb(46, 132, 92)
-                    });
-                    if ui.add(m_btn).clicked() {
-                        ch.mute = !ch.mute;
-                    }
-                });
-            });
-
-            // Duration & Slice Readout
-            let dur = self.sampler_duration_secs;
-            let start_s = proj.sampler.start * dur;
-            let end_s = proj.sampler.end * dur;
-            ui.label(
-                RichText::new(format!(
-                    "Sample: {}  •  Length: {:.2}s  •  Active Slice: {:.2}s – {:.2}s ({:.2}s)  •  Drag green START / coral END handles directly on the waveform!",
-                    proj.sample_data.name,
-                    dur,
-                    start_s,
-                    end_s,
-                    (end_s - start_s).max(0.0)
-                ))
-                .size(11.5)
-                .weak(),
-            );
-        });
-
-        ui.add_space(8.0);
-
-        // 2. INTERACTIVE VISUAL WAVEFORM DISPLAY (Draggable Start/End + Live Playhead!)
-        card_frame(ui, |ui| {
-            let wf_w = ui.available_width().max(300.0);
-            let wf_h = 150.0;
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(wf_w, wf_h), Sense::click_and_drag());
-
-            let start_x = rect.left() + proj.sampler.start.clamp(0.0, 0.99) * rect.width();
-            let end_x = rect.left() + proj.sampler.end.clamp(0.01, 1.0) * rect.width();
-
-            // Drag interaction for Start & End handles
-            if resp.drag_started() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let dist_start = (pos.x - start_x).abs();
-                    let dist_end = (pos.x - end_x).abs();
-                    self.sampler_drag_handle = if dist_start <= dist_end { Some(0) } else { Some(1) };
-                }
-            }
-            if resp.dragged() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let norm = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                    match self.sampler_drag_handle {
-                        Some(0) => {
-                            proj.sampler.start = norm.min(proj.sampler.end - 0.01).max(0.0);
-                        }
-                        Some(1) => {
-                            proj.sampler.end = norm.max(proj.sampler.start + 0.01).min(1.0);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if resp.drag_stopped() {
-                self.sampler_drag_handle = None;
-            }
-
-            let painter = ui.painter();
-            painter.rect_filled(rect, Rounding::same(8.0), Color32::from_rgb(10, 13, 20));
-
-            // Center line
-            let mid_y = rect.center().y;
-            painter.line_segment(
-                [egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)],
-                Stroke::new(1.0_f32, Color32::from_rgb(28, 34, 48)),
-            );
-
-            // Draw waveform bars
-            let n = self.sampler_peaks.len();
-            if n > 0 {
-                let half_h = rect.height() * 0.44;
-                let bar_w = rect.width() / n as f32;
-                for (i, &(mn, mx)) in self.sampler_peaks.iter().enumerate() {
-                    let x = rect.left() + (i as f32 + 0.5) * bar_w;
-                    let norm_x = i as f32 / n as f32;
-                    let in_slice = norm_x >= proj.sampler.start && norm_x <= proj.sampler.end;
-                    let col = if in_slice {
-                        samp_color
-                    } else {
-                        Color32::from_rgb(66, 74, 92)
-                    };
-                    let y0 = mid_y - mx.clamp(-1.0, 1.0) * half_h;
-                    let y1 = mid_y - mn.clamp(-1.0, 1.0) * half_h;
-                    painter.line_segment(
-                        [egui::pos2(x, y0), egui::pos2(x, y1.max(y0 + 1.0))],
-                        Stroke::new(bar_w.max(1.4), col),
-                    );
-                }
-            }
-
-            // Dimmed out-of-slice regions
-            let dim = Color32::from_rgba_unmultiplied(8, 10, 16, 145);
-            if start_x > rect.left() {
-                painter.rect_filled(
-                    egui::Rect::from_min_max(rect.left_top(), egui::pos2(start_x, rect.bottom())),
-                    Rounding::ZERO,
-                    dim,
-                );
-            }
-            if end_x < rect.right() {
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(end_x, rect.top()), rect.right_bottom()),
-                    Rounding::ZERO,
-                    dim,
-                );
-            }
-
-            // Start Handle (Green)
-            let start_col = Color32::from_rgb(72, 224, 148);
-            painter.line_segment(
-                [egui::pos2(start_x, rect.top()), egui::pos2(start_x, rect.bottom())],
-                Stroke::new(2.2_f32, start_col),
-            );
-            let start_tag = egui::Rect::from_min_size(egui::pos2(start_x, rect.top()), Vec2::new(42.0, 16.0));
-            painter.rect_filled(start_tag, Rounding::same(3.0), start_col);
-            painter.text(
-                start_tag.center(),
-                egui::Align2::CENTER_CENTER,
-                "START",
-                egui::FontId::proportional(9.5),
-                Color32::from_rgb(10, 14, 20),
-            );
-
-            // End Handle (Coral)
-            let end_col = Color32::from_rgb(245, 98, 112);
-            painter.line_segment(
-                [egui::pos2(end_x, rect.top()), egui::pos2(end_x, rect.bottom())],
-                Stroke::new(2.2_f32, end_col),
-            );
-            let end_tag = egui::Rect::from_min_size(
-                egui::pos2((end_x - 34.0).max(rect.left()), rect.top()),
-                Vec2::new(34.0, 16.0),
-            );
-            painter.rect_filled(end_tag, Rounding::same(3.0), end_col);
-            painter.text(
-                end_tag.center(),
-                egui::Align2::CENTER_CENTER,
-                "END",
-                egui::FontId::proportional(9.5),
-                Color32::WHITE,
-            );
-
-            // Live Playhead!
-            if let Some(ph) = tel.sampler_playhead {
-                let px = rect.left() + ph.clamp(0.0, 1.0) * rect.width();
-                painter.line_segment(
-                    [egui::pos2(px, rect.top()), egui::pos2(px, rect.bottom())],
-                    Stroke::new(2.0_f32, Color32::WHITE),
-                );
-            }
-
-            painter.rect_stroke(
-                rect,
-                Rounding::same(8.0),
-                Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 72)),
-            );
-
-            ui.add_space(6.0);
-
-            // Playable Chromatic / Interval Sample Pads!
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("TRIGGER PADS:").strong().size(11.5).color(samp_color));
-                const OFFSETS: [(&str, i8); 8] = [
-                    ("-12", -12),
-                    ("-7", -7),
-                    ("-5", -5),
-                    ("ROOT", 0),
-                    ("+3", 3),
-                    ("+5", 5),
-                    ("+7", 7),
-                    ("+12", 12),
-                ];
-                for &(lbl, off) in &OFFSETS {
-                    let midi = (proj.sampler.root_note as i16 + off as i16).clamp(24, 96) as u8;
-                    let held = self.sampler_audition_note == Some(midi);
-                    let btn = egui::Button::new(
-                        RichText::new(format!("{lbl}\n{}", note_name(midi)))
-                            .strong()
-                            .size(11.0)
-                            .color(if held { Color32::from_rgb(12, 14, 20) } else { Color32::WHITE }),
-                    )
-                    .fill(if held {
-                        samp_color
-                    } else if off == 0 {
-                        Color32::from_rgb(48, 56, 78)
-                    } else {
-                        Color32::from_rgb(28, 34, 48)
-                    })
-                    .min_size(Vec2::new(66.0, 36.0));
-                    let resp = ui.add(btn);
-                    if resp.is_pointer_button_down_on() && self.sampler_audition_note != Some(midi) {
-                        proj.mixer.channels[TrackId::Sampler.index()].mute = false;
-                        self.engine.send_live(LiveEvent::PlayNote {
-                            track: TrackId::Sampler,
-                            note: midi,
-                            velocity: 0.90,
-                        });
-                        self.sampler_audition_note = Some(midi);
-                    } else if !resp.is_pointer_button_down_on()
-                        && self.sampler_audition_note == Some(midi)
-                    {
-                        self.engine.send_live(LiveEvent::ReleaseNote {
-                            track: TrackId::Sampler,
-                            note: midi,
-                        });
-                        self.sampler_audition_note = None;
-                    }
-                }
-            });
-        });
-
-        ui.add_space(8.0);
-
-        // 3. REAL SAMPLER CONTROLS (4 clean cards in 2x2 grid)
-        let s = &mut proj.sampler;
-        ui.columns(2, |cols| {
-            // Card A: Slice & Playback
-            cols[0].vertical(|ui| {
-                card_frame(ui, |ui| {
-                    ui.label(RichText::new("SLICE & PLAYBACK").strong().size(12.5).color(samp_color));
-                    ui.add_space(4.0);
-                    let mut st_pct = s.start * 100.0;
-                    if ui
-                        .add(egui::Slider::new(&mut st_pct, 0.0..=99.0).suffix("%").text("Start"))
-                        .changed()
-                    {
-                        s.start = (st_pct / 100.0).min(s.end - 0.01).max(0.0);
-                    }
-                    let mut end_pct = s.end * 100.0;
-                    if ui
-                        .add(egui::Slider::new(&mut end_pct, 1.0..=100.0).suffix("%").text("End"))
-                        .changed()
-                    {
-                        s.end = (end_pct / 100.0).max(s.start + 0.01).min(1.0);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Loop:");
-                        ui.selectable_value(&mut s.loop_mode, LoopMode::OneShot, "1-Shot");
-                        ui.selectable_value(&mut s.loop_mode, LoopMode::Loop, "Loop");
-                        ui.selectable_value(&mut s.loop_mode, LoopMode::PingPong, "Ping-Pong");
-                        ui.checkbox(&mut s.reverse, "Reverse");
-                        if ui.small_button("Reset Slice").clicked() {
-                            s.start = 0.0;
-                            s.end = 1.0;
-                        }
-                    });
-                });
-
-                ui.add_space(8.0);
-
-                // Card C: Filter
-                card_frame(ui, |ui| {
-                    ui.label(RichText::new("SAMPLER FILTER").strong().size(12.5).color(accent));
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Mode:");
-                        ui.selectable_value(&mut s.filter_mode, GlobalFilterMode::LowPass, "Low-Pass");
-                        ui.selectable_value(&mut s.filter_mode, GlobalFilterMode::BandPass, "Band-Pass");
-                        ui.selectable_value(&mut s.filter_mode, GlobalFilterMode::HighPass, "High-Pass");
-                    });
-                    ui.add(
-                        egui::Slider::new(&mut s.cutoff, 120.0..=18_000.0)
-                            .logarithmic(true)
-                            .suffix(" Hz")
-                            .text("Cutoff"),
-                    );
-                    ui.add(egui::Slider::new(&mut s.resonance, 0.0..=0.88).text("Resonance"));
-                });
-            });
-
-            // Card B: Pitch & Lo-Fi Grit
-            cols[1].vertical(|ui| {
-                card_frame(ui, |ui| {
-                    ui.label(RichText::new("PITCH & LO-FI ENGINE").strong().size(12.5).color(samp_color));
-                    ui.add_space(4.0);
-                    ui.add(egui::Slider::new(&mut s.transpose, -24..=24).suffix(" st").text("Transpose"));
-                    ui.add(egui::Slider::new(&mut s.tune_cents, -100.0..=100.0).suffix(" ¢").text("Fine Tune"));
-                    ui.horizontal(|ui| {
-                        ui.label("Root Note:");
-                        if ui.small_button("-").clicked() {
-                            s.root_note = s.root_note.saturating_sub(1).max(24);
-                        }
-                        ui.strong(note_name(s.root_note));
-                        if ui.small_button("+").clicked() {
-                            s.root_note = (s.root_note + 1).min(96);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Character:");
-                        ui.selectable_value(&mut s.mode, SamplerMode::Sk1LoFi, "SK-1 8-Bit");
-                        ui.selectable_value(&mut s.mode, SamplerMode::Vintage12Bit, "12-Bit");
-                        ui.selectable_value(&mut s.mode, SamplerMode::HiFi, "Hi-Fi");
-                    });
-                    ui.add(egui::Slider::new(&mut s.bit_crush, 0.0..=1.0).text("Extra Crunch"));
-                });
-
-                ui.add_space(8.0);
-
-                // Card D: Amp Envelope (ADSR)
-                card_frame(ui, |ui| {
-                    ui.label(RichText::new("AMP ENVELOPE (ADSR)").strong().size(12.5).color(accent));
-                    ui.add_space(4.0);
-                    ui.add(egui::Slider::new(&mut s.attack, 0.001..=1.2).suffix(" s").text("Attack"));
-                    ui.add(egui::Slider::new(&mut s.decay, 0.02..=2.5).suffix(" s").text("Decay"));
-                    ui.add(egui::Slider::new(&mut s.sustain, 0.0..=1.0).text("Sustain"));
-                    ui.add(egui::Slider::new(&mut s.release, 0.01..=3.0).suffix(" s").text("Release"));
-                });
-            });
-        });
     }
 
     fn ui_arrange_party(
@@ -1806,7 +1921,7 @@ impl FunKeySynthApp {
                     ui.strong("Chords");
                     ui.strong("Arp");
                     ui.strong("303");
-                    ui.strong("Tex");
+                    ui.strong("Samp");
                     ui.strong("Drop");
                     ui.strong("Fill");
                     ui.strong("");
@@ -1856,70 +1971,126 @@ impl FunKeySynthApp {
         ui.add_space(8.0);
 
         ui.columns(2, |cols| {
-            // Left: Selected Track DSP Controls
+            // Left: Full Hardware Synth / Drum Engine Controls
             cols[0].vertical(|ui| {
                 card_frame(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("{} ENGINE", self.selected_track.role_name()))
-                            .strong()
-                            .size(13.0)
-                            .color(track_color(self.selected_track)),
-                    );
+                    let tc = track_color(self.selected_track);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} — FULL HARDWARE SYNTH", self.selected_track.role_name()))
+                                .strong()
+                                .size(13.0)
+                                .color(tc),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Hands-free Auto-Repeat / Drone Test Note Toggle!
+                            if toggle_pill(
+                                ui,
+                                if self.test_repeat_on { "🔁 TEST ON" } else { "🔁 TEST NOTE" },
+                                &mut self.test_repeat_on,
+                                Color32::from_rgb(72, 224, 148),
+                                "Hands-free repeating test phrase or held drone while you tweak knobs!",
+                            ) {
+                                if self.test_repeat_on {
+                                    self.test_repeat_next_t = ctx.input(|i| i.time);
+                                    self.test_repeat_step = 0;
+                                } else {
+                                    self.stop_test_repeat_note();
+                                }
+                            }
+                            for &(mode, lbl) in &[
+                                (TestRepeatMode::Drone, "Drone"),
+                                (TestRepeatMode::Eighth, "1/8"),
+                                (TestRepeatMode::Quarter, "1/4"),
+                            ] {
+                                if ui.selectable_label(self.test_repeat_mode == mode, lbl).clicked() {
+                                    self.test_repeat_mode = mode;
+                                    self.stop_test_repeat_note();
+                                    self.test_repeat_next_t = ctx.input(|i| i.time);
+                                }
+                            }
+                        });
+                    });
                     ui.add_space(6.0);
 
                     match self.selected_track {
-                        TrackId::Moog => moog_controls(ui, &mut proj.moog, "moog_bass"),
-                        TrackId::MoogPad => moog_controls(ui, &mut proj.moog_pad, "moog_pad"),
-                        TrackId::Monologue => {
-                            let m = &mut proj.monologue;
-                            egui::ComboBox::from_id_salt("mono_vco1")
-                                .selected_text(format!("VCO 1: {:?}", m.vco1_wave))
-                                .show_ui(ui, |ui| {
-                                    for w in [MonologueOscWave::Saw, MonologueOscWave::Triangle, MonologueOscWave::Square] {
-                                        ui.selectable_value(&mut m.vco1_wave, w, format!("{w:?}"));
-                                    }
-                                });
-                            ui.add(egui::Slider::new(&mut m.cutoff, 80.0..=14_000.0).logarithmic(true).text("Cutoff Hz"));
-                            ui.add(egui::Slider::new(&mut m.resonance, 0.0..=0.92).text("Resonance"));
-                            ui.add(egui::Slider::new(&mut m.eg_int, -1.0..=1.0).text("Filter Env"));
-                            ui.add(egui::Slider::new(&mut m.eg_decay, 0.02..=2.0).text("Decay"));
-                            ui.add(egui::Slider::new(&mut m.drive, 0.0..=1.0).text("Drive"));
-                            ui.add(egui::Slider::new(&mut m.glide, 0.0..=0.5).text("Glide"));
-                        }
+                        TrackId::Moog => moog_controls(ui, &mut proj.moog, "moog_bass", tc),
+                        TrackId::MoogPad => moog_controls(ui, &mut proj.moog_pad, "moog_pad", tc),
+                        TrackId::Monologue => monologue_controls(ui, &mut proj.monologue, tc),
                         TrackId::Tb303 => {
                             let a = &mut proj.tb303;
+                            ui.label(RichText::new("OSCILLATOR & TUNING").strong().size(11.5).color(tc));
                             ui.horizontal(|ui| {
+                                ui.label("Wave:");
                                 ui.selectable_value(&mut a.wave, Tb303Wave::Saw, "Saw");
                                 ui.selectable_value(&mut a.wave, Tb303Wave::Square, "Square");
                             });
-                            ui.add(egui::Slider::new(&mut a.cutoff, 80.0..=6000.0).logarithmic(true).text("Cutoff Hz"));
+                            ui.add(egui::Slider::new(&mut a.tuning, -12.0..=12.0).suffix(" st").text("Tuning"));
+                            ui.separator();
+                            ui.label(RichText::new("DIODE LADDER FILTER & ACID").strong().size(11.5).color(tc));
+                            ui.add(egui::Slider::new(&mut a.cutoff, 80.0..=6000.0).logarithmic(true).suffix(" Hz").text("Cutoff"));
                             ui.add(egui::Slider::new(&mut a.resonance, 0.0..=0.96).text("Resonance"));
                             ui.add(egui::Slider::new(&mut a.env_mod, 0.0..=1.0).text("Env Mod"));
-                            ui.add(egui::Slider::new(&mut a.decay, 0.05..=1.5).text("Decay"));
+                            ui.add(egui::Slider::new(&mut a.decay, 0.05..=1.5).suffix(" s").text("Decay"));
                             ui.add(egui::Slider::new(&mut a.accent, 0.0..=1.0).text("Accent"));
                             ui.add(egui::Slider::new(&mut a.overdrive, 0.0..=1.0).text("Overdrive"));
                         }
                         TrackId::Drums => {
-                            ui.horizontal(|ui| {
-                                ui.label("Kit Model:");
-                                if ui.button("808").clicked() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Kit Preset:");
+                                if ui.button("All 808").clicked() {
                                     proj.drums.set_all_model(DrumModel::Tr808);
                                 }
-                                if ui.button("909").clicked() {
+                                if ui.button("All 909").clicked() {
                                     proj.drums.set_all_model(DrumModel::Tr909);
                                 }
                                 if ui.button("Hybrid 808/909").clicked() {
                                     proj.drums.set_hybrid();
                                 }
+                                if ui.button("Unmute All").clicked() {
+                                    for v in &mut proj.drums.voices {
+                                        v.mute = false;
+                                    }
+                                }
                             });
-                            ui.add_space(4.0);
+                            ui.add(egui::Slider::new(&mut proj.drums.accent_level, 0.0..=1.0).text("Global Accent"));
+                            ui.separator();
                             for (i, v) in proj.drums.voices.iter_mut().enumerate() {
-                                let name = DrumVoiceId::from_index(i).map(|d| d.short_name()).unwrap_or("DRM");
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(name).strong().size(11.0));
-                                    ui.add(egui::Slider::new(&mut v.level, 0.0..=1.2).text("Lvl").max_decimals(2));
-                                    ui.add(egui::Slider::new(&mut v.decay, 0.05..=1.0).text("Dec").max_decimals(2));
-                                    ui.add(egui::Slider::new(&mut v.tune, -12.0..=12.0).text("Tune").max_decimals(1));
+                                let name = DrumVoiceId::from_index(i).map(|d| d.full_name()).unwrap_or("Drum");
+                                egui::CollapsingHeader::new(
+                                    RichText::new(format!(
+                                        "{}  [{}]{}",
+                                        name,
+                                        match v.model {
+                                            DrumModel::Tr808 => "808",
+                                            DrumModel::Tr909 => "909",
+                                        },
+                                        if v.mute { "  (MUTED)" } else { "" }
+                                    ))
+                                    .strong()
+                                    .color(if v.mute { Color32::GRAY } else { tc }),
+                                )
+                                .default_open(i < 2)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("🔊 Hit").clicked() {
+                                            v.mute = false;
+                                            self.engine.send_live(LiveEvent::PlayNote {
+                                                track: TrackId::Drums,
+                                                note: i as u8,
+                                                velocity: 0.92,
+                                            });
+                                        }
+                                        ui.checkbox(&mut v.mute, "Mute");
+                                        ui.selectable_value(&mut v.model, DrumModel::Tr808, "808");
+                                        ui.selectable_value(&mut v.model, DrumModel::Tr909, "909");
+                                    });
+                                    ui.add(egui::Slider::new(&mut v.level, 0.0..=1.25).text("Level"));
+                                    ui.add(egui::Slider::new(&mut v.tune, -12.0..=12.0).suffix(" st").text("Tune"));
+                                    ui.add(egui::Slider::new(&mut v.decay, 0.05..=1.0).text("Decay"));
+                                    ui.add(egui::Slider::new(&mut v.tone, 0.0..=1.0).text("Tone"));
+                                    ui.add(egui::Slider::new(&mut v.snappy, 0.0..=1.0).text("Snappy"));
+                                    ui.add(egui::Slider::new(&mut v.pan, -1.0..=1.0).text("Pan"));
                                 });
                             }
                         }
@@ -1967,6 +2138,8 @@ impl FunKeySynthApp {
                             });
                             ui.add(egui::Slider::new(&mut s.start, 0.0..=0.98).text("Start"));
                             ui.add(egui::Slider::new(&mut s.end, 0.02..=1.0).text("End"));
+                            ui.add(egui::Slider::new(&mut s.transpose, -24..=24).suffix(" st").text("Transpose"));
+                            ui.add(egui::Slider::new(&mut s.tune_cents, -100.0..=100.0).suffix(" ¢").text("Fine Tune"));
                             ui.add(egui::Slider::new(&mut s.cutoff, 150.0..=16_000.0).logarithmic(true).text("Cutoff Hz"));
                             ui.add(egui::Slider::new(&mut s.resonance, 0.0..=0.88).text("Resonance"));
                             ui.add(egui::Slider::new(&mut s.attack, 0.001..=0.5).text("Attack"));
@@ -2049,27 +2222,148 @@ impl FunKeySynthApp {
     }
 }
 
-fn moog_controls(ui: &mut egui::Ui, m: &mut crate::model::MoogParams, id: &str) {
+fn moog_controls(ui: &mut egui::Ui, m: &mut crate::model::MoogParams, id: &str, tc: Color32) {
     ui.horizontal(|ui| {
         ui.checkbox(&mut m.poly_mode, "Polyphonic");
+        ui.add(egui::Slider::new(&mut m.glide, 0.0..=0.6).text("Glide"));
+    });
+
+    ui.separator();
+    ui.label(RichText::new("OSCILLATORS & CP3 MIXER").strong().size(11.5).color(tc));
+    // Osc 1
+    ui.horizontal(|ui| {
+        ui.label("Osc 1:");
         egui::ComboBox::from_id_salt((id, "w1"))
-            .selected_text(format!("Osc 1: {}", m.osc1_wave.name()))
+            .width(86.0)
+            .selected_text(m.osc1_wave.name())
             .show_ui(ui, |ui| {
                 for &w in &MoogWave::ALL {
                     ui.selectable_value(&mut m.osc1_wave, w, w.name());
                 }
             });
+        ui.add(egui::Slider::new(&mut m.osc1_level, 0.0..=1.0).text("Lvl"));
     });
-    ui.add(egui::Slider::new(&mut m.cutoff, 60.0..=16_000.0).logarithmic(true).text("Cutoff Hz"));
-    ui.add(egui::Slider::new(&mut m.resonance, 0.0..=0.92).text("Resonance"));
-    ui.add(egui::Slider::new(&mut m.env_amount, -1.0..=1.0).text("Filter Env"));
-    ui.add(egui::Slider::new(&mut m.drive, 0.0..=1.0).text("Drive"));
-    ui.add(egui::Slider::new(&mut m.osc2_detune, -30.0..=30.0).text("Detune"));
-    ui.add(egui::Slider::new(&mut m.amp_attack, 0.002..=1.2).text("Attack"));
-    ui.add(egui::Slider::new(&mut m.amp_decay, 0.05..=2.0).text("Decay"));
-    ui.add(egui::Slider::new(&mut m.amp_sustain, 0.0..=1.0).text("Sustain"));
-    ui.add(egui::Slider::new(&mut m.amp_release, 0.02..=2.5).text("Release"));
+    // Osc 2
+    ui.horizontal(|ui| {
+        ui.label("Osc 2:");
+        egui::ComboBox::from_id_salt((id, "w2"))
+            .width(86.0)
+            .selected_text(m.osc2_wave.name())
+            .show_ui(ui, |ui| {
+                for &w in &MoogWave::ALL {
+                    ui.selectable_value(&mut m.osc2_wave, w, w.name());
+                }
+            });
+        ui.add(egui::DragValue::new(&mut m.osc2_octave).range(-2..=2).prefix("Oct "));
+        ui.add(egui::Slider::new(&mut m.osc2_level, 0.0..=1.0).text("Lvl"));
+    });
+    ui.add(egui::Slider::new(&mut m.osc2_detune, -50.0..=50.0).suffix(" ¢").text("Osc 2 Detune"));
+    // Osc 3
+    ui.horizontal(|ui| {
+        ui.label("Osc 3:");
+        egui::ComboBox::from_id_salt((id, "w3"))
+            .width(86.0)
+            .selected_text(m.osc3_wave.name())
+            .show_ui(ui, |ui| {
+                for &w in &MoogWave::ALL {
+                    ui.selectable_value(&mut m.osc3_wave, w, w.name());
+                }
+            });
+        ui.add(egui::DragValue::new(&mut m.osc3_octave).range(-2..=2).prefix("Oct "));
+        ui.add(egui::Slider::new(&mut m.osc3_level, 0.0..=1.0).text("Lvl"));
+    });
+    ui.add(egui::Slider::new(&mut m.osc3_detune, -50.0..=50.0).suffix(" ¢").text("Osc 3 Detune"));
+    ui.add(egui::Slider::new(&mut m.noise_level, 0.0..=0.6).text("Noise"));
+    ui.add(egui::Slider::new(&mut m.drive, 0.0..=1.0).text("CP3 Drive"));
+
+    ui.separator();
+    ui.label(RichText::new("24dB LADDER FILTER & FILTER ENV").strong().size(11.5).color(tc));
+    ui.add(egui::Slider::new(&mut m.cutoff, 30.0..=16_000.0).logarithmic(true).suffix(" Hz").text("Cutoff"));
+    ui.add(egui::Slider::new(&mut m.resonance, 0.0..=0.94).text("Resonance"));
+    ui.add(egui::Slider::new(&mut m.env_amount, -1.0..=1.0).text("Env Amount"));
+    ui.add(egui::Slider::new(&mut m.key_track, 0.0..=1.0).text("Key Track"));
+    ui.add(egui::Slider::new(&mut m.filt_attack, 0.002..=1.5).suffix(" s").text("Filt Attack"));
+    ui.add(egui::Slider::new(&mut m.filt_decay, 0.02..=2.5).suffix(" s").text("Filt Decay"));
+    ui.add(egui::Slider::new(&mut m.filt_sustain, 0.0..=1.0).text("Filt Sustain"));
+    ui.add(egui::Slider::new(&mut m.filt_release, 0.02..=2.5).suffix(" s").text("Filt Release"));
+
+    ui.separator();
+    ui.label(RichText::new("AMP ENVELOPE & LFO").strong().size(11.5).color(tc));
+    ui.add(egui::Slider::new(&mut m.amp_attack, 0.002..=1.5).suffix(" s").text("Amp Attack"));
+    ui.add(egui::Slider::new(&mut m.amp_decay, 0.02..=2.5).suffix(" s").text("Amp Decay"));
+    ui.add(egui::Slider::new(&mut m.amp_sustain, 0.0..=1.0).text("Amp Sustain"));
+    ui.add(egui::Slider::new(&mut m.amp_release, 0.02..=3.0).suffix(" s").text("Amp Release"));
+    ui.add(egui::Slider::new(&mut m.lfo_rate, 0.1..=18.0).suffix(" Hz").text("LFO Rate"));
+    ui.add(egui::Slider::new(&mut m.lfo_to_pitch, 0.0..=1.0).text("LFO → Pitch"));
+    ui.add(egui::Slider::new(&mut m.lfo_to_filter, 0.0..=1.0).text("LFO → Filter"));
+}
+
+fn monologue_controls(ui: &mut egui::Ui, m: &mut crate::model::MonologueParams, tc: Color32) {
+    ui.label(RichText::new("VCO 1 & VCO 2 (SYNC / RING)").strong().size(11.5).color(tc));
+    ui.horizontal(|ui| {
+        ui.label("VCO 1:");
+        for &w in &MonologueOscWave::ALL {
+            ui.selectable_value(&mut m.vco1_wave, w, w.name());
+        }
+    });
+    ui.add(egui::Slider::new(&mut m.vco1_shape, 0.0..=1.0).text("VCO 1 Shape"));
+    ui.add(egui::Slider::new(&mut m.vco1_level, 0.0..=1.0).text("VCO 1 Level"));
+
+    ui.horizontal(|ui| {
+        ui.label("VCO 2:");
+        for &w in &MonologueOscWave::ALL {
+            ui.selectable_value(&mut m.vco2_wave, w, w.name());
+        }
+        ui.add(egui::DragValue::new(&mut m.vco2_octave).range(-2..=2).prefix("Oct "));
+    });
+    ui.add(egui::Slider::new(&mut m.vco2_pitch, -12.0..=12.0).suffix(" st").text("VCO 2 Pitch"));
+    ui.add(egui::Slider::new(&mut m.vco2_shape, 0.0..=1.0).text("VCO 2 Shape"));
+    ui.add(egui::Slider::new(&mut m.vco2_level, 0.0..=1.0).text("VCO 2 Level"));
+    ui.horizontal(|ui| {
+        ui.label("VCO 2 Mod:");
+        for &mm in &Osc2ModMode::ALL {
+            ui.selectable_value(&mut m.mod_mode, mm, mm.name());
+        }
+    });
     ui.add(egui::Slider::new(&mut m.glide, 0.0..=0.5).text("Glide"));
+
+    ui.separator();
+    ui.label(RichText::new("12dB FILTER, DRIVE & ENVELOPE").strong().size(11.5).color(tc));
+    ui.add(egui::Slider::new(&mut m.cutoff, 30.0..=16_000.0).logarithmic(true).suffix(" Hz").text("Cutoff"));
+    ui.add(egui::Slider::new(&mut m.resonance, 0.0..=0.94).text("Resonance"));
+    ui.add(egui::Slider::new(&mut m.drive, 0.0..=1.0).text("Drive"));
+    ui.horizontal(|ui| {
+        ui.label("EG Target:");
+        for &t in &EgTarget::ALL {
+            ui.selectable_value(&mut m.eg_target, t, t.name());
+        }
+    });
+    ui.add(egui::Slider::new(&mut m.eg_attack, 0.002..=1.5).suffix(" s").text("EG Attack"));
+    ui.add(egui::Slider::new(&mut m.eg_decay, 0.02..=2.5).suffix(" s").text("EG Decay"));
+    ui.add(egui::Slider::new(&mut m.eg_int, -1.0..=1.0).text("EG Intensity"));
+    ui.checkbox(&mut m.amp_sustain, "Amp Gate Sustain (off = punchy AD)");
+
+    ui.separator();
+    ui.label(RichText::new("LFO MODULATION").strong().size(11.5).color(tc));
+    ui.horizontal(|ui| {
+        ui.label("Wave:");
+        for &w in &LfoWave::ALL {
+            ui.selectable_value(&mut m.lfo_wave, w, w.name());
+        }
+        ui.separator();
+        ui.label("Mode:");
+        for &lm in &LfoMode::ALL {
+            ui.selectable_value(&mut m.lfo_mode, lm, lm.name());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Target:");
+        for &lt in &LfoTarget::ALL {
+            ui.selectable_value(&mut m.lfo_target, lt, lt.name());
+        }
+    });
+    ui.add(egui::Slider::new(&mut m.lfo_rate, 0.0..=1.0).text("LFO Rate"));
+    ui.add(egui::Slider::new(&mut m.lfo_int, -1.0..=1.0).text("LFO Intensity"));
 }
 
 fn track_mixer_mut(p: &mut Project, track: TrackId) -> (&mut f32, &mut bool, &mut bool) {
@@ -2169,29 +2463,6 @@ fn draw_scope(painter: &egui::Painter, rect: egui::Rect, samples: &[f32], color:
     painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
 }
 
-fn compute_waveform_peaks(pcm: &[f32], bins: usize) -> Vec<(f32, f32)> {
-    if pcm.is_empty() || bins == 0 {
-        return Vec::new();
-    }
-    let bins = bins.min(pcm.len());
-    let mut out = Vec::with_capacity(bins);
-    for i in 0..bins {
-        let start = (i * pcm.len()) / bins;
-        let end = (((i + 1) * pcm.len()) / bins).max(start + 1).min(pcm.len());
-        let mut mn = 0.0_f32;
-        let mut mx = 0.0_f32;
-        for &s in &pcm[start..end] {
-            if s < mn {
-                mn = s;
-            }
-            if s > mx {
-                mx = s;
-            }
-        }
-        out.push((mn, mx));
-    }
-    out
-}
 
 fn apply_studio_theme(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();

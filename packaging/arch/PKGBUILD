@@ -1,0 +1,21 @@
+pkgname=fun-key-synth
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Fun Key Synth — Vibe Studio, Auto-Chord/Beat Groovebox & 8-Part Performance Sampler"
+arch=('x86_64')
+url="https://github.com/morganlowe/fun-key-synth"
+license=('MIT')
+depends=('alsa-lib' 'libxkbcommon' 'wayland' 'libglvnd')
+makedepends=('cargo' 'rust')
+
+build() {
+    cd "$startdir/../.."
+    cargo build --release --locked
+}
+
+package() {
+    cd "$startdir/../.."
+    install -Dm755 "target/release/fun-key-synth" "$pkgdir/usr/bin/fun-key-synth"
+    install -Dm644 "packaging/fun-key-synth.desktop" "$pkgdir/usr/share/applications/fun-key-synth.desktop"
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/fun-key-synth/README.md"
+}

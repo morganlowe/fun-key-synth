@@ -1,6 +1,10 @@
 /target/
 /Inspiration/
+/packaging/build/
 *.tar.gz
+*.deb
+*.pkg.tar.zst
+*.zip
 *.wav
 *.mp3
 *.flac

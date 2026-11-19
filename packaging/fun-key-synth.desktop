@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Fun Key Synth
+Comment=Beginner-friendly Vibe Studio, Auto-Chord/Beat Groovebox & 8-Part Performance Sampler
+Exec=/usr/bin/fun-key-synth
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Music;Synthesizer;
+Keywords=synth;groovebox;sampler;music;beats;volca;

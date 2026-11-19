@@ -8,7 +8,7 @@ pub use project::{
     load_project, save_project, DelayDivision, DrumKitParams, DrumModel, DrumVoiceParams, EgTarget,
     FactoryPreset, FxParams, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MidiSettings,
     MixerParams, MonologueOscWave, MonologueParams, MoogParams, MoogWave, Osc2ModMode, Project,
-    SamplerMode, SamplerParams, SavedSample, SongSection, Tb303Params, Tb303Wave,
+    SamplePart, SamplerMode, SamplerParams, SavedSample, SongSection, Tb303Params, Tb303Wave,
     TrackMixerChannel,
 };
 pub use sequencer::{
@@ -100,7 +100,7 @@ impl TrackId {
             TrackId::MoogPad => "CHORDS",
             TrackId::Monologue => "ARP",
             TrackId::Tb303 => "LEAD / 303",
-            TrackId::Sampler => "TEXTURE",
+            TrackId::Sampler => "SAMPLER",
             TrackId::MidiOut => "MIDI",
         }
     }

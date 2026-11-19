@@ -1,0 +1,41 @@
+name: Release Windows Binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package Windows ZIP
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $dir = "fun-key-synth-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "target/release/fun-key-synth.exe" "$dir/fun-key-synth.exe"
+          Copy-Item "README.md" "$dir/README.md"
+          Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
+
+      - name: Upload Windows asset to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = "fun-key-synth-$tag-windows-x86_64.zip"
+          gh release upload $tag $zip --clobber
