@@ -1,17 +1,23 @@
 use crate::{
     dsp::sampler::{load_audio_to_mono_f32, BUILTIN_SAMPLE_NAMES},
-    engine::{export_wav, AudioEngine, LiveEvent},
+    engine::{export_stems, export_wav, AudioEngine, LiveEvent},
+    mic::MicRecorder,
+    midi::{MidiManager, MidiMsg},
     model::{
         apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads, generate_auto_beat,
-        generate_melodic_tracks, load_project, note_name, root_name, save_project,
-        voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId,
-        EgTarget, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MonologueOscWave,
-        MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, SongSection, Tb303Wave, TrackId,
-        Vibe, NOTE_NAMES, PROGRESSIONS,
+        generate_melodic_tracks, load_pattern, load_project, note_name, root_name, save_pattern,
+        save_project, voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel,
+        DrumVoiceId, EgTarget, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
+        MonologueOscWave, MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, SongSection,
+        Tb303Wave, TrackId, Vibe, NOTE_NAMES, PROGRESSIONS,
+    },
+    settings::{
+        spawn_update_check, AppSettings, StudioTheme, UpdateStatus, CURRENT_VERSION, RELEASES_URL,
     },
 };
 use eframe::egui::{self, Color32, Key, RichText, Rounding, Sense, Stroke, Vec2};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StudioTab {
@@ -46,6 +52,12 @@ pub struct FunKeySynthApp {
     // Sampler visual waveform state (Volca 8-part)
     volca_ui: crate::volca_ui::VolcaUiState,
     app_icon: egui::TextureHandle,
+    midi: MidiManager,
+    mic: MicRecorder,
+    rec_motion: bool,
+    settings: AppSettings,
+    show_settings: bool,
+    update_status: Arc<Mutex<UpdateStatus>>,
     // Sound Lab / Sampler Auto-Repeat Test Note
     test_repeat_on: bool,
     test_repeat_mode: TestRepeatMode,
@@ -57,7 +69,12 @@ pub struct FunKeySynthApp {
 
 impl FunKeySynthApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_studio_theme(&cc.egui_ctx);
+        let settings = AppSettings::load();
+        settings.apply_to_egui(&cc.egui_ctx);
+        let update_status = Arc::new(Mutex::new(UpdateStatus::Idle));
+        if settings.check_updates_on_startup {
+            spawn_update_check(update_status.clone());
+        }
         let icon_img = egui::ColorImage::from_rgba_unmultiplied([64, 64], include_bytes!("icon_64.rgba"));
         let app_icon = cc.egui_ctx.load_texture("app_icon", icon_img, egui::TextureOptions::LINEAR);
         let project = Project::default();
@@ -79,6 +96,12 @@ impl FunKeySynthApp {
             toast: None,
             volca_ui: crate::volca_ui::VolcaUiState::default(),
             app_icon,
+            midi: MidiManager::default(),
+            mic: MicRecorder::default(),
+            rec_motion: false,
+            settings,
+            show_settings: false,
+            update_status,
             test_repeat_on: false,
             test_repeat_mode: TestRepeatMode::Quarter,
             test_repeat_next_t: 0.0,
@@ -241,6 +264,110 @@ impl FunKeySynthApp {
         0x51A7_1337u32.wrapping_mul(self.roll_counter).wrapping_add(0x9E37_79B9)
     }
 
+    fn handle_midi(
+        &mut self,
+        p: &mut Project,
+        pads: &[AutoChordPad],
+        playing: bool,
+        cur_step: usize,
+    ) {
+        let msgs = self.midi.drain();
+        for msg in msgs {
+            match msg {
+                MidiMsg::NoteOn { note, velocity } => {
+                    if self.tab == StudioTab::Sampler && (36..44).contains(&note) {
+                        let part = (note - 36) as usize;
+                        self.volca_ui.selected_part = part;
+                        p.mixer.channels[TrackId::Sampler.index()].mute = false;
+                        self.engine.send_live(LiveEvent::TriggerSamplePart { part, velocity });
+                        if self.record_live && playing {
+                            let lane = &mut p.current_pattern_mut().sample_lanes[part];
+                            let s_idx = cur_step % lane.step_count.as_usize();
+                            lane.steps[s_idx].active = true;
+                            lane.steps[s_idx].velocity = velocity;
+                        }
+                    } else if p.auto_chord_mode {
+                        let idx = (note as usize) % pads.len().max(1);
+                        self.trigger_pad_down(idx, p, pads, playing, cur_step);
+                    } else {
+                        let target = if self.selected_track == TrackId::Drums {
+                            TrackId::Monologue
+                        } else {
+                            self.selected_track
+                        };
+                        self.engine.send_live(LiveEvent::PlayNote {
+                            track: target,
+                            note,
+                            velocity,
+                        });
+                        if self.record_live && playing {
+                            if let Some(seq) = p.current_pattern_mut().melodic_mut(target) {
+                                let s_idx = cur_step % seq.step_count.as_usize();
+                                let st = &mut seq.steps[s_idx];
+                                st.active = true;
+                                st.note = note;
+                                st.velocity = velocity;
+                                st.gate = 1.5;
+                            }
+                        }
+                    }
+                }
+                MidiMsg::NoteOff { note } => {
+                    if self.tab == StudioTab::Sampler && (36..44).contains(&note) {
+                        let part = (note - 36) as usize;
+                        if p.sample_parts[part].loop_mode != LoopMode::OneShot {
+                            self.engine.send_live(LiveEvent::ReleaseSamplePart { part });
+                        }
+                    } else if p.auto_chord_mode {
+                        self.engine.send_live(LiveEvent::ReleaseChord);
+                    } else {
+                        let target = if self.selected_track == TrackId::Drums {
+                            TrackId::Monologue
+                        } else {
+                            self.selected_track
+                        };
+                        self.engine.send_live(LiveEvent::ReleaseNote { track: target, note });
+                    }
+                }
+                MidiMsg::Cc { cc, value } => match cc {
+                    1 | 74 => {
+                        p.fx.global_filter_cutoff = 120.0 * (18_000.0_f32 / 120.0).powf(value);
+                        if self.rec_motion && playing {
+                            p.current_pattern_mut().motion.filter[cur_step % 64] = Some(value);
+                        }
+                    }
+                    71 => {
+                        p.fx.global_filter_resonance = value * 0.85;
+                        p.tb303.resonance = (value * 0.92).clamp(0.1, 0.94);
+                    }
+                    91 => {
+                        p.fx.reverb_mix = value;
+                        p.fx.delay_mix = (value * 0.92).min(0.85);
+                        if self.rec_motion && playing {
+                            p.current_pattern_mut().motion.space[cur_step % 64] = Some(value);
+                        }
+                    }
+                    7 => {
+                        p.mixer.master_volume = (value * 1.15).clamp(0.0, 1.15);
+                    }
+                    16 => {
+                        p.sampler_iso_bass = value * 2.0;
+                        if self.rec_motion && playing {
+                            p.current_pattern_mut().motion.iso_bass[cur_step % 64] = Some(value * 2.0);
+                        }
+                    }
+                    17 => {
+                        p.sampler_iso_treble = value * 2.0;
+                        if self.rec_motion && playing {
+                            p.current_pattern_mut().motion.iso_treble[cur_step % 64] = Some(value * 2.0);
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+
     fn handle_keyboard(
         &mut self,
         ctx: &egui::Context,
@@ -387,9 +514,16 @@ impl eframe::App for FunKeySynthApp {
             Err(_) => return,
         };
         let pads = build_auto_chord_pads(proj.root_note, proj.scale);
-        let accent = vibe_color(proj.vibe);
+        let accent = if self.settings.use_vibe_accent {
+            vibe_color(proj.vibe)
+        } else {
+            let [r, g, b] = self.settings.custom_accent;
+            Color32::from_rgb(r, g, b)
+        };
+        let theme = self.settings.theme;
 
         self.handle_keyboard(ctx, &mut proj, &pads, playing, cur_step);
+        self.handle_midi(&mut proj, &pads, playing, cur_step);
         self.update_test_repeat(ctx, &proj, playing);
 
         if playing && self.follow_playhead {
@@ -400,9 +534,9 @@ impl eframe::App for FunKeySynthApp {
         egui::TopBottomPanel::top("top_vibe_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(16, 19, 27))
+                    .fill(theme.bar_bg())
                     .inner_margin(egui::Margin::symmetric(14.0, 8.0))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(36, 42, 58))),
+                    .stroke(Stroke::new(1.0_f32, theme.border())),
             )
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -512,7 +646,7 @@ impl eframe::App for FunKeySynthApp {
                     );
                     if toggle_pill(
                         ui,
-                        if proj.party_mode { "★ PARTY ON" } else { "★ PARTY MODE" },
+                        if proj.party_mode { "PARTY ON" } else { "PARTY MODE" },
                         &mut proj.party_mode,
                         Color32::from_rgb(244, 92, 186),
                         "Generates and evolves full tracks on the fly for your chosen Vibe!",
@@ -545,9 +679,58 @@ impl eframe::App for FunKeySynthApp {
                             ui.label(RichText::new(chord_text).strong().size(12.5).color(accent));
                         });
 
-                    // Right-aligned Views + Save/Load/Export
+                    // Right-aligned Views + MIDI + Prefs + Save/Load/Export
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Export WAV").on_hover_text("Render 16 bars to stereo WAV").clicked() {
+                        // Prefs / Theme & Update Check button
+                        if ui
+                            .button("Prefs")
+                            .on_hover_text("Color themes, custom accent & GitHub update check settings")
+                            .clicked()
+                        {
+                            self.show_settings = !self.show_settings;
+                        }
+
+                        // Non-intrusive Update Available badge if GitHub has a newer release
+                        let upd_snapshot = self
+                            .update_status
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+                        if let UpdateStatus::UpdateAvailable { latest_tag, url } = upd_snapshot {
+                            let ubtn = egui::Button::new(
+                                RichText::new(format!("Update {latest_tag}"))
+                                    .strong()
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(12, 14, 20)),
+                            )
+                            .fill(Color32::from_rgb(72, 224, 148));
+                            if ui
+                                .add(ubtn)
+                                .on_hover_text("New release available on GitHub — click to open Releases")
+                                .clicked()
+                            {
+                                ctx.open_url(egui::OpenUrl::new_tab(url));
+                            }
+                        }
+
+                        if ui
+                            .button("Stems")
+                            .on_hover_text("Export Master + 6 separate stereo WAV stems for DAW mixing")
+                            .clicked()
+                        {
+                            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                let bars = if proj.song_mode {
+                                    proj.song_sections.iter().map(|s| s.bars.max(1) as usize).sum::<usize>().clamp(4, 64)
+                                } else {
+                                    16
+                                };
+                                match export_stems(&proj, &dir, bars) {
+                                    Ok(n) => self.set_toast(ctx, format!("Exported {n} stereo WAV stems!")),
+                                    Err(e) => self.set_toast(ctx, format!("Stem export error: {e}")),
+                                }
+                            }
+                        }
+                        if ui.button("WAV").on_hover_text("Export stereo mix WAV").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .set_file_name(format!("{}.wav", proj.vibe.name().to_lowercase().replace(' ', "_")))
                                 .add_filter("WAV Audio", &["wav"])
@@ -572,8 +755,15 @@ impl eframe::App for FunKeySynthApp {
                                 match load_project(&path) {
                                     Ok(mut loaded) => {
                                         loaded.sample_generation = proj.sample_generation.wrapping_add(1);
+                                        for (i, sp) in loaded.sample_parts.iter_mut().enumerate() {
+                                            sp.generation = proj
+                                                .sample_parts
+                                                .get(i)
+                                                .map(|old| old.generation.wrapping_add(1))
+                                                .unwrap_or(1);
+                                        }
                                         proj = loaded;
-                                        self.set_toast(ctx, "Project loaded!");
+                                        self.set_toast(ctx, "Project loaded (all patterns, synths & samples)!");
                                     }
                                     Err(e) => self.set_toast(ctx, format!("Load error: {e}")),
                                 }
@@ -591,6 +781,34 @@ impl eframe::App for FunKeySynthApp {
                                 }
                             }
                         }
+
+                        // Compact USB MIDI Input Picker
+                        let midi_lbl = if let Some(ref name) = self.midi.connected_name {
+                            format!("MIDI: {}", name.chars().take(10).collect::<String>())
+                        } else {
+                            "MIDI".to_string()
+                        };
+                        egui::ComboBox::from_id_salt("midi_port_combo")
+                            .width(84.0)
+                            .selected_text(midi_lbl)
+                            .show_ui(ui, |ui| {
+                                if ui.button("Rescan MIDI Devices").clicked() {
+                                    self.midi.refresh_ports();
+                                }
+                                if ui.selectable_label(self.midi.connected_name.is_none(), "Off").clicked() {
+                                    self.midi.disconnect();
+                                }
+                                let ports = self.midi.ports.clone();
+                                for (i, pname) in ports.iter().enumerate() {
+                                    let is_conn = self.midi.connected_name.as_deref() == Some(pname.as_str());
+                                    if ui.selectable_label(is_conn, pname).clicked() {
+                                        match self.midi.connect(i) {
+                                            Ok(()) => self.set_toast(ctx, format!("Connected MIDI: {pname}")),
+                                            Err(e) => self.set_toast(ctx, e),
+                                        }
+                                    }
+                                }
+                            });
 
                         ui.separator();
 
@@ -624,9 +842,9 @@ impl eframe::App for FunKeySynthApp {
         egui::TopBottomPanel::bottom("playable_pads_dock")
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(14, 17, 24))
+                    .fill(theme.bar_bg())
                     .inner_margin(egui::Margin::symmetric(14.0, 8.0))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(34, 40, 56))),
+                    .stroke(Stroke::new(1.0_f32, theme.border())),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -657,7 +875,7 @@ impl eframe::App for FunKeySynthApp {
                             {
                                 proj.auto_chord_mode = false;
                             }
-                            ui.checkbox(&mut self.record_live, "● Rec")
+                            ui.checkbox(&mut self.record_live, "Rec")
                                 .on_hover_text("Record pads into pattern while playing");
                         });
                         ui.horizontal(|ui| {
@@ -738,10 +956,20 @@ impl eframe::App for FunKeySynthApp {
                         );
                     }
 
-                    // Mini Oscilloscope + Status
+                    // Mini Oscilloscope + Live Stereo VU & Sidechain Meter + Status
                     ui.vertical(|ui| {
-                        let scope_rect = ui.allocate_exact_size(Vec2::new(160.0, 42.0), Sense::hover()).0;
-                        draw_scope(ui.painter(), scope_rect, &self.scope_buf, accent);
+                        ui.horizontal(|ui| {
+                            let scope_rect = ui.allocate_exact_size(Vec2::new(124.0, 42.0), Sense::hover()).0;
+                            draw_scope(ui.painter(), scope_rect, &self.scope_buf, accent);
+                            let meter_rect = ui.allocate_exact_size(Vec2::new(34.0, 42.0), Sense::hover()).0;
+                            draw_vu_meters(
+                                ui.painter(),
+                                meter_rect,
+                                telemetry.peak_l,
+                                telemetry.peak_r,
+                                telemetry.sidechain_duck,
+                            );
+                        });
                         let status_text = if let Some((ref msg, until)) = self.toast {
                             if ctx.input(|i| i.time) < until {
                                 msg.as_str()
@@ -760,18 +988,19 @@ impl eframe::App for FunKeySynthApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(12, 14, 20))
+                    .fill(theme.panel_bg())
                     .inner_margin(egui::Margin::symmetric(14.0, 10.0)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-                    StudioTab::Studio => self.ui_studio(ui, &mut proj, playing, cur_step, accent),
+                    StudioTab::Studio => self.ui_studio(ui, ctx, &mut proj, playing, cur_step, accent),
                     StudioTab::Sampler => {
                         if let Some(msg) = crate::volca_ui::render_volca_sampler(
                             ui,
                             ctx,
                             &mut self.volca_ui,
                             &self.engine,
+                            &mut self.mic,
                             &mut proj,
                             &telemetry,
                             playing,
@@ -779,6 +1008,7 @@ impl eframe::App for FunKeySynthApp {
                             &mut self.bar_page,
                             &mut self.follow_playhead,
                             self.record_live,
+                            &mut self.rec_motion,
                             &mut self.test_repeat_on,
                             &mut self.test_repeat_next_t,
                             accent,
@@ -793,6 +1023,123 @@ impl eframe::App for FunKeySynthApp {
                 });
             });
 
+        // Settings & Color Theme Window
+        if self.show_settings {
+            let mut open = self.show_settings;
+            let mut changed = false;
+            egui::Window::new("Preferences — Theme & Updates")
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("COLOR THEME").strong().size(12.5).color(accent));
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for &th in &StudioTheme::ALL {
+                            let active = self.settings.theme == th;
+                            let [ar, ag, ab] = th.default_accent();
+                            let btn = egui::Button::new(
+                                RichText::new(th.name())
+                                    .strong()
+                                    .size(11.5)
+                                    .color(if active { Color32::from_rgb(12, 14, 20) } else { Color32::WHITE }),
+                            )
+                            .fill(if active {
+                                Color32::from_rgb(ar, ag, ab)
+                            } else {
+                                Color32::from_rgb(32, 38, 52)
+                            });
+                            if ui.add(btn).clicked() {
+                                self.settings.theme = th;
+                                self.settings.custom_accent = th.default_accent();
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(&mut self.settings.use_vibe_accent, "Dynamic Vibe Accent Color")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if !self.settings.use_vibe_accent {
+                            ui.label("Custom:");
+                            if ui
+                                .color_edit_button_srgb(&mut self.settings.custom_accent)
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(RichText::new("GITHUB UPDATES").strong().size(12.5).color(accent));
+                    ui.add_space(4.0);
+                    if ui
+                        .checkbox(
+                            &mut self.settings.check_updates_on_startup,
+                            "Check GitHub for updates on startup",
+                        )
+                        .changed()
+                    {
+                        changed = true;
+                    }
+
+                    let upd = self
+                        .update_status
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Installed: v{CURRENT_VERSION}"));
+                        if ui.button("Check Now").clicked() {
+                            spawn_update_check(self.update_status.clone());
+                        }
+                        if ui.button("Releases Page").clicked() {
+                            ctx.open_url(egui::OpenUrl::new_tab(RELEASES_URL));
+                        }
+                    });
+                    match upd {
+                        UpdateStatus::Idle => {
+                            ui.label(RichText::new("Update check idle.").weak());
+                        }
+                        UpdateStatus::Checking => {
+                            ui.label(RichText::new("Checking GitHub releases...").color(accent));
+                        }
+                        UpdateStatus::UpToDate => {
+                            ui.label(
+                                RichText::new("You are on the latest version!")
+                                    .color(Color32::from_rgb(72, 224, 148)),
+                            );
+                        }
+                        UpdateStatus::UpdateAvailable { latest_tag, url } => {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("New version available: {latest_tag}"))
+                                        .strong()
+                                        .color(Color32::from_rgb(72, 224, 148)),
+                                );
+                                if ui.button("Download").clicked() {
+                                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                                }
+                            });
+                        }
+                        UpdateStatus::OfflineOrError(msg) => {
+                            ui.label(RichText::new(format!("Status: {msg}")).weak());
+                        }
+                    }
+                });
+            self.show_settings = open;
+            if changed {
+                self.settings.apply_to_egui(ctx);
+                self.settings.save();
+            }
+        }
+
         // Commit project edits back to audio thread
         if let Ok(mut guard) = self.engine.project.lock() {
             *guard = proj;
@@ -804,6 +1151,7 @@ impl FunKeySynthApp {
     fn ui_studio(
         &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         proj: &mut Project,
         playing: bool,
         cur_step: usize,
@@ -860,7 +1208,7 @@ impl FunKeySynthApp {
 
                 // 1-Click Roll Fresh Vibe!
                 let roll_btn = egui::Button::new(
-                    RichText::new("🎲 Fresh Groove")
+                    RichText::new("Fresh Groove")
                         .strong()
                         .size(12.5)
                         .color(Color32::WHITE),
@@ -927,7 +1275,7 @@ impl FunKeySynthApp {
                                     };
                                     let sel_btn = egui::Button::new(
                                         RichText::new(if is_muted_now {
-                                            format!("🔇 {}", track.role_name())
+                                            format!("M {}", track.role_name())
                                         } else {
                                             track.role_name().to_string()
                                         })
@@ -962,9 +1310,9 @@ impl FunKeySynthApp {
                                         ui.label(RichText::new(track.role_name()).strong().color(tc));
                                         ui.separator();
                                         let open_lbl = if track == TrackId::Sampler {
-                                            "🎛 Open Pro Sampler Workbench"
+                                            "Open Pro Sampler Workbench"
                                         } else {
-                                            "🎛 Open Full Synth in Sound Lab"
+                                            "Open Full Synth in Sound Lab"
                                         };
                                         if ui.button(open_lbl).clicked() {
                                             self.selected_track = track;
@@ -977,11 +1325,11 @@ impl FunKeySynthApp {
                                         }
                                         {
                                             let (_, mute, solo) = track_mixer_mut(proj, track);
-                                            if ui.button(if *mute { "🔊 Unmute Track" } else { "🔇 Mute Track" }).clicked() {
+                                            if ui.button(if *mute { "Unmute Track" } else { "M Mute Track" }).clicked() {
                                                 *mute = !*mute;
                                                 ui.close_menu();
                                             }
-                                            if ui.button(if *solo { "★ Unsolo Track" } else { "☆ Solo Track" }).clicked() {
+                                            if ui.button(if *solo { "Unsolo Track" } else { "Solo Track" }).clicked() {
                                                 *solo = !*solo;
                                                 ui.close_menu();
                                             }
@@ -1038,7 +1386,7 @@ impl FunKeySynthApp {
                                             ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_reverb_send, 0.0..=1.0).text("Reverb"));
                                         }
                                         ui.separator();
-                                        if ui.button("🎲 Randomize Pattern").clicked() {
+                                        if ui.button("Randomize Pattern").clicked() {
                                             let seed = self.next_seed();
                                             if track == TrackId::Drums {
                                                 let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
@@ -1062,7 +1410,7 @@ impl FunKeySynthApp {
                                             }
                                             ui.close_menu();
                                         }
-                                        if ui.button("✕ Clear Pattern").clicked() {
+                                        if ui.button("X Clear Pattern").clicked() {
                                             let pat = proj.current_pattern_mut();
                                             if track == TrackId::Drums {
                                                 for lane in &mut pat.drums.lanes {
@@ -1078,9 +1426,9 @@ impl FunKeySynthApp {
                                     // Instant Voice Preset Picker (or Volca 8-Pad shortcut for Sampler)
                                     if track == TrackId::Sampler {
                                         let label = if proj.sample_parts[0].sample.builtin_id.is_none() {
-                                            format!("{} →", proj.sample_parts[0].name)
+                                            format!("{} ->", proj.sample_parts[0].name)
                                         } else {
-                                            "8-Part Volca →".to_string()
+                                            "8-Part Volca ->".to_string()
                                         };
                                         let vbtn = egui::Button::new(
                                             RichText::new(label)
@@ -1234,8 +1582,62 @@ impl FunKeySynthApp {
                         }
                         ui.checkbox(&mut self.follow_playhead, "Follow");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // Pattern bank A..D quick switch
-                            for b in (0..4).rev() {
+                            if ui
+                                .small_button("Load Pat")
+                                .on_hover_text("Load a saved pattern (.json) into the active Bank")
+                                .clicked()
+                            {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Fun Key Pattern", &["json"])
+                                    .pick_file()
+                                {
+                                    match load_pattern(&path) {
+                                        Ok(pat) => {
+                                            let cur = proj.active_pattern;
+                                            proj.patterns[cur] = pat;
+                                            self.set_toast(ctx, format!("Loaded pattern into Bank {}!", (b'A' + cur as u8) as char));
+                                        }
+                                        Err(e) => self.set_toast(ctx, format!("Pattern load error: {e}")),
+                                    }
+                                }
+                            }
+                            if ui
+                                .small_button("Save Pat")
+                                .on_hover_text("Save the current Bank pattern (all tracks, Volca lanes, Step FX & Motion) to a reusable .json file")
+                                .clicked()
+                            {
+                                let bank_ch = (b'A' + proj.active_pattern as u8) as char;
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .set_file_name(format!("pattern_{bank_ch}.json"))
+                                    .add_filter("Fun Key Pattern", &["json"])
+                                    .save_file()
+                                {
+                                    match save_pattern(&path, proj.current_pattern()) {
+                                        Ok(()) => self.set_toast(ctx, format!("Saved Bank {bank_ch} pattern!")),
+                                        Err(e) => self.set_toast(ctx, format!("Pattern save error: {e}")),
+                                    }
+                                }
+                            }
+                            if ui
+                                .small_button("Dup->Next")
+                                .on_hover_text("Duplicate current Bank pattern into the next Bank so you can build variations")
+                                .clicked()
+                            {
+                                let src = proj.active_pattern;
+                                let dst = (src + 1) % proj.patterns.len().max(1);
+                                proj.patterns[dst] = proj.patterns[src].clone();
+                                proj.active_pattern = dst;
+                                self.set_toast(
+                                    ctx,
+                                    format!(
+                                        "Duplicated Bank {} -> Bank {}",
+                                        (b'A' + src as u8) as char,
+                                        (b'A' + dst as u8) as char
+                                    ),
+                                );
+                            }
+                            // Pattern bank A..H quick switch
+                            for b in (0..8).rev() {
                                 let label = format!("{}", (b'A' + b as u8) as char);
                                 if ui.selectable_label(proj.active_pattern == b, label).clicked() {
                                     proj.active_pattern = b;
@@ -1263,13 +1665,13 @@ impl FunKeySynthApp {
                                 let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
                                 proj.current_pattern_mut().drums = drums;
                             }
-                            if ui.small_button("🎲 New Beat").clicked() {
+                            if ui.small_button("New Beat").clicked() {
                                 let seed = self.next_seed();
                                 proj.party_seed = seed;
                                 let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
                                 proj.current_pattern_mut().drums = drums;
                             }
-                            if ui.small_button("⚡ Fill Now").clicked() {
+                            if ui.small_button("Fill Now").clicked() {
                                 self.engine.send_live(LiveEvent::TriggerFill);
                             }
                             ui.label(RichText::new("Click drum name = Mute  •  Right-click drum = Tune/Options  •  Right-click step = Ratchet").size(10.5).weak());
@@ -1292,7 +1694,7 @@ impl FunKeySynthApp {
                                 // Clickable drum voice label: Left-click = Mute, Right-click = Full Voice Options & Tuning!
                                 let lbl_btn = egui::Button::new(
                                     RichText::new(if is_muted {
-                                        format!("✕ {}", voice.short_name())
+                                        format!("X {}", voice.short_name())
                                     } else {
                                         voice.short_name().to_string()
                                     })
@@ -1322,7 +1724,7 @@ impl FunKeySynthApp {
                                     ui.label(RichText::new(voice.full_name()).strong().color(tc));
                                     ui.separator();
                                     ui.horizontal(|ui| {
-                                        if ui.button("🔊 Audition").clicked() {
+                                        if ui.button("Audition").clicked() {
                                             proj.drums.voices[lane_idx].mute = false;
                                             self.engine.send_live(LiveEvent::PlayNote {
                                                 track: TrackId::Drums,
@@ -1430,17 +1832,52 @@ impl FunKeySynthApp {
                                             st.ratchet = 1;
                                         }
                                     }
-                                    if resp.secondary_clicked() {
-                                        st.active = true;
-                                        st.ratchet = (st.ratchet % 4) + 1;
-                                    }
+                                    resp.context_menu(|ui| {
+                                        ui.set_min_width(190.0);
+                                        ui.label(RichText::new(format!("{} — Step {}", voice.short_name(), idx + 1)).strong().color(tc));
+                                        ui.separator();
+                                        ui.horizontal(|ui| {
+                                            ui.label("Ratchet:");
+                                            for r in 1..=4u8 {
+                                                if ui.selectable_label(st.ratchet == r, format!("{r}x")).clicked() {
+                                                    st.ratchet = r;
+                                                    st.active = true;
+                                                }
+                                            }
+                                        });
+                                        if ui.add(egui::Slider::new(&mut st.pitch_offset, -12..=12).suffix(" st").text("Pitch")).changed() {
+                                            st.active = true;
+                                        }
+                                        let mut p_on = st.pan_lock.is_some();
+                                        let mut p_val = st.pan_lock.unwrap_or(0.0);
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut p_on, "Pan").changed() {
+                                                st.pan_lock = if p_on { Some(p_val) } else { None };
+                                            }
+                                            if p_on && ui.add(egui::Slider::new(&mut p_val, -1.0..=1.0).show_value(false)).changed() {
+                                                st.pan_lock = Some(p_val);
+                                                st.active = true;
+                                            }
+                                        });
+                                        ui.checkbox(&mut st.accent, "Accent");
+                                        ui.add(egui::Slider::new(&mut st.velocity, 0.1..=1.0).text("Vel").max_decimals(2));
+                                        if ui.small_button("Reset Step FX").clicked() {
+                                            st.clear_step_fx();
+                                            st.ratchet = 1;
+                                        }
+                                    });
                                     let painter = ui.painter();
                                     painter.rect_filled(rect, Rounding::same(4.0), fill);
-                                    if st.active && st.ratchet > 1 {
+                                    if st.active && (st.ratchet > 1 || st.has_step_fx()) {
+                                        let b = if st.ratchet > 1 {
+                                            format!("{}x", st.ratchet)
+                                        } else {
+                                            "*".to_string()
+                                        };
                                         painter.text(
                                             rect.center(),
                                             egui::Align2::CENTER_CENTER,
-                                            format!("{}x", st.ratchet),
+                                            b,
                                             egui::FontId::proportional(9.5),
                                             Color32::from_rgb(12, 14, 20),
                                         );
@@ -1461,7 +1898,7 @@ impl FunKeySynthApp {
                     } else if self.selected_track == TrackId::Sampler {
                         // 8-Lane Volca Sampler Grid right inside STUDIO!
                         ui.horizontal(|ui| {
-                            if ui.small_button("Open Volca Sampler Workbench →").clicked() {
+                            if ui.small_button("Open Volca Sampler Workbench ->").clicked() {
                                 self.tab = StudioTab::Sampler;
                             }
                             ui.label(RichText::new("Click P1–P8 = Mute  •  Right-click step = Ratchet").size(10.5).weak());
@@ -1662,6 +2099,20 @@ impl FunKeySynthApp {
                                 ui.add(egui::Slider::new(&mut st.gate, 0.25..=16.0).text("Len").max_decimals(1));
                                 ui.checkbox(&mut st.accent, "Acc");
                                 ui.checkbox(&mut st.slide, "Slide");
+                                // Per-Step Filter / Res P-Locks for Synths!
+                                let mut c_val = st.motion.cutoff.unwrap_or(0.6);
+                                if ui.add(egui::Slider::new(&mut c_val, 0.0..=1.0).text("Filt Lock").max_decimals(2)).changed() {
+                                    st.motion.cutoff = Some(c_val);
+                                    st.active = true;
+                                }
+                                let mut r_val = st.motion.resonance.unwrap_or(0.3);
+                                if ui.add(egui::Slider::new(&mut r_val, 0.0..=1.0).text("Res Lock").max_decimals(2)).changed() {
+                                    st.motion.resonance = Some(r_val);
+                                    st.active = true;
+                                }
+                                if st.motion.any_locked() && ui.small_button("Clr Lock").clicked() {
+                                    st.motion.clear();
+                                }
                             });
                             ui.label(RichText::new("Left-click = toggle step  •  Right-click = select step to edit").size(10.5).weak());
                         }
@@ -1676,6 +2127,28 @@ impl FunKeySynthApp {
         card_frame(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("VIBE MACROS").strong().size(12.0).color(accent));
+                let has_motion = proj.current_pattern().motion.has_any();
+                let rm_btn = egui::Button::new(
+                    RichText::new(if self.rec_motion { "REC MOTION ON" } else { "REC MOTION" })
+                        .strong()
+                        .size(11.0)
+                        .color(Color32::WHITE),
+                )
+                .fill(if self.rec_motion {
+                    Color32::from_rgb(225, 58, 72)
+                } else {
+                    Color32::from_rgb(36, 42, 58)
+                });
+                if ui
+                    .add(rm_btn)
+                    .on_hover_text("Turn ON while playing, then sweep Filter, Space, Sidechain, Glitch, or Isolator to record live automation!")
+                    .clicked()
+                {
+                    self.rec_motion = !self.rec_motion;
+                }
+                if has_motion && ui.small_button("Clr Motion").on_hover_text("Clear recorded motion automation on this pattern").clicked() {
+                    proj.current_pattern_mut().motion.clear();
+                }
                 ui.separator();
 
                 // Logarithmic Filter Macro
@@ -1688,6 +2161,9 @@ impl FunKeySynthApp {
                     .changed()
                 {
                     proj.fx.global_filter_cutoff = 120.0 * (18_000.0_f32 / 120.0).powf(filt_norm);
+                    if self.rec_motion && playing {
+                        proj.current_pattern_mut().motion.filter[cur_step % 64] = Some(filt_norm);
+                    }
                 }
 
                 // Space Macro (Reverb + Delay together!)
@@ -1699,16 +2175,35 @@ impl FunKeySynthApp {
                 {
                     proj.fx.reverb_mix = space;
                     proj.fx.delay_mix = (space * 0.92).min(0.85);
+                    if self.rec_motion && playing {
+                        proj.current_pattern_mut().motion.space[cur_step % 64] = Some(space);
+                    }
                 }
 
                 ui.label("Sidechain");
-                ui.add(egui::Slider::new(&mut proj.sidechain_amount, 0.0..=1.0).show_value(false));
+                if ui
+                    .add(egui::Slider::new(&mut proj.sidechain_amount, 0.0..=1.0).show_value(false))
+                    .changed()
+                    && self.rec_motion
+                    && playing
+                {
+                    let sc = proj.sidechain_amount;
+                    proj.current_pattern_mut().motion.sidechain[cur_step % 64] = Some(sc);
+                }
 
                 ui.label("Warmth");
                 ui.add(egui::Slider::new(&mut proj.fx.analog_warmth, 0.0..=1.0).show_value(false));
 
                 ui.label("Glitch");
-                ui.add(egui::Slider::new(&mut proj.fx.glitch, 0.0..=0.85).show_value(false));
+                if ui
+                    .add(egui::Slider::new(&mut proj.fx.glitch, 0.0..=0.85).show_value(false))
+                    .changed()
+                    && self.rec_motion
+                    && playing
+                {
+                    let gl = proj.fx.glitch;
+                    proj.current_pattern_mut().motion.glitch[cur_step % 64] = Some(gl);
+                }
 
                 ui.label("Master");
                 ui.add(egui::Slider::new(&mut proj.mixer.master_volume, 0.0..=1.15).show_value(false));
@@ -1721,16 +2216,16 @@ impl FunKeySynthApp {
                 ui.label(RichText::new("DJ LIVE:").strong().size(12.0).color(Color32::from_rgb(255, 168, 52)));
                 ui.separator();
 
-                let drop_btn = egui::Button::new(RichText::new("⚡ BASS DROP").strong().color(Color32::WHITE))
+                let drop_btn = egui::Button::new(RichText::new("BASS DROP").strong().color(Color32::WHITE))
                     .fill(Color32::from_rgb(208, 66, 98))
-                    .min_size(Vec2::new(112.0, 28.0));
+                    .min_size(Vec2::new(104.0, 28.0));
                 if ui.add(drop_btn).on_hover_text("Fires a key-locked sub bass dive!").clicked() {
                     self.engine.send_live(LiveEvent::TriggerBassDrop);
                 }
 
                 let mut drum_cut = self.engine.drum_cut.load(Ordering::Relaxed);
                 let cut_btn = egui::Button::new(
-                    RichText::new(if drum_cut { "🛑 DRUM CUT ON" } else { "🛑 DRUM CUT" })
+                    RichText::new(if drum_cut { "DRUM CUT ON" } else { "DRUM CUT" })
                         .strong()
                         .color(Color32::WHITE),
                 )
@@ -1739,33 +2234,33 @@ impl FunKeySynthApp {
                 } else {
                     Color32::from_rgb(44, 52, 74)
                 })
-                .min_size(Vec2::new(118.0, 28.0));
+                .min_size(Vec2::new(108.0, 28.0));
                 if ui.add(cut_btn).clicked() {
                     drum_cut = !drum_cut;
                     self.engine.drum_cut.store(drum_cut, Ordering::Relaxed);
                 }
 
                 let build_resp = ui.add(
-                    egui::Button::new(RichText::new("🌪 HOLD SNARE BUILD").strong().color(Color32::WHITE))
+                    egui::Button::new(RichText::new("HOLD SNARE BUILD").strong().color(Color32::WHITE))
                         .fill(if self.engine.snare_build.load(Ordering::Relaxed) {
                             Color32::from_rgb(245, 165, 36)
                         } else {
                             Color32::from_rgb(44, 52, 74)
                         })
-                        .min_size(Vec2::new(148.0, 28.0)),
+                        .min_size(Vec2::new(140.0, 28.0)),
                 );
                 self.engine
                     .snare_build
                     .store(build_resp.is_pointer_button_down_on(), Ordering::Relaxed);
 
                 let stutter_resp = ui.add(
-                    egui::Button::new(RichText::new("🔁 HOLD STUTTER").strong().color(Color32::WHITE))
+                    egui::Button::new(RichText::new("HOLD STUTTER").strong().color(Color32::WHITE))
                         .fill(if self.stutter_held {
                             Color32::from_rgb(138, 92, 246)
                         } else {
                             Color32::from_rgb(44, 52, 74)
                         })
-                        .min_size(Vec2::new(128.0, 28.0)),
+                        .min_size(Vec2::new(118.0, 28.0)),
                 );
                 let down = stutter_resp.is_pointer_button_down_on();
                 if down != self.stutter_held {
@@ -1775,9 +2270,9 @@ impl FunKeySynthApp {
 
                 if ui
                     .add(
-                        egui::Button::new(RichText::new("🥁 FILL").strong().color(Color32::WHITE))
+                        egui::Button::new(RichText::new("FILL").strong().color(Color32::WHITE))
                             .fill(Color32::from_rgb(44, 52, 74))
-                            .min_size(Vec2::new(78.0, 28.0)),
+                            .min_size(Vec2::new(68.0, 28.0)),
                     )
                     .clicked()
                 {
@@ -1830,7 +2325,7 @@ impl FunKeySynthApp {
         card_frame(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new("★ PARTY MODE — LOCAL VIBE SONG GENERATOR")
+                    RichText::new("PARTY MODE — LOCAL VIBE SONG GENERATOR")
                         .strong()
                         .size(14.0)
                         .color(Color32::from_rgb(244, 92, 186)),
@@ -1847,13 +2342,13 @@ impl FunKeySynthApp {
                 {
                     self.engine.playing.store(true, Ordering::Relaxed);
                 }
-                if ui.button("⏭ Next Section").clicked() {
+                if ui.button("Next Section").clicked() {
                     self.engine.send_live(LiveEvent::NextPartySection);
                 }
-                if ui.button("⚡ Drop Now").clicked() {
+                if ui.button("Drop Now").clicked() {
                     self.engine.send_live(LiveEvent::TriggerBassDrop);
                 }
-                if ui.button("🎲 Fresh Party Song").clicked() {
+                if ui.button("Fresh Party Song").clicked() {
                     let seed = self.next_seed();
                     let next_prog = (proj.progression_idx + 1) % PROGRESSIONS.len();
                     apply_vibe_to_project(proj, proj.vibe, Some(next_prog), seed);
@@ -1951,7 +2446,7 @@ impl FunKeySynthApp {
                         }
                         ui.checkbox(&mut sec.bass_drop, "");
                         ui.checkbox(&mut sec.fill, "");
-                        if ui.small_button("✕").clicked() {
+                        if ui.small_button("X").clicked() {
                             remove_idx = Some(idx);
                         }
                         ui.end_row();
@@ -1995,7 +2490,7 @@ impl FunKeySynthApp {
                             // Hands-free Auto-Repeat / Drone Test Note Toggle!
                             if toggle_pill(
                                 ui,
-                                if self.test_repeat_on { "🔁 TEST ON" } else { "🔁 TEST NOTE" },
+                                if self.test_repeat_on { "TEST ON" } else { "TEST NOTE" },
                                 &mut self.test_repeat_on,
                                 Color32::from_rgb(72, 224, 148),
                                 "Hands-free repeating test phrase or held drone while you tweak knobs!",
@@ -2082,7 +2577,7 @@ impl FunKeySynthApp {
                                 .default_open(i < 2)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("🔊 Hit").clicked() {
+                                        if ui.small_button("Hit").clicked() {
                                             v.mute = false;
                                             self.engine.send_live(LiveEvent::PlayNote {
                                                 track: TrackId::Drums,
@@ -2127,7 +2622,7 @@ impl FunKeySynthApp {
                                 if ui.button("Load MP3 / WAV…").clicked() {
                                     self.load_sample_dialog(ctx, proj);
                                 }
-                                if ui.button("Open Waveform Sampler →").clicked() {
+                                if ui.button("Open Waveform Sampler ->").clicked() {
                                     self.tab = StudioTab::Sampler;
                                 }
                             });
@@ -2303,8 +2798,8 @@ fn moog_controls(ui: &mut egui::Ui, m: &mut crate::model::MoogParams, id: &str, 
     ui.add(egui::Slider::new(&mut m.amp_sustain, 0.0..=1.0).text("Amp Sustain"));
     ui.add(egui::Slider::new(&mut m.amp_release, 0.02..=3.0).suffix(" s").text("Amp Release"));
     ui.add(egui::Slider::new(&mut m.lfo_rate, 0.1..=18.0).suffix(" Hz").text("LFO Rate"));
-    ui.add(egui::Slider::new(&mut m.lfo_to_pitch, 0.0..=1.0).text("LFO → Pitch"));
-    ui.add(egui::Slider::new(&mut m.lfo_to_filter, 0.0..=1.0).text("LFO → Filter"));
+    ui.add(egui::Slider::new(&mut m.lfo_to_pitch, 0.0..=1.0).text("LFO -> Pitch"));
+    ui.add(egui::Slider::new(&mut m.lfo_to_filter, 0.0..=1.0).text("LFO -> Filter"));
 }
 
 fn monologue_controls(ui: &mut egui::Ui, m: &mut crate::model::MonologueParams, tc: Color32) {
@@ -2472,15 +2967,40 @@ fn draw_scope(painter: &egui::Painter, rect: egui::Rect, samples: &[f32], color:
     painter.add(egui::Shape::line(points, Stroke::new(1.5_f32, color)));
 }
 
-
-fn apply_studio_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = Color32::from_rgb(14, 17, 24);
-    visuals.panel_fill = Color32::from_rgb(12, 14, 20);
-    visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(20, 24, 34);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(26, 32, 46);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(36, 44, 64);
-    visuals.widgets.active.bg_fill = Color32::from_rgb(48, 58, 84);
-    visuals.selection.bg_fill = Color32::from_rgb(64, 152, 236);
-    ctx.set_visuals(visuals);
+fn draw_vu_meters(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    peak_l: f32,
+    peak_r: f32,
+    sidechain_duck: f32,
+) {
+    painter.rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(10, 13, 20));
+    painter.rect_stroke(rect, Rounding::same(4.0), Stroke::new(1.0_f32, Color32::from_rgb(36, 44, 62)));
+    let pad = 3.0;
+    let inner_h = (rect.height() - pad * 2.0).max(4.0);
+    let col_w = ((rect.width() - pad * 4.0) / 3.0).max(4.0);
+    let bars = [
+        (peak_l.clamp(0.0, 1.0), Color32::from_rgb(72, 224, 148)),
+        (peak_r.clamp(0.0, 1.0), Color32::from_rgb(72, 224, 148)),
+        (sidechain_duck.clamp(0.0, 1.0), Color32::from_rgb(245, 168, 52)),
+    ];
+    for (i, (val, base_col)) in bars.iter().enumerate() {
+        let x0 = rect.left() + pad + i as f32 * (col_w + pad);
+        let h = inner_h * val;
+        let col = if i < 2 && *val > 0.90 {
+            Color32::from_rgb(235, 72, 86)
+        } else if i < 2 && *val > 0.72 {
+            Color32::from_rgb(245, 202, 72)
+        } else {
+            *base_col
+        };
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(x0, rect.bottom() - pad - h),
+            egui::pos2(x0 + col_w, rect.bottom() - pad),
+        );
+        painter.rect_filled(bar_rect, Rounding::same(2.0), col);
+    }
 }
+
+
+

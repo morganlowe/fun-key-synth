@@ -594,13 +594,35 @@ pub fn normalize_peak(input: &[f32]) -> Vec<f32> {
     input.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PartStepFx {
+    reverse_xor: bool,
+    pitch_offset: i8,
+    speed_mult: f32,
+    cutoff_lock: Option<f32>,
+    pan_lock: Option<f32>,
+}
+
+impl Default for PartStepFx {
+    fn default() -> Self {
+        Self {
+            reverse_xor: false,
+            pitch_offset: 0,
+            speed_mult: 1.0,
+            cutoff_lock: None,
+            pan_lock: None,
+        }
+    }
+}
+
 /// 8-part Korg Volca Sample 2-inspired multi-track performance sampler bank
-/// with per-part buffers, choke groups, stereo panning, reverb send, and a
-/// master 2-band Analog Isolator (Bass & Treble kill/boost EQ).
+/// with per-part buffers, choke groups, per-step FX (P-locks: reverse, pitch, speed, filter, pan),
+/// stereo panning, reverb send, and a master 2-band Analog Isolator (Bass & Treble kill/boost EQ).
 pub struct VolcaSamplerBank {
     sr: f32,
     parts: [Sk1Sampler; 8],
     loaded_gen: [u64; 8],
+    step_fx: [PartStepFx; 8],
     // Stereo 2-band Isolator EQ state (low ~260 Hz, high ~3200 Hz)
     lp_l: f32,
     lp_r: f32,
@@ -619,6 +641,7 @@ impl VolcaSamplerBank {
             sr,
             parts: std::array::from_fn(|_| Sk1Sampler::new(sr)),
             loaded_gen: [u64::MAX; 8],
+            step_fx: [PartStepFx::default(); 8],
             lp_l: 0.0,
             lp_r: 0.0,
             hp_lp_l: 0.0,
@@ -653,6 +676,43 @@ impl VolcaSamplerBank {
         if idx >= 8 || idx >= parts.len() {
             return;
         }
+        self.step_fx[idx] = PartStepFx::default();
+        self.trigger_part_internal(idx, velocity, parts);
+    }
+
+    pub fn trigger_part_with_step(
+        &mut self,
+        idx: usize,
+        velocity: f32,
+        step: &crate::model::DrumStep,
+        parts: &[SamplePart],
+    ) {
+        if idx >= 8 || idx >= parts.len() {
+            return;
+        }
+        self.step_fx[idx] = PartStepFx {
+            reverse_xor: step.reverse,
+            pitch_offset: step.pitch_offset,
+            speed_mult: step.speed_mult.clamp(0.25, 2.0),
+            cutoff_lock: step.cutoff_lock,
+            pan_lock: step.pan_lock,
+        };
+        self.trigger_part_internal(idx, velocity, parts);
+    }
+
+    fn effective_params(&self, idx: usize, part: &SamplePart) -> SamplerParams {
+        let mut sp = part.to_sampler_params();
+        let fx = self.step_fx[idx];
+        sp.reverse = sp.reverse ^ fx.reverse_xor;
+        sp.transpose = (sp.transpose as i16 + fx.pitch_offset as i16).clamp(-36, 36) as i8;
+        sp.speed = (sp.speed * fx.speed_mult).clamp(0.20, 3.0);
+        if let Some(c_norm) = fx.cutoff_lock {
+            sp.cutoff = 120.0 * (18_000.0_f32 / 120.0).powf(c_norm.clamp(0.0, 1.0));
+        }
+        sp
+    }
+
+    fn trigger_part_internal(&mut self, idx: usize, velocity: f32, parts: &[SamplePart]) {
         let grp = parts[idx].choke_group;
         if grp > 0 {
             for (other_i, other) in parts.iter().take(8).enumerate() {
@@ -661,7 +721,7 @@ impl VolcaSamplerBank {
                 }
             }
         }
-        let sp = parts[idx].to_sampler_params();
+        let sp = self.effective_params(idx, &parts[idx]);
         self.parts[idx].note_on(60, velocity, &sp);
     }
 
@@ -696,12 +756,13 @@ impl VolcaSamplerBank {
         let mut rev_r = 0.0_f32;
 
         for (i, part) in parts.iter().take(8).enumerate() {
-            let sp = part.to_sampler_params();
+            let sp = self.effective_params(i, part);
             let s = self.parts[i].process_sample(&sp);
             if part.mute || s.abs() < 1e-7 {
                 continue;
             }
-            let p = (part.pan.clamp(-1.0, 1.0) + 1.0) * 0.5;
+            let pan_val = self.step_fx[i].pan_lock.unwrap_or(part.pan);
+            let p = (pan_val.clamp(-1.0, 1.0) + 1.0) * 0.5;
             let angle = p * std::f32::consts::FRAC_PI_2;
             let sl = s * part.level * angle.cos() * 1.15;
             let sr = s * part.level * angle.sin() * 1.15;

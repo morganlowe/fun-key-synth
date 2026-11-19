@@ -255,6 +255,13 @@ struct Runtime {
     party_bar_in_sec: usize,
     party_cycle: u32,
     party_filter_mod: f32,
+    // Motion automation live playback overrides
+    auto_filter: Option<f32>,
+    auto_space: Option<f32>,
+    auto_sidechain: Option<f32>,
+    auto_glitch: Option<f32>,
+    auto_iso_bass: Option<f32>,
+    auto_iso_treble: Option<f32>,
     // Auto-beat cache
     auto_beat_drums: crate::model::DrumTrackSeq,
     auto_beat_sig: (u8, u32, u32),
@@ -307,6 +314,12 @@ impl Runtime {
             party_bar_in_sec: 0,
             party_cycle: 0,
             party_filter_mod: 1.0,
+            auto_filter: None,
+            auto_space: None,
+            auto_sidechain: None,
+            auto_glitch: None,
+            auto_iso_bass: None,
+            auto_iso_treble: None,
             auto_beat_drums: crate::model::DrumTrackSeq::default(),
             auto_beat_sig: (255, 0, 0),
             peak_l: 0.0,
@@ -574,6 +587,15 @@ impl Runtime {
         let pat = &p.patterns[pat_idx];
         let seed = p.party_seed.wrapping_add(self.party_cycle.wrapping_mul(7919));
 
+        // --- 0. MOTION AUTOMATION PLAYBACK ---
+        let m_step = global % 64;
+        self.auto_filter = pat.motion.filter.get(m_step).copied().flatten();
+        self.auto_space = pat.motion.space.get(m_step).copied().flatten();
+        self.auto_sidechain = pat.motion.sidechain.get(m_step).copied().flatten();
+        self.auto_glitch = pat.motion.glitch.get(m_step).copied().flatten();
+        self.auto_iso_bass = pat.motion.iso_bass.get(m_step).copied().flatten();
+        self.auto_iso_treble = pat.motion.iso_treble.get(m_step).copied().flatten();
+
         // --- 1. DRUMS (bit 0) ---
         if !drum_cut && (section_mask & 0b000001) != 0 {
             // Refresh Auto-Beat cache if needed
@@ -603,10 +625,19 @@ impl Runtime {
                 let st = d_lane.steps[global % d_len];
                 if st.active && (st.probability >= 0.999 || hash_f32(seed, global, lane as u32) <= st.probability) {
                     if let Some(voice) = DrumVoiceId::from_index(lane) {
-                        // Subtle velocity humanization for groove
+                        // Subtle velocity humanization + per-step Pitch/Pan P-Locks!
                         let human = 0.94 + hash_f32(seed, global, lane as u32 + 99) * 0.12;
                         let vel = (st.velocity * human).clamp(0.1, 1.0);
-                        self.drums.trigger(voice, vel, st.accent, st.flam, &p.drums);
+                        if st.pitch_offset != 0 || st.pan_lock.is_some() {
+                            let mut dk = p.drums.clone();
+                            dk.voices[lane].tune = (dk.voices[lane].tune + st.pitch_offset as f32).clamp(-12.0, 12.0);
+                            if let Some(pan) = st.pan_lock {
+                                dk.voices[lane].pan = pan.clamp(-1.0, 1.0);
+                            }
+                            self.drums.trigger(voice, vel, st.accent, st.flam, &dk);
+                        } else {
+                            self.drums.trigger(voice, vel, st.accent, st.flam, &p.drums);
+                        }
                         if voice == DrumVoiceId::Kick {
                             self.sidechain_env = vel;
                         }
@@ -842,7 +873,7 @@ impl Runtime {
                         || hash_f32(seed, global, 200 + part_idx as u32) <= dst.probability)
                 {
                     let vel = (dst.velocity * if dst.accent { 1.15 } else { 1.0 }).clamp(0.1, 1.0);
-                    self.volca.trigger_part(part_idx, vel, &p.sample_parts);
+                    self.volca.trigger_part_with_step(part_idx, vel, &dst, &p.sample_parts);
                     if dst.ratchet > 1 {
                         let n = dst.ratchet.min(4) as usize;
                         let sub_len = base_step_samples / n as f32;
@@ -961,7 +992,8 @@ impl Runtime {
 
         // Sidechain ducking envelope decay
         self.sidechain_env *= self.sidechain_decay;
-        let duck = (1.0 - self.sidechain_env * p.sidechain_amount.clamp(0.0, 1.0) * 0.78).clamp(0.18, 1.0);
+        let sc_amt = self.auto_sidechain.unwrap_or(p.sidechain_amount).clamp(0.0, 1.0);
+        let duck = (1.0 - self.sidechain_env * sc_amt * 0.78).clamp(0.18, 1.0);
         telemetry.sidechain_duck = 1.0 - duck;
 
         // Key-locked sub bass dive (DJ Bass Drop)
@@ -1060,9 +1092,11 @@ impl Runtime {
 
         // 4: Sampler + 8-Part Volca Bank — true stereo + Isolator EQ + gentle sidechain
         let samp_s = self.sampler.process_sample(&p.sampler) * (0.35 + 0.65 * duck);
+        let iso_b = self.auto_iso_bass.unwrap_or(p.sampler_iso_bass);
+        let iso_t = self.auto_iso_treble.unwrap_or(p.sampler_iso_treble);
         let (vl, vr, vrev_l, vrev_r) =
             self.volca
-                .process_stereo(&p.sample_parts, p.sampler_iso_bass, p.sampler_iso_treble);
+                .process_stereo(&p.sample_parts, iso_b, iso_t);
         let v_duck = 0.40 + 0.60 * duck;
         if audible(ch[4].mute, ch[4].solo) {
             let (wl, wr) = self.sampler_widener.process(samp_s, 0.58);
@@ -1099,8 +1133,20 @@ impl Runtime {
             }
         }
 
-        // Apply Party Build filter modulation cleanly on a stack copy of FxParams
+        // Apply Motion Automation & Party Build filter modulation cleanly on a stack copy of FxParams
         let mut fx_params = p.fx.clone();
+        if let Some(fnorm) = self.auto_filter {
+            fx_params.global_filter_enabled = true;
+            fx_params.global_filter_cutoff = 120.0 * (18_000.0_f32 / 120.0).powf(fnorm.clamp(0.0, 1.0));
+        }
+        if let Some(sp) = self.auto_space {
+            let s = sp.clamp(0.0, 1.0);
+            fx_params.reverb_mix = s;
+            fx_params.delay_mix = (s * 0.92).min(0.85);
+        }
+        if let Some(gl) = self.auto_glitch {
+            fx_params.glitch = gl.clamp(0.0, 0.9);
+        }
         if p.party_mode && self.party_filter_mod < 0.99 {
             fx_params.global_filter_enabled = true;
             fx_params.global_filter_cutoff =
@@ -1337,6 +1383,58 @@ pub fn export_wav(project: &Project, path: &Path, bars: usize) -> Result<(), Str
         writer.write_sample(ir).map_err(|e| e.to_string())?;
     }
     writer.finalize().map_err(|e| e.to_string())
+}
+
+/// Offline-renders `bars` of the current project into normalized mono f32 at 48 kHz
+/// so you can resample your own synth chords, acid lines, or grooves straight onto a Volca Pad!
+pub fn render_resample_mono(project: &Project, bars: usize) -> Vec<f32> {
+    let sr = 48_000u32;
+    let mut rt = Runtime::new(sr as f32);
+    let mut tel = EngineTelemetry::default();
+    let total_seconds = (bars.clamp(1, 8) as f32) * 4.0 * (60.0 / project.bpm.clamp(40.0, 240.0));
+    let total_samples = (total_seconds * sr as f32).round() as usize;
+    let mut out = Vec::with_capacity(total_samples);
+    for _ in 0..total_samples {
+        let (l, r) = rt.process_sample(project, true, false, false, 0, &mut tel);
+        out.push(((l + r) * 0.5).clamp(-1.0, 1.0));
+    }
+    crate::dsp::sampler::normalize_peak(&out)
+}
+
+/// Exports the master mix + 6 individual stereo track stems into `dir`.
+pub fn export_stems(project: &Project, dir: &Path, bars: usize) -> Result<usize, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut count = 0usize;
+    export_wav(project, &dir.join("00_master_mix.wav"), bars)?;
+    count += 1;
+
+    let stems: [(&str, TrackId); 6] = [
+        ("01_drums.wav", TrackId::Drums),
+        ("02_bass.wav", TrackId::Moog),
+        ("03_chords.wav", TrackId::MoogPad),
+        ("04_arp.wav", TrackId::Monologue),
+        ("05_lead_303.wav", TrackId::Tb303),
+        ("06_sampler.wav", TrackId::Sampler),
+    ];
+
+    for (fname, track) in stems {
+        let mut solo_proj = project.clone();
+        for ch in &mut solo_proj.mixer.channels {
+            ch.solo = false;
+        }
+        solo_proj.mixer.moog_pad_solo = false;
+        if track == TrackId::MoogPad {
+            solo_proj.mixer.moog_pad_mute = false;
+            solo_proj.mixer.moog_pad_solo = true;
+        } else {
+            let idx = track.index();
+            solo_proj.mixer.channels[idx].mute = false;
+            solo_proj.mixer.channels[idx].solo = true;
+        }
+        export_wav(&solo_proj, &dir.join(fname), bars)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 #[cfg(test)]

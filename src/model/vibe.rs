@@ -16,10 +16,14 @@ pub enum Vibe {
     Synthwave,
     AcidClub,
     AmbientDub,
+    UkGarage,
+    JungleDnb,
+    DetroitTechno,
+    DreamPop,
 }
 
 impl Vibe {
-    pub const ALL: [Vibe; 7] = [
+    pub const ALL: [Vibe; 11] = [
         Vibe::DeepHouse,
         Vibe::ElectroFunk,
         Vibe::LofiChill,
@@ -27,6 +31,10 @@ impl Vibe {
         Vibe::Synthwave,
         Vibe::AcidClub,
         Vibe::AmbientDub,
+        Vibe::UkGarage,
+        Vibe::JungleDnb,
+        Vibe::DetroitTechno,
+        Vibe::DreamPop,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -38,6 +46,10 @@ impl Vibe {
             Vibe::Synthwave => "Night Drive",
             Vibe::AcidClub => "Acid Club",
             Vibe::AmbientDub => "Ambient Dub",
+            Vibe::UkGarage => "UK Garage",
+            Vibe::JungleDnb => "Jungle / DnB",
+            Vibe::DetroitTechno => "Detroit Techno",
+            Vibe::DreamPop => "Dream Pop",
         }
     }
 
@@ -50,6 +62,10 @@ impl Vibe {
             Vibe::Synthwave => "Driving 8th-note Moog bass, 80s pads & neon lead",
             Vibe::AcidClub => "Squelchy 303 slides, 909 hats & club energy",
             Vibe::AmbientDub => "Spacious ping-pong dub chords, deep sub & huge reverb",
+            Vibe::UkGarage => "Heavy 2-step swing, shuffling hats & warm organ bass",
+            Vibe::JungleDnb => "170 BPM breakbeat energy, rolling Reese sub & lush pads",
+            Vibe::DetroitTechno => "Driving 909 pulse, hypnotic chord stabs & deep analog bass",
+            Vibe::DreamPop => "Shimmering wide pads, dreamy dotted-8th arps & lush reverb",
         }
     }
 
@@ -62,6 +78,10 @@ impl Vibe {
             Vibe::Synthwave => 118.0,
             Vibe::AcidClub => 128.0,
             Vibe::AmbientDub => 108.0,
+            Vibe::UkGarage => 132.0,
+            Vibe::JungleDnb => 170.0,
+            Vibe::DetroitTechno => 130.0,
+            Vibe::DreamPop => 104.0,
         }
     }
 
@@ -75,18 +95,26 @@ impl Vibe {
             Vibe::Synthwave => 0.02,
             Vibe::AcidClub => 0.08,
             Vibe::AmbientDub => 0.06,
+            Vibe::UkGarage => 0.26,
+            Vibe::JungleDnb => 0.04,
+            Vibe::DetroitTechno => 0.08,
+            Vibe::DreamPop => 0.06,
         }
     }
 
     pub const fn default_root(self) -> u8 {
         match self {
-            Vibe::DeepHouse => 9,   // A
-            Vibe::ElectroFunk => 4, // E
-            Vibe::LofiChill => 2,   // D
-            Vibe::ElectroSoul => 5, // F
-            Vibe::Synthwave => 9,   // A
-            Vibe::AcidClub => 0,    // C
-            Vibe::AmbientDub => 7,  // G
+            Vibe::DeepHouse => 9,     // A
+            Vibe::ElectroFunk => 4,   // E
+            Vibe::LofiChill => 2,     // D
+            Vibe::ElectroSoul => 5,   // F
+            Vibe::Synthwave => 9,     // A
+            Vibe::AcidClub => 0,      // C
+            Vibe::AmbientDub => 7,    // G
+            Vibe::UkGarage => 5,      // F
+            Vibe::JungleDnb => 2,     // D
+            Vibe::DetroitTechno => 0, // C
+            Vibe::DreamPop => 7,      // G
         }
     }
 
@@ -99,6 +127,10 @@ impl Vibe {
             Vibe::Synthwave => Scale::Minor,
             Vibe::AcidClub => Scale::AcidMinor,
             Vibe::AmbientDub => Scale::Minor,
+            Vibe::UkGarage => Scale::Dorian,
+            Vibe::JungleDnb => Scale::Minor,
+            Vibe::DetroitTechno => Scale::Minor,
+            Vibe::DreamPop => Scale::Major,
         }
     }
 
@@ -111,6 +143,10 @@ impl Vibe {
             Vibe::Synthwave => 2,
             Vibe::AcidClub => 5,
             Vibe::AmbientDub => 6,
+            Vibe::UkGarage => 0,
+            Vibe::JungleDnb => 6,
+            Vibe::DetroitTechno => 5,
+            Vibe::DreamPop => 7,
         }
     }
 
@@ -123,6 +159,10 @@ impl Vibe {
             Vibe::Synthwave => [255, 86, 168],
             Vibe::AcidClub => [186, 255, 56],
             Vibe::AmbientDub => [96, 165, 250],
+            Vibe::UkGarage => [255, 198, 66],
+            Vibe::JungleDnb => [255, 96, 96],
+            Vibe::DetroitTechno => [130, 178, 255],
+            Vibe::DreamPop => [246, 146, 218],
         }
     }
 }
@@ -347,7 +387,7 @@ pub fn build_auto_chord_pads(root_note: u8, scale: Scale) -> Vec<AutoChordPad> {
             let center = if i == 7 { 66 } else { 60 };
             let mut label = chord_symbol(root_note, slot);
             if i == 7 {
-                label.push('↑');
+                label.push('+');
             }
             AutoChordPad {
                 key_label: KEYS[i],
@@ -1036,6 +1076,92 @@ pub fn generate_auto_beat(vibe: Vibe, energy: f32, seed: u32) -> DrumTrackSeq {
                     }
                 }
             }
+            Vibe::UkGarage => {
+                // Classic 2-step skipped kick + snappy snare on 2 & 4 + shuffling ghost hats!
+                set(&mut seq, DrumVoiceId::Kick, base, 0.96, true, 1);
+                set(&mut seq, DrumVoiceId::Kick, base + 10, 0.88, false, 1);
+                if bar % 2 == 1 {
+                    set(&mut seq, DrumVoiceId::Kick, base + 6, 0.70, false, 1);
+                }
+                for beat in [4, 12] {
+                    set(&mut seq, DrumVoiceId::Snare, base + beat, 0.92, true, 1);
+                    set(&mut seq, DrumVoiceId::Clap, base + beat, 0.72, false, 1);
+                }
+                if e > 0.35 {
+                    set(&mut seq, DrumVoiceId::CowbellRim, base + 7, 0.56, false, 1);
+                    set(&mut seq, DrumVoiceId::CowbellRim, base + 15, 0.62, false, 1);
+                }
+                for s in [2, 3, 6, 9, 10, 14, 15] {
+                    let vel = if s % 4 == 2 { 0.76 } else { 0.48 };
+                    let ratch = if is_fill_bar && s == 15 && e > 0.5 { 2 } else { 1 };
+                    set(&mut seq, DrumVoiceId::ClosedHat, base + s, vel, s == 2 || s == 10, ratch);
+                }
+                set(&mut seq, DrumVoiceId::OpenHat, base + 14, 0.68, false, 1);
+            }
+            Vibe::JungleDnb => {
+                // 170 BPM Breakbeat: Kick on 1 & 10, Snare on 4 & 12 + ghost snares on 7 & 9!
+                set(&mut seq, DrumVoiceId::Kick, base, 0.98, true, 1);
+                set(&mut seq, DrumVoiceId::Kick, base + 10, 0.90, false, 1);
+                if bar == 3 && e > 0.5 {
+                    set(&mut seq, DrumVoiceId::Kick, base + 11, 0.74, false, 1);
+                }
+                set(&mut seq, DrumVoiceId::Snare, base + 4, 0.96, true, 1);
+                set(&mut seq, DrumVoiceId::Snare, base + 12, 0.94, true, 1);
+                if e > 0.3 {
+                    set(&mut seq, DrumVoiceId::Snare, base + 7, 0.46, false, 1);
+                    set(&mut seq, DrumVoiceId::Snare, base + 9, 0.44, false, 1);
+                    if is_fill_bar {
+                        set(&mut seq, DrumVoiceId::Snare, base + 14, 0.80, false, 2);
+                        set(&mut seq, DrumVoiceId::Snare, base + 15, 0.88, true, 2);
+                    }
+                }
+                for s in (0..16).step_by(2) {
+                    set(&mut seq, DrumVoiceId::ClosedHat, base + s, if s % 4 == 0 { 0.72 } else { 0.52 }, false, 1);
+                }
+                if e > 0.55 {
+                    set(&mut seq, DrumVoiceId::OpenHat, base + 2, 0.54, false, 1);
+                    set(&mut seq, DrumVoiceId::OpenHat, base + 14, 0.58, false, 1);
+                }
+            }
+            Vibe::DetroitTechno => {
+                // Hypnotic 909 four-on-the-floor + offbeat open hats + crisp ride cymbal!
+                for beat in [0, 4, 8, 12] {
+                    set(&mut seq, DrumVoiceId::Kick, base + beat, 0.98, beat == 0, 1);
+                }
+                for beat in [4, 12] {
+                    set(&mut seq, DrumVoiceId::Clap, base + beat, 0.76, false, 1);
+                }
+                for step in [2, 6, 10, 14] {
+                    set(&mut seq, DrumVoiceId::OpenHat, base + step, 0.76, false, 1);
+                    if e > 0.45 {
+                        set(&mut seq, DrumVoiceId::Cymbal, base + step, 0.40, false, 1);
+                    }
+                }
+                for s in 0..16 {
+                    if s % 4 != 2 && e > 0.35 {
+                        set(&mut seq, DrumVoiceId::ClosedHat, base + s, 0.44, false, 1);
+                    }
+                }
+                if is_fill_bar && e > 0.5 {
+                    set(&mut seq, DrumVoiceId::Tom, base + 11, 0.68, false, 1);
+                    set(&mut seq, DrumVoiceId::Tom, base + 14, 0.74, false, 1);
+                }
+            }
+            Vibe::DreamPop => {
+                // Warm steady indie-pop groove
+                set(&mut seq, DrumVoiceId::Kick, base, 0.90, true, 1);
+                set(&mut seq, DrumVoiceId::Kick, base + 6, 0.72, false, 1);
+                set(&mut seq, DrumVoiceId::Kick, base + 8, 0.84, false, 1);
+                for beat in [4, 12] {
+                    set(&mut seq, DrumVoiceId::Snare, base + beat, 0.84, true, 1);
+                }
+                for s in (0..16).step_by(2) {
+                    set(&mut seq, DrumVoiceId::ClosedHat, base + s, if s % 4 == 0 { 0.54 } else { 0.38 }, false, 1);
+                }
+                if bar == 0 {
+                    set(&mut seq, DrumVoiceId::Cymbal, 0, 0.48, false, 1);
+                }
+            }
         }
     }
     seq
@@ -1220,16 +1346,64 @@ pub fn generate_melodic_tracks(
                     s.gate = gate;
                 }
             }
+            Vibe::UkGarage => {
+                // Bouncy 2-step organ/sub bass!
+                for &(st, iv, gate, vel) in &[(0, 0, 2.2, 0.94), (3, 7, 1.4, 0.78), (10, 0, 2.2, 0.90), (14, 10, 1.4, 0.82)] {
+                    let s = &mut bass.steps[base + st];
+                    s.active = true;
+                    s.note = (bass_root + iv).min(56);
+                    s.velocity = vel;
+                    s.gate = gate;
+                    s.accent = st == 0 || st == 10;
+                }
+            }
+            Vibe::JungleDnb => {
+                // Deep rolling Reese sub-bass!
+                let s = &mut bass.steps[base];
+                s.active = true;
+                s.note = bass_root;
+                s.velocity = 0.94;
+                s.gate = 14.0;
+                if bar % 2 == 1 {
+                    let s2 = &mut bass.steps[base + 10];
+                    s2.active = true;
+                    s2.note = (bass_root + 3).min(52);
+                    s2.velocity = 0.84;
+                    s2.gate = 5.0;
+                    s2.slide = true;
+                }
+            }
+            Vibe::DetroitTechno => {
+                // Driving hypnotic offbeat techno bass
+                for s_idx in [2, 6, 10, 14] {
+                    let s = &mut bass.steps[base + s_idx];
+                    s.active = true;
+                    s.note = if s_idx == 14 { bass_root + 7 } else { bass_root };
+                    s.velocity = 0.88;
+                    s.gate = 1.6;
+                    s.accent = s_idx == 2 || s_idx == 10;
+                }
+            }
+            Vibe::DreamPop => {
+                // Warm melodic 8th/dotted bass
+                for &(st, iv, gate) in &[(0, 0, 3.5), (6, 0, 1.8), (8, 7, 3.5), (14, 12, 1.5)] {
+                    let s = &mut bass.steps[base + st];
+                    s.active = true;
+                    s.note = (bass_root + iv).min(56);
+                    s.velocity = 0.82;
+                    s.gate = gate;
+                }
+            }
         }
 
         // 3. ARP / MELODY (Monologue) — 100% locked to active chord tones!
         let arp_steps: &[usize] = match vibe {
-            Vibe::ElectroSoul | Vibe::Synthwave => &[0, 2, 4, 6, 8, 10, 12, 14],
-            Vibe::ElectroFunk => &[2, 5, 7, 10, 14],
-            Vibe::DeepHouse => &[2, 6, 10, 14],
+            Vibe::ElectroSoul | Vibe::Synthwave | Vibe::DreamPop => &[0, 2, 4, 6, 8, 10, 12, 14],
+            Vibe::ElectroFunk | Vibe::UkGarage => &[2, 5, 7, 10, 14],
+            Vibe::DeepHouse | Vibe::DetroitTechno => &[2, 6, 10, 14],
             Vibe::LofiChill => &[0, 6, 10],
             Vibe::AcidClub => &[2, 10, 14],
-            Vibe::AmbientDub => &[4, 12],
+            Vibe::AmbientDub | Vibe::JungleDnb => &[4, 12],
         };
         for (i, &st) in arp_steps.iter().enumerate() {
             let tone_idx = (i + bar + rng.range(2)) % arp_tones.len().max(1);
@@ -1379,6 +1553,42 @@ pub fn apply_vibe_to_project(p: &mut Project, vibe: Vibe, prog_idx: Option<usize
             apply_voice_preset(p, TrackId::Tb303, 3);     // Deep Sub 303
             apply_voice_preset(p, TrackId::Sampler, 2);   // Choir Ahh
             p.sidechain_amount = 0.28;
+        }
+        Vibe::UkGarage => {
+            apply_voice_preset(p, TrackId::Drums, 2);     // Funk Electro (crisp 2-step)
+            apply_voice_preset(p, TrackId::Moog, 1);      // Funk Slap / Organ
+            apply_voice_preset(p, TrackId::MoogPad, 2);   // Dub Chord
+            apply_voice_preset(p, TrackId::Monologue, 0); // Pluck Arp
+            apply_voice_preset(p, TrackId::Tb303, 1);     // Liquid 303
+            apply_voice_preset(p, TrackId::Sampler, 0);   // Minor9 Rhodes
+            p.sidechain_amount = 0.44;
+        }
+        Vibe::JungleDnb => {
+            apply_voice_preset(p, TrackId::Drums, 1);     // 909 Club
+            apply_voice_preset(p, TrackId::Moog, 3);      // Deep Reese
+            apply_voice_preset(p, TrackId::MoogPad, 1);   // Warm Strings
+            apply_voice_preset(p, TrackId::Monologue, 1); // Sparkle Bell
+            apply_voice_preset(p, TrackId::Tb303, 3);     // Deep Sub 303
+            apply_voice_preset(p, TrackId::Sampler, 2);   // Choir Ahh
+            p.sidechain_amount = 0.42;
+        }
+        Vibe::DetroitTechno => {
+            apply_voice_preset(p, TrackId::Drums, 1);     // 909 Club
+            apply_voice_preset(p, TrackId::Moog, 0);      // Warm Sub
+            apply_voice_preset(p, TrackId::MoogPad, 2);   // Dub Chord
+            apply_voice_preset(p, TrackId::Monologue, 0); // Pluck Arp
+            apply_voice_preset(p, TrackId::Tb303, 1);     // Liquid 303
+            apply_voice_preset(p, TrackId::Sampler, 2);   // Choir Ahh
+            p.sidechain_amount = 0.62;
+        }
+        Vibe::DreamPop => {
+            apply_voice_preset(p, TrackId::Drums, 0);     // 808 Warm
+            apply_voice_preset(p, TrackId::Moog, 0);      // Warm Sub
+            apply_voice_preset(p, TrackId::MoogPad, 1);   // Warm Strings
+            apply_voice_preset(p, TrackId::Monologue, 1); // Sparkle Bell
+            apply_voice_preset(p, TrackId::Tb303, 3);     // Deep Sub 303
+            apply_voice_preset(p, TrackId::Sampler, 3);   // Retro FM Bell
+            p.sidechain_amount = 0.34;
         }
     }
 

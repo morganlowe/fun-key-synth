@@ -1643,6 +1643,23 @@ pub fn load_project(path: &Path) -> Result<Project, String> {
     Ok(project)
 }
 
+pub fn save_pattern(path: &Path, pattern: &Pattern) -> Result<(), String> {
+    let mut normalized = pattern.clone();
+    normalized.normalize();
+    let json = serde_json::to_string_pretty(&normalized)
+        .map_err(|e| format!("Failed to serialize pattern: {e}"))?;
+    fs::write(path, json).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
+pub fn load_pattern(path: &Path) -> Result<Pattern, String> {
+    let raw =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let mut pat: Pattern =
+        serde_json::from_str(&raw).map_err(|e| format!("Invalid pattern JSON: {e}"))?;
+    pat.normalize();
+    Ok(pat)
+}
+
 const B64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn b64_encode(input: &[u8]) -> String {

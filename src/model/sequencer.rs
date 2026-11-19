@@ -372,6 +372,16 @@ pub struct DrumStep {
     pub flam: bool,
     pub probability: f32,
     pub ratchet: u8,
+    /// Per-step FX (P-Locks): flip reverse for just this step!
+    pub reverse: bool,
+    /// Per-step pitch shift in semitones (-24..=+24)
+    pub pitch_offset: i8,
+    /// Per-step varispeed multiplier (0.25..=2.0, 1.0 = normal)
+    pub speed_mult: f32,
+    /// Optional per-step filter cutoff lock (0.0..=1.0)
+    pub cutoff_lock: Option<f32>,
+    /// Optional per-step stereo pan lock (-1.0..=1.0)
+    pub pan_lock: Option<f32>,
 }
 
 impl Default for DrumStep {
@@ -383,7 +393,30 @@ impl Default for DrumStep {
             flam: false,
             probability: 1.0,
             ratchet: 1,
+            reverse: false,
+            pitch_offset: 0,
+            speed_mult: 1.0,
+            cutoff_lock: None,
+            pan_lock: None,
         }
+    }
+}
+
+impl DrumStep {
+    pub fn has_step_fx(&self) -> bool {
+        self.reverse
+            || self.pitch_offset != 0
+            || (self.speed_mult - 1.0).abs() > 0.01
+            || self.cutoff_lock.is_some()
+            || self.pan_lock.is_some()
+    }
+
+    pub fn clear_step_fx(&mut self) {
+        self.reverse = false;
+        self.pitch_offset = 0;
+        self.speed_mult = 1.0;
+        self.cutoff_lock = None;
+        self.pan_lock = None;
     }
 }
 
@@ -631,6 +664,63 @@ impl MidiTrackSeq {
     }
 }
 
+/// 64-step per-pattern live macro & performance motion recording (Volca-style!).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MotionAutomation {
+    pub filter: Vec<Option<f32>>,     // 0..1 normalized cutoff
+    pub space: Vec<Option<f32>>,      // 0..1 reverb/delay macro
+    pub sidechain: Vec<Option<f32>>,  // 0..1
+    pub glitch: Vec<Option<f32>>,     // 0..1
+    pub iso_bass: Vec<Option<f32>>,   // 0..2 Volca bass isolator
+    pub iso_treble: Vec<Option<f32>>, // 0..2 Volca treble isolator
+}
+
+impl Default for MotionAutomation {
+    fn default() -> Self {
+        Self {
+            filter: vec![None; MAX_STEPS],
+            space: vec![None; MAX_STEPS],
+            sidechain: vec![None; MAX_STEPS],
+            glitch: vec![None; MAX_STEPS],
+            iso_bass: vec![None; MAX_STEPS],
+            iso_treble: vec![None; MAX_STEPS],
+        }
+    }
+}
+
+impl MotionAutomation {
+    pub fn normalize(&mut self) {
+        for lane in [
+            &mut self.filter,
+            &mut self.space,
+            &mut self.sidechain,
+            &mut self.glitch,
+            &mut self.iso_bass,
+            &mut self.iso_treble,
+        ] {
+            if lane.len() < MAX_STEPS {
+                lane.resize(MAX_STEPS, None);
+            } else if lane.len() > MAX_STEPS {
+                lane.truncate(MAX_STEPS);
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn has_any(&self) -> bool {
+        self.filter.iter().any(|v| v.is_some())
+            || self.space.iter().any(|v| v.is_some())
+            || self.sidechain.iter().any(|v| v.is_some())
+            || self.glitch.iter().any(|v| v.is_some())
+            || self.iso_bass.iter().any(|v| v.is_some())
+            || self.iso_treble.iter().any(|v| v.is_some())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Pattern {
@@ -642,6 +732,7 @@ pub struct Pattern {
     pub drums: DrumTrackSeq,
     pub sampler: MelodicTrackSeq,
     pub sample_lanes: Vec<DrumLane>,
+    pub motion: MotionAutomation,
     pub midi_out: MidiTrackSeq,
 }
 
@@ -660,6 +751,7 @@ impl Default for Pattern {
             drums: DrumTrackSeq::default(),
             sampler: MelodicTrackSeq::with_default_note(60, StepCount::Steps16),
             sample_lanes,
+            motion: MotionAutomation::default(),
             midi_out: MidiTrackSeq::default(),
         }
     }
@@ -700,6 +792,7 @@ impl Pattern {
         for l in &mut self.sample_lanes {
             l.normalize();
         }
+        self.motion.normalize();
         self.midi_out.normalize();
     }
 }
