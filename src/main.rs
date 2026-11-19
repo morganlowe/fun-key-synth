@@ -8,10 +8,16 @@ fn main() -> eframe::Result {
         .expect("failed to start Tokio runtime");
     let _guard = rt.enter();
 
+    let icon = egui::IconData {
+        rgba: include_bytes!("icon_64.rgba").to_vec(),
+        width: 64,
+        height: 64,
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 820.0])
-            .with_min_inner_size([1180.0, 620.0]),
+            .with_min_inner_size([1180.0, 620.0])
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native(

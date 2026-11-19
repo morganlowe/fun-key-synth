@@ -17,5 +17,6 @@ package() {
     cd "$startdir/../.."
     install -Dm755 "target/release/fun-key-synth" "$pkgdir/usr/bin/fun-key-synth"
     install -Dm644 "packaging/fun-key-synth.desktop" "$pkgdir/usr/share/applications/fun-key-synth.desktop"
+    install -Dm644 "packaging/fun-key-synth.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/fun-key-synth.png"
     install -Dm644 "README.md" "$pkgdir/usr/share/doc/fun-key-synth/README.md"
 }

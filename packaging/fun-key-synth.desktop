@@ -2,6 +2,7 @@
 Name=Fun Key Synth
 Comment=Beginner-friendly Vibe Studio, Auto-Chord/Beat Groovebox & 8-Part Performance Sampler
 Exec=/usr/bin/fun-key-synth
+Icon=fun-key-synth
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Music;Synthesizer;
