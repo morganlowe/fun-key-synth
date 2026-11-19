@@ -15,6 +15,7 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("fun-key-synth")
             .with_inner_size([1440.0, 820.0])
             .with_min_inner_size([1180.0, 620.0])
             .with_icon(icon),
