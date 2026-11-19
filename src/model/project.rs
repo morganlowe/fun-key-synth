@@ -16,6 +16,9 @@ pub struct SongSection {
     pub bars: u8,
     pub bass_drop: bool,
     pub fill: bool,
+    /// Bitmask of active studio tracks:
+    /// bit 0=Drums, 1=Bass(Moog), 2=Chords(MoogPad), 3=Arp(Monologue), 4=Lead/303, 5=Sampler
+    pub track_mask: u8,
 }
 impl Default for SongSection {
     fn default() -> Self {
@@ -25,6 +28,7 @@ impl Default for SongSection {
             bars: 4,
             bass_drop: false,
             fill: false,
+            track_mask: 0b111111,
         }
     }
 }
@@ -112,7 +116,7 @@ impl Default for MoogParams {
             osc3_detune: -6.0,
             osc3_level: 0.55,
             noise_level: 0.02,
-            drive: 0.30,
+            drive: 0.12,
             cutoff: 1350.0,
             resonance: 0.36,
             env_amount: 0.58,
@@ -300,7 +304,7 @@ impl Default for MonologueParams {
             glide: 0.12,
             cutoff: 1850.0,
             resonance: 0.42,
-            drive: 0.42,
+            drive: 0.16,
             eg_attack: 0.005,
             eg_decay: 0.28,
             eg_int: 0.55,
@@ -354,7 +358,7 @@ impl Default for Tb303Params {
             env_mod: 0.68,
             decay: 0.34,
             accent: 0.78,
-            overdrive: 0.38,
+            overdrive: 0.12,
         }
     }
 }
@@ -427,20 +431,20 @@ impl Default for DrumKitParams {
         voices[1] = DrumVoiceParams {
             model: DrumModel::Tr909,
             tune: 0.05,
-            decay: 0.45,
+            decay: 0.22,
             tone: 0.55,
             snappy: 0.68,
-            level: 0.92,
+            level: 0.78,
             pan: -0.05,
             mute: false,
         }; // Snare
         voices[2] = DrumVoiceParams {
             model: DrumModel::Tr808,
             tune: 0.0,
-            decay: 0.55,
+            decay: 0.18,
             tone: 0.6,
             snappy: 0.6,
-            level: 0.82,
+            level: 0.62,
             pan: 0.08,
             mute: false,
         }; // Clap
@@ -569,10 +573,12 @@ pub struct SamplerParams {
     pub loop_mode: LoopMode,
     pub reverse: bool,
     pub root_note: u8,
+    pub transpose: i8,  // -24..=+24 semitones
     pub tune_cents: f32,
     pub start: f32,     // 0..1
     pub end: f32,       // 0..1
     pub bit_crush: f32, // 0..1 extra grit
+    pub filter_mode: GlobalFilterMode,
     pub cutoff: f32,    // 150..18000 Hz
     pub resonance: f32, // 0..0.9
     pub attack: f32,
@@ -588,10 +594,12 @@ impl Default for SamplerParams {
             loop_mode: LoopMode::OneShot,
             reverse: false,
             root_note: 60,
+            transpose: 0,
             tune_cents: 0.0,
             start: 0.0,
             end: 1.0,
             bit_crush: 0.15,
+            filter_mode: GlobalFilterMode::LowPass,
             cutoff: 7200.0,
             resonance: 0.18,
             attack: 0.004,
@@ -663,6 +671,8 @@ pub struct TrackMixerChannel {
     pub pan: f32,         // -1..=1
     pub delay_send: f32,  // 0..1
     pub reverb_send: f32, // 0..1
+    pub delay_enabled: bool,
+    pub reverb_enabled: bool,
     pub mute: bool,
     pub solo: bool,
 }
@@ -674,6 +684,8 @@ impl Default for TrackMixerChannel {
             pan: 0.0,
             delay_send: 0.15,
             reverb_send: 0.15,
+            delay_enabled: true,
+            reverb_enabled: true,
             mute: false,
             solo: false,
         }
@@ -686,6 +698,10 @@ pub struct MixerParams {
     pub channels: [TrackMixerChannel; 6],
     pub master_volume: f32,
     pub moog_pad_volume: f32,
+    pub moog_pad_reverb_send: f32,
+    pub moog_pad_delay_send: f32,
+    pub moog_pad_delay_enabled: bool,
+    pub moog_pad_reverb_enabled: bool,
     pub moog_pad_mute: bool,
     pub moog_pad_solo: bool,
 }
@@ -697,7 +713,9 @@ impl Default for MixerParams {
             volume: 1.12,
             pan: -0.08,
             delay_send: 0.20,
-            reverb_send: 0.25,
+            reverb_send: 0.06,
+            delay_enabled: true,
+            reverb_enabled: true,
             mute: false,
             solo: false,
         }; // Moog
@@ -705,7 +723,9 @@ impl Default for MixerParams {
             volume: 0.75,
             pan: 0.12,
             delay_send: 0.30,
-            reverb_send: 0.22,
+            reverb_send: 0.10,
+            delay_enabled: true,
+            reverb_enabled: true,
             mute: false,
             solo: false,
         }; // Monologue
@@ -713,7 +733,9 @@ impl Default for MixerParams {
             volume: 0.82,
             pan: 0.0,
             delay_send: 0.25,
-            reverb_send: 0.12,
+            reverb_send: 0.04,
+            delay_enabled: true,
+            reverb_enabled: true,
             mute: false,
             solo: false,
         }; // 303
@@ -721,7 +743,9 @@ impl Default for MixerParams {
             volume: 0.56,
             pan: 0.0,
             delay_send: 0.06,
-            reverb_send: 0.10,
+            reverb_send: 0.025,
+            delay_enabled: true,
+            reverb_enabled: true,
             mute: false,
             solo: false,
         }; // Drums
@@ -729,7 +753,9 @@ impl Default for MixerParams {
             volume: 0.80,
             pan: -0.14,
             delay_send: 0.28,
-            reverb_send: 0.30,
+            reverb_send: 0.14,
+            delay_enabled: true,
+            reverb_enabled: true,
             mute: false,
             solo: false,
         }; // SK-1
@@ -738,6 +764,8 @@ impl Default for MixerParams {
             pan: 0.0,
             delay_send: 0.0,
             reverb_send: 0.0,
+            delay_enabled: false,
+            reverb_enabled: false,
             mute: false,
             solo: false,
         }; // MIDI
@@ -745,6 +773,10 @@ impl Default for MixerParams {
             channels,
             master_volume: 0.88,
             moog_pad_volume: 0.78,
+            moog_pad_reverb_send: 0.28,
+            moog_pad_delay_send: 0.10,
+            moog_pad_delay_enabled: true,
+            moog_pad_reverb_enabled: true,
             moog_pad_mute: false,
             moog_pad_solo: false,
         }
@@ -796,6 +828,9 @@ impl DelayDivision {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FxParams {
+    pub delay_enabled: bool,
+    pub reverb_enabled: bool,
+    pub global_filter_enabled: bool,
     pub delay_div: DelayDivision,
     pub delay_feedback: f32,
     pub delay_tone: f32, // 0..1 LP
@@ -816,14 +851,17 @@ pub struct FxParams {
 impl Default for FxParams {
     fn default() -> Self {
         Self {
+            delay_enabled: true,
+            reverb_enabled: true,
+            global_filter_enabled: true,
             delay_div: DelayDivision::DottedEighth,
-            delay_feedback: 0.44,
+            delay_feedback: 0.28,
             delay_tone: 0.58,
-            delay_mix: 0.62,
-            reverb_size: 0.62,
-            reverb_damp: 0.45,
-            reverb_mix: 0.52,
-            analog_warmth: 0.22,
+            delay_mix: 0.20,
+            reverb_size: 0.42,
+            reverb_damp: 0.62,
+            reverb_mix: 0.16,
+            analog_warmth: 0.05,
             global_filter_mode: GlobalFilterMode::LowPass,
             global_filter_cutoff: 18000.0,
             global_filter_resonance: 0.08,
@@ -862,6 +900,18 @@ pub struct Project {
     pub swing: f32, // 0.0..=0.5 (displayed 50%..75%)
     pub root_note: u8,
     pub scale: Scale,
+    pub vibe: super::Vibe,
+    pub progression_idx: usize,
+    pub bars_per_chord: u8,
+    pub auto_chord_mode: bool,
+    pub auto_chord_follow: bool,
+    pub auto_beat_mode: bool,
+    pub beat_energy: f32,
+    pub sidechain_amount: f32,
+    pub party_energy: f32,
+    pub party_auto_evolve: bool,
+    pub voice_presets: [usize; 6],
+    pub sample_generation: u64,
     pub moog: MoogParams,
     pub moog_pad: MoogParams,
     pub monologue: MonologueParams,
@@ -882,7 +932,9 @@ pub struct Project {
 
 impl Default for Project {
     fn default() -> Self {
-        Self::factory(FactoryPreset::AcidWarehouse)
+        let mut p = Self::factory(FactoryPreset::BlankInit);
+        super::apply_vibe_to_project(&mut p, super::Vibe::DeepHouse, None, 0xF00D_5EED);
+        p
     }
 }
 
@@ -891,14 +943,20 @@ pub enum FactoryPreset {
     AcidWarehouse,
     ElectroFunkSk1,
     Detroit909Deep,
+    NightDrive,
+    NeonSoul,
+    WarmHouse,
     BlankInit,
 }
 
 impl FactoryPreset {
-    pub const ALL: [FactoryPreset; 4] = [
+    pub const ALL: [FactoryPreset; 7] = [
         FactoryPreset::AcidWarehouse,
         FactoryPreset::ElectroFunkSk1,
         FactoryPreset::Detroit909Deep,
+        FactoryPreset::NightDrive,
+        FactoryPreset::NeonSoul,
+        FactoryPreset::WarmHouse,
         FactoryPreset::BlankInit,
     ];
 
@@ -907,6 +965,9 @@ impl FactoryPreset {
             FactoryPreset::AcidWarehouse => "Acid Warehouse (808/909 + 303)",
             FactoryPreset::ElectroFunkSk1 => "Electro Funk (SK-1 + Moog)",
             FactoryPreset::Detroit909Deep => "Detroit Deep 909 (64-Step)",
+            FactoryPreset::NightDrive => "Night Drive (deep and spacious)",
+            FactoryPreset::NeonSoul => "Neon Soul (warm electro funk)",
+            FactoryPreset::WarmHouse => "Warm House (chords and bounce)",
             FactoryPreset::BlankInit => "Blank Init",
         }
     }
@@ -916,6 +977,9 @@ impl FactoryPreset {
             FactoryPreset::AcidWarehouse => "acid",
             FactoryPreset::ElectroFunkSk1 => "electro",
             FactoryPreset::Detroit909Deep => "detroit",
+            FactoryPreset::NightDrive => "night",
+            FactoryPreset::NeonSoul => "soul",
+            FactoryPreset::WarmHouse => "house",
             FactoryPreset::BlankInit => "blank",
         }
     }
@@ -925,6 +989,9 @@ impl FactoryPreset {
             "acid" | "warehouse" => Some(Self::AcidWarehouse),
             "electro" | "funk" | "sk1" => Some(Self::ElectroFunkSk1),
             "detroit" | "909" | "deep" => Some(Self::Detroit909Deep),
+            "night" | "drive" => Some(Self::NightDrive),
+            "soul" | "neon" => Some(Self::NeonSoul),
+            "house" | "warm" => Some(Self::WarmHouse),
             "blank" | "init" => Some(Self::BlankInit),
             _ => None,
         }
@@ -963,6 +1030,46 @@ impl Project {
     }
 
     pub fn factory(preset: FactoryPreset) -> Self {
+        // Variations start with a proven musical arrangement, then set a distinct tempo,
+        // tone, and mix rather than generating a new pile of unrelated notes.
+        match preset {
+            FactoryPreset::NightDrive => {
+                let mut p = Self::factory(FactoryPreset::Detroit909Deep);
+                p.name = preset.name().into();
+                p.bpm = 116.0;
+                p.root_note = 2;
+                p.fx.delay_mix = 0.10;
+                p.fx.reverb_mix = 0.16;
+                p.moog.cutoff = 980.0;
+                p.moog_pad.cutoff = 3100.0;
+                p.patterns[0].name = "Night Drive".into();
+                return p;
+            }
+            FactoryPreset::NeonSoul => {
+                let mut p = Self::factory(FactoryPreset::ElectroFunkSk1);
+                p.name = preset.name().into();
+                p.bpm = 106.0;
+                p.root_note = 7;
+                p.fx.delay_mix = 0.08;
+                p.fx.reverb_mix = 0.12;
+                p.moog.cutoff = 1800.0;
+                p.patterns[0].name = "Neon Soul".into();
+                return p;
+            }
+            FactoryPreset::WarmHouse => {
+                let mut p = Self::factory(FactoryPreset::AcidWarehouse);
+                p.name = preset.name().into();
+                p.bpm = 122.0;
+                p.root_note = 9;
+                p.tb303.cutoff = 720.0;
+                p.tb303.resonance = 0.34;
+                p.fx.delay_mix = 0.08;
+                p.fx.reverb_mix = 0.14;
+                p.patterns[0].name = "Warm House".into();
+                return p;
+            }
+            _ => {}
+        }
         let mut patterns: Vec<Pattern> = (0..NUM_PATTERNS)
             .map(|i| Pattern::named(format!("Bank {}", (b'A' + i as u8) as char)))
             .collect();
@@ -982,12 +1089,24 @@ impl Project {
         moog_pad.amp_release = 2.4;
 
         let mut p = Self {
-            version: 1,
+            version: 2,
             name: preset.name().to_string(),
-            bpm: 128.0,
-            swing: 0.08,
-            root_note: 0, // C
+            bpm: 122.0,
+            swing: 0.12,
+            root_note: 9, // A
             scale: Scale::Minor,
+            vibe: super::Vibe::DeepHouse,
+            progression_idx: 0,
+            bars_per_chord: 1,
+            auto_chord_mode: true,
+            auto_chord_follow: true,
+            auto_beat_mode: false,
+            beat_energy: 0.65,
+            sidechain_amount: 0.55,
+            party_energy: 0.70,
+            party_auto_evolve: true,
+            voice_presets: [0; 6],
+            sample_generation: 1,
             moog: MoogParams::default(),
             moog_pad,
             monologue: MonologueParams::default(),
@@ -1007,6 +1126,7 @@ impl Project {
                 bars: 4,
                 bass_drop: false,
                 fill: false,
+                track_mask: 0b111111,
             }],
             party_mode: false,
             party_seed: 0xF00D_5EED,
@@ -1363,6 +1483,7 @@ impl Project {
                     };
                 }
             }
+            FactoryPreset::NightDrive | FactoryPreset::NeonSoul | FactoryPreset::WarmHouse => unreachable!(),
         }
 
         p.patterns = patterns;

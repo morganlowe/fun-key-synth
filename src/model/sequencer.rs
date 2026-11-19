@@ -14,9 +14,14 @@ pub enum ChordType {
     Sus4,
     Major7,
     Minor7,
+    Minor9,
+    Major9,
+    Dom9,
+    Minor11,
+    Add9,
 }
 impl ChordType {
-    pub const ALL: [ChordType; 7] = [
+    pub const ALL: [ChordType; 12] = [
         ChordType::Single,
         ChordType::Major,
         ChordType::Minor,
@@ -24,16 +29,26 @@ impl ChordType {
         ChordType::Sus4,
         ChordType::Major7,
         ChordType::Minor7,
+        ChordType::Minor9,
+        ChordType::Major9,
+        ChordType::Dom9,
+        ChordType::Minor11,
+        ChordType::Add9,
     ];
     pub const fn name(self) -> &'static str {
         match self {
             Self::Single => "Single",
-            Self::Major => "Major",
-            Self::Minor => "Minor",
+            Self::Major => "Maj",
+            Self::Minor => "Min",
             Self::Sus2 => "Sus2",
             Self::Sus4 => "Sus4",
             Self::Major7 => "Maj7",
             Self::Minor7 => "Min7",
+            Self::Minor9 => "m9",
+            Self::Major9 => "Maj9",
+            Self::Dom9 => "9",
+            Self::Minor11 => "m11",
+            Self::Add9 => "add9",
         }
     }
     pub const fn intervals(self) -> &'static [u8] {
@@ -45,6 +60,11 @@ impl ChordType {
             Self::Sus4 => &[0, 5, 7],
             Self::Major7 => &[0, 4, 7, 11],
             Self::Minor7 => &[0, 3, 7, 10],
+            Self::Minor9 => &[0, 3, 7, 10, 14],
+            Self::Major9 => &[0, 4, 7, 11, 14],
+            Self::Dom9 => &[0, 4, 7, 10, 14],
+            Self::Minor11 => &[0, 3, 7, 10, 17],
+            Self::Add9 => &[0, 4, 7, 14],
         }
     }
 }
@@ -141,6 +161,22 @@ impl Default for MelodicTrackSeq {
 }
 
 impl MelodicTrackSeq {
+    pub fn new(step_count: StepCount) -> Self {
+        Self {
+            step_count,
+            ..Self::default()
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for st in &mut self.steps {
+            st.active = false;
+            st.accent = false;
+            st.slide = false;
+            st.motion.clear();
+        }
+    }
+
     pub fn with_default_note(note: u8, step_count: StepCount) -> Self {
         let mut s = Self {
             step_count,
@@ -286,14 +322,28 @@ impl DrumVoiceId {
         }
     }
 
+    pub const fn from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(DrumVoiceId::Kick),
+            1 => Some(DrumVoiceId::Snare),
+            2 => Some(DrumVoiceId::Clap),
+            3 => Some(DrumVoiceId::CowbellRim),
+            4 => Some(DrumVoiceId::ClosedHat),
+            5 => Some(DrumVoiceId::OpenHat),
+            6 => Some(DrumVoiceId::Tom),
+            7 => Some(DrumVoiceId::Cymbal),
+            _ => None,
+        }
+    }
+
     pub const fn short_name(self) -> &'static str {
         match self {
-            DrumVoiceId::Kick => "BD",
-            DrumVoiceId::Snare => "SD",
-            DrumVoiceId::Clap => "CP",
-            DrumVoiceId::CowbellRim => "CB/RM",
-            DrumVoiceId::ClosedHat => "CH",
-            DrumVoiceId::OpenHat => "OH",
+            DrumVoiceId::Kick => "KICK",
+            DrumVoiceId::Snare => "SNARE",
+            DrumVoiceId::Clap => "CLAP",
+            DrumVoiceId::CowbellRim => "RIM",
+            DrumVoiceId::ClosedHat => "C.HAT",
+            DrumVoiceId::OpenHat => "O.HAT",
             DrumVoiceId::Tom => "TOM",
             DrumVoiceId::Cymbal => "CYM",
         }
@@ -321,6 +371,7 @@ pub struct DrumStep {
     pub accent: bool,
     pub flam: bool,
     pub probability: f32,
+    pub ratchet: u8,
 }
 
 impl Default for DrumStep {
@@ -331,6 +382,7 @@ impl Default for DrumStep {
             accent: false,
             flam: false,
             probability: 1.0,
+            ratchet: 1,
         }
     }
 }
@@ -352,6 +404,12 @@ impl Default for DrumLane {
 }
 
 impl DrumLane {
+    pub fn clear(&mut self) {
+        for st in &mut self.steps {
+            *st = DrumStep::default();
+        }
+    }
+
     pub fn normalize(&mut self) {
         normalize_vec(&mut self.steps, MAX_STEPS);
         for st in &mut self.steps {
@@ -606,6 +664,17 @@ impl Pattern {
         Self {
             name: name.into(),
             ..Self::default()
+        }
+    }
+
+    pub fn melodic_mut(&mut self, track: super::TrackId) -> Option<&mut MelodicTrackSeq> {
+        match track {
+            super::TrackId::Moog => Some(&mut self.moog),
+            super::TrackId::MoogPad => Some(&mut self.moog_pad),
+            super::TrackId::Monologue => Some(&mut self.monologue),
+            super::TrackId::Tb303 => Some(&mut self.tb303),
+            super::TrackId::Sampler => Some(&mut self.sampler),
+            _ => None,
         }
     }
 

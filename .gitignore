@@ -1,4 +1,6 @@
 /target/
+/Inspiration/
+*.tar.gz
 *.wav
 *.mp3
 *.flac

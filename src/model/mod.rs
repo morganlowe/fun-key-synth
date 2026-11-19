@@ -1,5 +1,6 @@
 pub mod project;
 pub mod sequencer;
+pub mod vibe;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,12 @@ pub use project::{
 pub use sequencer::{
     euclidean_rhythm, ChordType, DrumLane, DrumStep, DrumTrackSeq, DrumVoiceId, MelodicStep,
     MelodicTrackSeq, MidiStep, MidiTrackSeq, MotionLocks, Pattern,
+};
+pub use vibe::{
+    apply_vibe_to_project, apply_voice_preset, arp_tones_for, bass_midi_for, build_auto_chord_pads,
+    chord_symbol, default_vibe_sections, generate_auto_beat, generate_melodic_tracks,
+    progression_at, voice_led_chord, voice_preset_names, AutoChordPad, ChordProgression, ChordSlot,
+    Vibe, PROGRESSIONS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -85,6 +92,27 @@ impl TrackId {
             TrackId::MidiOut => "MIDI",
         }
     }
+
+    pub const fn role_name(self) -> &'static str {
+        match self {
+            TrackId::Drums => "DRUMS",
+            TrackId::Moog => "BASS",
+            TrackId::MoogPad => "CHORDS",
+            TrackId::Monologue => "ARP",
+            TrackId::Tb303 => "LEAD / 303",
+            TrackId::Sampler => "TEXTURE",
+            TrackId::MidiOut => "MIDI",
+        }
+    }
+
+    pub const STUDIO_TRACKS: [TrackId; 6] = [
+        TrackId::Drums,
+        TrackId::Moog,
+        TrackId::MoogPad,
+        TrackId::Monologue,
+        TrackId::Tb303,
+        TrackId::Sampler,
+    ];
 
     pub const fn is_melodic(self) -> bool {
         !matches!(self, TrackId::Drums)

@@ -2,12 +2,12 @@ use std::f32::consts::TAU;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::model::{LoopMode, MotionLocks, SamplerMode, SamplerParams};
+use crate::model::{GlobalFilterMode, LoopMode, MotionLocks, SamplerMode, SamplerParams};
 
 use super::{soft_tanh, AdsrEnv, Svf12Filter};
 
 const MAX_SAMPLER_VOICES: usize = 4;
-const MAX_SAMPLE_SECONDS: f32 = 15.0;
+const MAX_SAMPLE_SECONDS: f32 = 30.0;
 
 pub const BUILTIN_SAMPLE_NAMES: [&str; 5] = [
     "SK-1 Choir Ahh",
@@ -136,7 +136,9 @@ impl Sk1Sampler {
                     .unwrap_or(0)
             });
 
-        let semitones = (note as f32 - params.root_note as f32) + (params.tune_cents / 100.0);
+        let semitones = (note as f32 - params.root_note as f32)
+            + params.transpose as f32
+            + (params.tune_cents / 100.0);
         let pitch_ratio = 2.0_f64.powf(semitones as f64 / 12.0);
         let sr_ratio = self.buffer_sr as f64 / self.sample_rate as f64;
 
@@ -251,7 +253,12 @@ impl Sk1Sampler {
                 v.sh_held_sample
             };
 
-            let filtered = v.filter.process_lp(crushed, cutoff.min(post_lp_cap), res);
+            let (lp, bp, hp) = v.filter.process_all(crushed, cutoff.min(post_lp_cap), res);
+            let filtered = match params.filter_mode {
+                GlobalFilterMode::LowPass => lp,
+                GlobalFilterMode::BandPass => bp,
+                GlobalFilterMode::HighPass => hp,
+            };
             mix += filtered * env * v.velocity * 0.65;
 
             // Advance position
@@ -432,6 +439,107 @@ pub fn load_wav_to_mono_f32(path: &Path, target_sr: u32) -> Result<Vec<f32>, Str
         mono.push((sum / frame.len() as f32).clamp(-1.0, 1.0));
     }
 
+    let resampled = resample_mono_linear(&mono, src_sr, target_sr);
+    Ok(normalize_peak(&resampled))
+}
+
+/// Loads MP3, WAV, FLAC, or OGG audio via `symphonia` (with `hound` fallback for WAV),
+/// downmixes to mono f32, caps at MAX_SAMPLE_SECONDS, resamples to `target_sr`, and normalizes.
+pub fn load_audio_to_mono_f32(path: &Path, target_sr: u32) -> Result<Vec<f32>, String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    // Fast path for WAV via hound if it works cleanly
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false)
+    {
+        if let Ok(pcm) = load_wav_to_mono_f32(path, target_sr) {
+            return Ok(pcm);
+        }
+    }
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("Unsupported audio format: {e}"))?;
+
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| "No audio track found in file".to_string())?;
+    let track_id = track.id;
+    let src_sr = track.codec_params.sample_rate.unwrap_or(44_100).max(4000);
+    let max_src_frames = (src_sr as f32 * MAX_SAMPLE_SECONDS) as usize;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("Failed to initialize audio decoder: {e}"))?;
+
+    let mut mono = Vec::new();
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+
+    loop {
+        if mono.len() >= max_src_frames {
+            break;
+        }
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(SymphoniaError::ResetRequired) => {
+                decoder.reset();
+                continue;
+            }
+            Err(e) => return Err(format!("Decode read error: {e}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let spec = *decoded.spec();
+                let channels = spec.channels.count().max(1);
+                let frames = decoded.frames();
+                let sb = sample_buf.get_or_insert_with(|| {
+                    SampleBuffer::<f32>::new(decoded.capacity() as u64, spec)
+                });
+                if sb.capacity() < frames * channels {
+                    *sb = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                }
+                sb.copy_interleaved_ref(decoded);
+                let samples = sb.samples();
+                for frame in samples.chunks_exact(channels) {
+                    if mono.len() >= max_src_frames {
+                        break;
+                    }
+                    let sum: f32 = frame.iter().copied().sum();
+                    mono.push((sum / channels as f32).clamp(-1.0, 1.0));
+                }
+            }
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(e) => return Err(format!("Decode error: {e}")),
+        }
+    }
+
+    if mono.is_empty() {
+        return Err("Audio file decoded to 0 samples".to_string());
+    }
     let resampled = resample_mono_linear(&mono, src_sr, target_sr);
     Ok(normalize_peak(&resampled))
 }

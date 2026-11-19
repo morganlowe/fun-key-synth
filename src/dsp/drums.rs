@@ -434,7 +434,7 @@ impl DrumMachine {
         let t_ms = (self.clap_samples as f32 / sr) * 1000.0;
         self.clap_samples = self.clap_samples.saturating_add(1);
 
-        // 4 staggered hand-clap micro-bursts at 0, 10, 20, 30ms + reverb tail
+        // Four short hand-clap bursts. The tail is a voice envelope, not a reverb effect.
         let burst_env = if t_ms < 42.0 {
             let phase_ms = t_ms % 10.5;
             (-phase_ms / 4.2).exp()
@@ -443,8 +443,8 @@ impl DrumMachine {
         };
 
         let tail_dec = match vp.model {
-            DrumModel::Tr808 => 0.10 + vp.decay * 0.38,
-            DrumModel::Tr909 => 0.08 + vp.decay * 0.26,
+            DrumModel::Tr808 => 0.035 + vp.decay * 0.14,
+            DrumModel::Tr909 => 0.030 + vp.decay * 0.12,
         };
         if t_ms >= 30.0 {
             self.clap_tail_env *= (-1.0 / (tail_dec * sr)).exp();
