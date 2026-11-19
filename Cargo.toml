@@ -1,15 +1,15 @@
 [package]
-name = "retrobox"
+name = "fun-key-synth"
 version = "0.1.0"
 edition = "2021"
-description = "Native Linux Analog & Lo-Fi Groovebox Synthesizer (Moog, Monologue, 303, 808/909, Casio SK-1, MIDI)"
+description = "Fun Key Synth: a native Linux analog and lo-fi groovebox synthesizer"
 
 [lib]
-name = "retrobox"
+name = "fun_key_synth"
 path = "src/lib.rs"
 
 [[bin]]
-name = "retrobox"
+name = "fun-key-synth"
 path = "src/main.rs"
 
 [dependencies]

@@ -4,7 +4,7 @@ use crate::{
 };
 use eframe::egui;
 
-pub struct GrooveboxApp {
+pub struct FunKeySynthApp {
     engine: Engine,
     track: TrackId,
     page: usize,
@@ -14,6 +14,7 @@ pub struct GrooveboxApp {
 }
 #[derive(Clone, Copy, PartialEq)]
 enum PageView {
+    Overview,
     Sequencer,
     Song,
     Mixer,
@@ -21,7 +22,7 @@ enum PageView {
     Sound,
     Effects,
 }
-impl GrooveboxApp {
+impl FunKeySynthApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self {
             engine: Engine::new(Project::default()),
@@ -595,6 +596,150 @@ impl GrooveboxApp {
         Self::slider(ui, "Master", &mut p.mixer.master_volume, 0.0..=1.25);
     }
 
+    fn overview_panel(ui: &mut egui::Ui, p: &mut Project, selected: TrackId) -> Option<TrackId> {
+        ui.horizontal(|ui| {
+            ui.heading("PATTERN OVERVIEW");
+            ui.separator();
+            ui.label(&p.current_pattern().name);
+            ui.label(format!("{} BPM", p.bpm));
+        });
+        ui.label(
+            "Click a step to toggle it. Select a track name to open its detailed sound controls.",
+        );
+        let pat = p.current_pattern();
+        let max_steps = [
+            pat.moog.step_count.as_usize(),
+            pat.moog_pad.step_count.as_usize(),
+            pat.monologue.step_count.as_usize(),
+            pat.tb303.step_count.as_usize(),
+            pat.sampler.step_count.as_usize(),
+            pat.midi_out.step_count.as_usize(),
+            pat.drums.step_count.as_usize(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(16);
+        ui.label(format!("Showing all {max_steps} steps"));
+        let rows = [
+            (TrackId::Moog, "MOOG", usize::MAX),
+            (TrackId::MoogPad, "MOOG PAD", usize::MAX),
+            (TrackId::Monologue, "MONO", usize::MAX),
+            (TrackId::Tb303, "303", usize::MAX),
+            (TrackId::Drums, "BD", 0),
+            (TrackId::Drums, "SD", 1),
+            (TrackId::Drums, "CP", 2),
+            (TrackId::Drums, "CB", 3),
+            (TrackId::Drums, "CH", 4),
+            (TrackId::Drums, "OH", 5),
+            (TrackId::Drums, "TOM", 6),
+            (TrackId::Drums, "CYM", 7),
+            (TrackId::Sampler, "SK-1", usize::MAX),
+            (TrackId::MidiOut, "MIDI", usize::MAX),
+        ];
+        let mut chosen = None;
+        let table = egui::Grid::new("overview_steps")
+            .spacing([1.0, 4.0])
+            .min_col_width(15.0);
+        table.show(ui, |ui| {
+            ui.label("TRACK / BEAT");
+            for col in 0..max_steps {
+                ui.label(if col % 4 == 0 {
+                    format!("{}", col / 4 + 1)
+                } else {
+                    String::new()
+                });
+            }
+            ui.end_row();
+            for (track, label, lane) in rows {
+                if ui.selectable_label(selected == track, label).clicked() {
+                    chosen = Some(track);
+                }
+                for col in 0..max_steps {
+                    let i = col;
+                    let (len, active) = match track {
+                        TrackId::Moog => (
+                            p.current_pattern().moog.step_count.as_usize(),
+                            p.current_pattern().moog.steps[i].active,
+                        ),
+                        TrackId::MoogPad => (
+                            p.current_pattern().moog_pad.step_count.as_usize(),
+                            p.current_pattern().moog_pad.steps[i].active,
+                        ),
+                        TrackId::Monologue => (
+                            p.current_pattern().monologue.step_count.as_usize(),
+                            p.current_pattern().monologue.steps[i].active,
+                        ),
+                        TrackId::Tb303 => (
+                            p.current_pattern().tb303.step_count.as_usize(),
+                            p.current_pattern().tb303.steps[i].active,
+                        ),
+                        TrackId::Sampler => (
+                            p.current_pattern().sampler.step_count.as_usize(),
+                            p.current_pattern().sampler.steps[i].active,
+                        ),
+                        TrackId::MidiOut => (
+                            p.current_pattern().midi_out.step_count.as_usize(),
+                            p.current_pattern().midi_out.steps[i].active,
+                        ),
+                        TrackId::Drums => {
+                            let l = &p.current_pattern().drums.lanes[lane];
+                            (l.step_count.as_usize(), l.steps[i].active)
+                        }
+                    };
+                    let enabled = i < len;
+                    let fill = if active {
+                        egui::Color32::from_rgb(235, 119, 62)
+                    } else {
+                        egui::Color32::from_gray(if col % 4 == 0 { 62 } else { 39 })
+                    };
+                    let resp = ui.add_enabled(
+                        enabled,
+                        egui::Button::new(if active { "●" } else { "·" })
+                            .fill(fill)
+                            .min_size(egui::vec2(15.0, 23.0)),
+                    );
+                    if resp.clicked() {
+                        match track {
+                            TrackId::Moog => {
+                                let s = &mut p.current_pattern_mut().moog.steps[i];
+                                s.active = !s.active;
+                            }
+                            TrackId::MoogPad => {
+                                let s = &mut p.current_pattern_mut().moog_pad.steps[i];
+                                s.active = !s.active;
+                                if s.active {
+                                    s.gate = 1.0;
+                                }
+                            }
+                            TrackId::Monologue => {
+                                let s = &mut p.current_pattern_mut().monologue.steps[i];
+                                s.active = !s.active;
+                            }
+                            TrackId::Tb303 => {
+                                let s = &mut p.current_pattern_mut().tb303.steps[i];
+                                s.active = !s.active;
+                            }
+                            TrackId::Sampler => {
+                                let s = &mut p.current_pattern_mut().sampler.steps[i];
+                                s.active = !s.active;
+                            }
+                            TrackId::MidiOut => {
+                                let s = &mut p.current_pattern_mut().midi_out.steps[i];
+                                s.active = !s.active;
+                            }
+                            TrackId::Drums => {
+                                let s = &mut p.current_pattern_mut().drums.lanes[lane].steps[i];
+                                s.active = !s.active;
+                            }
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+        chosen
+    }
+
     fn apply_moog_preset(p: &mut Project, id: u8) {
         p.moog.poly_mode = matches!(id, 4 | 5 | 6);
         match id {
@@ -673,12 +818,12 @@ impl GrooveboxApp {
         }
     }
 }
-impl eframe::App for GrooveboxApp {
+impl eframe::App for FunKeySynthApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(
-                    egui::RichText::new("RETROBOX")
+                    egui::RichText::new("FUN KEY SYNTH")
                         .color(egui::Color32::from_rgb(238, 122, 66))
                         .strong(),
                 );
@@ -698,7 +843,7 @@ impl eframe::App for GrooveboxApp {
                 }
                 if ui.button("Open").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Retrobox project", &["json"])
+                        .add_filter("Fun Key Synth project", &["json"])
                         .pick_file()
                     {
                         match load_project(&path) {
@@ -715,8 +860,8 @@ impl eframe::App for GrooveboxApp {
                 }
                 if ui.button("Save").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Retrobox project", &["json"])
-                        .set_file_name("groove.json")
+                        .add_filter("Fun Key Synth project", &["json"])
+                        .set_file_name("fun-key-synth.json")
                         .save_file()
                     {
                         let p = self
@@ -786,6 +931,7 @@ impl eframe::App for GrooveboxApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for (view, label) in [
+                    (PageView::Overview, "OVERVIEW"),
                     (PageView::Sequencer, "SEQUENCER"),
                     (PageView::Song, "SONG"),
                     (PageView::Mixer, "MIXER"),
@@ -799,7 +945,16 @@ impl eframe::App for GrooveboxApp {
                 }
             });
             ui.separator();
-            if self.page_view == PageView::Song {
+            if self.page_view == PageView::Overview {
+                let mut p = self
+                    .engine
+                    .project
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(track) = Self::overview_panel(ui, &mut p, self.track) {
+                    self.track = track;
+                }
+            } else if self.page_view == PageView::Song {
                 let mut p = self
                     .engine
                     .project

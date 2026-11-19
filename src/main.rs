@@ -1,13 +1,13 @@
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([820.0, 560.0]),
+            .with_inner_size([1440.0, 820.0])
+            .with_min_inner_size([1180.0, 620.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "Retrobox Groovebox",
+        "Fun Key Synth",
         options,
-        Box::new(|cc| Ok(Box::new(retrobox::ui::GrooveboxApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(fun_key_synth::ui::FunKeySynthApp::new(cc)))),
     )
 }
