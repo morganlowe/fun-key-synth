@@ -9,12 +9,15 @@ use super::{soft_tanh, AdsrEnv, Svf12Filter};
 const MAX_SAMPLER_VOICES: usize = 4;
 const MAX_SAMPLE_SECONDS: f32 = 30.0;
 
-pub const BUILTIN_SAMPLE_NAMES: [&str; 5] = [
+pub const BUILTIN_SAMPLE_NAMES: [&str; 8] = [
     "SK-1 Choir Ahh",
     "SK-1 Brass Stab",
     "SK-1 Toy Piano",
     "SK-1 Minor9 Rhodes",
     "Retro FM Bell",
+    "70s Solina String",
+    "OB-X Power Chord",
+    "Electric Guitar",
 ];
 
 #[derive(Debug, Clone)]
@@ -379,7 +382,7 @@ pub fn generate_builtin_sample(id: u8, sample_rate: u32) -> Vec<f32> {
             }
             out
         }
-        _ => {
+        4 => {
             // Retro FM Bell / Laser
             let len = (1.1 * sr) as usize;
             let mut out = Vec::with_capacity(len);
@@ -390,6 +393,105 @@ pub fn generate_builtin_sample(id: u8, sample_rate: u32) -> Vec<f32> {
                 let car = (t * base_hz * TAU + mod_sig).sin();
                 let env = (t / 0.002).min(1.0) * (-t * 2.6).exp();
                 out.push((car * env * 0.85).clamp(-1.0, 1.0));
+            }
+            out
+        }
+        5 => {
+            // 70s Solina / ARP Omni Ensemble String Synth (3-phase BBD chorus vibrato)
+            let len = (2.2 * sr) as usize;
+            let mut out = Vec::with_capacity(len);
+            let mut lp = 0.0_f32;
+            let mut hp = 0.0_f32;
+            for i in 0..len {
+                let t = i as f32 / sr;
+                let mut sum = 0.0_f32;
+                // 3-phase ensemble chorus voices + octave shimmer
+                for k in 0..3 {
+                    let phase_off = (k as f32) * (TAU / 3.0);
+                    let vib = 1.0
+                        + 0.0055 * (t * 5.9 * TAU + phase_off).sin()
+                        + 0.0025 * (t * 0.72 * TAU + phase_off * 1.3).sin();
+                    let f = base_hz * vib;
+                    let saw_lo = (t * f).fract() * 2.0 - 1.0;
+                    let saw_hi = (t * f * 2.0).fract() * 2.0 - 1.0;
+                    sum += saw_lo * 0.42 + saw_hi * 0.24;
+                }
+                // Warm string-machine bandpass coloration
+                lp += 0.28 * (sum - lp);
+                hp += 0.012 * (lp - hp);
+                let shaped = lp - hp;
+                let attack = (t / 0.22).min(1.0);
+                let release = (1.0 - (t / 2.2)).max(0.0).powf(0.45);
+                out.push((shaped * attack * release * 0.78).tanh().clamp(-1.0, 1.0));
+            }
+            out
+        }
+        6 => {
+            // 80s Oberheim OB-X Power Synth Brass (fat detuned unison + fifth weight)
+            let len = (1.5 * sr) as usize;
+            let mut out = Vec::with_capacity(len);
+            let mut lp = 0.0_f32;
+            let detunes = [0.992_f32, 0.997, 1.003, 1.009, 0.5, 1.498];
+            let weights = [0.30_f32, 0.34, 0.34, 0.30, 0.26, 0.16];
+            for i in 0..len {
+                let t = i as f32 / sr;
+                let mut sum = 0.0_f32;
+                for (k, &d) in detunes.iter().enumerate() {
+                    let f = base_hz * d;
+                    let saw = (t * f).fract() * 2.0 - 1.0;
+                    sum += saw * weights[k];
+                }
+                // Iconic 80s brass filter sweep
+                let sweep = 0.14 + 0.56 * (-t * 4.2).exp();
+                lp += sweep.clamp(0.05, 0.75) * (sum - lp);
+                let attack = (t / 0.014).min(1.0);
+                let env = attack * (-t * 1.15).exp();
+                out.push(((lp * 1.45).tanh() * env * 0.92).clamp(-1.0, 1.0));
+            }
+            out
+        }
+        _ => {
+            // Karplus-Strong Overdriven Electric Guitar (bridge pickup + tube amp)
+            let len = (1.6 * sr) as usize;
+            let delay_len = (sr / base_hz).round().max(16.0) as usize;
+            let pickup_tap = (delay_len / 5).max(3);
+            let mut ring = vec![0.0_f32; delay_len];
+            // Seed exciter with deterministic bright pick burst
+            let mut seed = 0x51A7_E1EC_u32;
+            for s in &mut ring {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let n = ((seed & 0xFFFF) as f32 / 32768.0) - 1.0;
+                *s = n;
+            }
+            // Bridge pickup comb shaping on initial pluck
+            let orig = ring.clone();
+            for j in 0..delay_len {
+                ring[j] = orig[j] - 0.62 * orig[(j + delay_len - pickup_tap) % delay_len];
+            }
+
+            let mut out = Vec::with_capacity(len);
+            let mut idx = 0usize;
+            let mut prev = 0.0_f32;
+            let mut cab_lp = 0.0_f32;
+            let mut cab_hp = 0.0_f32;
+            for i in 0..len {
+                let t = i as f32 / sr;
+                let cur = ring[idx];
+                let damped = 0.9962 * (0.52 * cur + 0.48 * prev);
+                prev = cur;
+                ring[idx] = damped;
+                idx = (idx + 1) % delay_len;
+
+                // Asymmetric tube overdrive + 4x12 guitar cabinet roll-off
+                let drive = cur * 3.6;
+                let amp = (drive + 0.16 * drive * drive).tanh();
+                cab_lp += 0.34 * (amp - cab_lp);
+                cab_hp += 0.015 * (cab_lp - cab_hp);
+                let cab = cab_lp - cab_hp;
+                let tail = if t > 1.25 { (1.0 - (t - 1.25) / 0.35).max(0.0) } else { 1.0 };
+                out.push((cab * 0.92 * tail).clamp(-1.0, 1.0));
             }
             out
         }

@@ -1069,17 +1069,23 @@ pub enum FactoryPreset {
     NightDrive,
     NeonSoul,
     WarmHouse,
+    Disco70sStrings,
+    Obx80sPower,
+    ElectricRockJam,
     BlankInit,
 }
 
 impl FactoryPreset {
-    pub const ALL: [FactoryPreset; 7] = [
+    pub const ALL: [FactoryPreset; 10] = [
         FactoryPreset::AcidWarehouse,
         FactoryPreset::ElectroFunkSk1,
         FactoryPreset::Detroit909Deep,
         FactoryPreset::NightDrive,
         FactoryPreset::NeonSoul,
         FactoryPreset::WarmHouse,
+        FactoryPreset::Disco70sStrings,
+        FactoryPreset::Obx80sPower,
+        FactoryPreset::ElectricRockJam,
         FactoryPreset::BlankInit,
     ];
 
@@ -1091,6 +1097,9 @@ impl FactoryPreset {
             FactoryPreset::NightDrive => "Night Drive (deep and spacious)",
             FactoryPreset::NeonSoul => "Neon Soul (warm electro funk)",
             FactoryPreset::WarmHouse => "Warm House (chords and bounce)",
+            FactoryPreset::Disco70sStrings => "70s String Synth Disco",
+            FactoryPreset::Obx80sPower => "80s OB-X Power Synth",
+            FactoryPreset::ElectricRockJam => "Electric Guitar Rock Jam",
             FactoryPreset::BlankInit => "Blank Init",
         }
     }
@@ -1103,6 +1112,9 @@ impl FactoryPreset {
             FactoryPreset::NightDrive => "night",
             FactoryPreset::NeonSoul => "soul",
             FactoryPreset::WarmHouse => "house",
+            FactoryPreset::Disco70sStrings => "disco70s",
+            FactoryPreset::Obx80sPower => "obx80s",
+            FactoryPreset::ElectricRockJam => "rock",
             FactoryPreset::BlankInit => "blank",
         }
     }
@@ -1115,6 +1127,9 @@ impl FactoryPreset {
             "night" | "drive" => Some(Self::NightDrive),
             "soul" | "neon" => Some(Self::NeonSoul),
             "house" | "warm" => Some(Self::WarmHouse),
+            "disco" | "disco70s" | "strings" => Some(Self::Disco70sStrings),
+            "obx" | "obx80s" | "arena" => Some(Self::Obx80sPower),
+            "rock" | "guitar" => Some(Self::ElectricRockJam),
             "blank" | "init" => Some(Self::BlankInit),
             _ => None,
         }
@@ -1197,6 +1212,24 @@ impl Project {
                 p.fx.delay_mix = 0.08;
                 p.fx.reverb_mix = 0.14;
                 p.patterns[0].name = "Warm House".into();
+                return p;
+            }
+            FactoryPreset::Disco70sStrings => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::Disco70s, None, 0x7050_114A);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::Obx80sPower => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::Arena80s, None, 0x80B0_0B5A);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::ElectricRockJam => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::IndieRock, None, 0xE1EC_7A12);
+                p.name = preset.name().into();
                 return p;
             }
             _ => {}
@@ -1617,7 +1650,12 @@ impl Project {
                     };
                 }
             }
-            FactoryPreset::NightDrive | FactoryPreset::NeonSoul | FactoryPreset::WarmHouse => unreachable!(),
+            FactoryPreset::NightDrive
+            | FactoryPreset::NeonSoul
+            | FactoryPreset::WarmHouse
+            | FactoryPreset::Disco70sStrings
+            | FactoryPreset::Obx80sPower
+            | FactoryPreset::ElectricRockJam => unreachable!(),
         }
 
         p.patterns = patterns;

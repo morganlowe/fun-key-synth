@@ -1480,4 +1480,55 @@ mod tests {
         assert!(!tel.active_chord.is_empty());
         assert!(!tel.party_section.is_empty());
     }
+
+    #[test]
+    fn all_voice_presets_samples_chords_scales_and_factory_presets_work() {
+        use crate::dsp::sampler::{generate_builtin_sample, BUILTIN_SAMPLE_NAMES};
+        use crate::model::{
+            apply_voice_preset, build_auto_chord_pads, chord_symbol, voice_preset_names,
+            ChordSlot, ChordType, FactoryPreset, Scale, PROGRESSIONS,
+        };
+
+        // 1. Every built-in sample (including 70s Solina String, OB-X Power Chord, Electric Guitar)
+        for id in 0..BUILTIN_SAMPLE_NAMES.len() {
+            let pcm = generate_builtin_sample(id as u8, 44_100);
+            assert!(!pcm.is_empty());
+            let peak = pcm.iter().fold(0.0_f32, |m, &x| {
+                assert!(x.is_finite());
+                m.max(x.abs())
+            });
+            assert!(peak > 0.1, "Sample {} was too quiet: {}", BUILTIN_SAMPLE_NAMES[id], peak);
+        }
+
+        // 2. Every voice preset on every studio track renders cleanly
+        let mut p = Project::default();
+        for &track in &TrackId::STUDIO_TRACKS {
+            let names = voice_preset_names(track);
+            assert!(!names.is_empty());
+            for pi in 0..names.len() {
+                apply_voice_preset(&mut p, track, pi);
+            }
+        }
+
+        // 3. Every scale builds 8 valid Auto-Chord pads, and every ChordType has a valid symbol
+        for &sc in &Scale::ALL {
+            let pads = build_auto_chord_pads(0, sc);
+            assert_eq!(pads.len(), 8);
+            for pad in &pads {
+                assert!(!pad.chord_notes.is_empty());
+            }
+        }
+        for &ct in &ChordType::ALL {
+            assert!(!ct.intervals().is_empty());
+            let sym = chord_symbol(0, ChordSlot { offset: 0, chord: ct });
+            assert!(!sym.is_empty());
+        }
+        assert_eq!(PROGRESSIONS.len(), 16);
+
+        // 4. Every FactoryPreset builds cleanly
+        for &fp in &FactoryPreset::ALL {
+            let proj = Project::factory(fp);
+            assert!(!proj.name.is_empty());
+        }
+    }
 }

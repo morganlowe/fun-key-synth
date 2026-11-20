@@ -200,18 +200,28 @@ pub enum Scale {
     Major,
     Dorian,
     Phrygian,
+    Mixolydian,
+    Lydian,
+    HarmonicMinor,
     MinorPentatonic,
+    MajorPentatonic,
+    Blues,
     AcidMinor,
 }
 
 impl Scale {
-    pub const ALL: [Scale; 7] = [
+    pub const ALL: [Scale; 12] = [
         Scale::Chromatic,
         Scale::Minor,
         Scale::Major,
         Scale::Dorian,
         Scale::Phrygian,
+        Scale::Mixolydian,
+        Scale::Lydian,
+        Scale::HarmonicMinor,
         Scale::MinorPentatonic,
+        Scale::MajorPentatonic,
+        Scale::Blues,
         Scale::AcidMinor,
     ];
 
@@ -222,7 +232,12 @@ impl Scale {
             Scale::Major => "Major",
             Scale::Dorian => "Dorian",
             Scale::Phrygian => "Phrygian",
+            Scale::Mixolydian => "Mixolydian",
+            Scale::Lydian => "Lydian",
+            Scale::HarmonicMinor => "Harmonic Min",
             Scale::MinorPentatonic => "Minor Pent",
+            Scale::MajorPentatonic => "Major Pent",
+            Scale::Blues => "Blues",
             Scale::AcidMinor => "Acid Minor",
         }
     }
@@ -234,7 +249,12 @@ impl Scale {
             Scale::Major => &[0, 2, 4, 5, 7, 9, 11],
             Scale::Dorian => &[0, 2, 3, 5, 7, 9, 10],
             Scale::Phrygian => &[0, 1, 3, 5, 7, 8, 10],
+            Scale::Mixolydian => &[0, 2, 4, 5, 7, 9, 10],
+            Scale::Lydian => &[0, 2, 4, 6, 7, 9, 11],
+            Scale::HarmonicMinor => &[0, 2, 3, 5, 7, 8, 11],
             Scale::MinorPentatonic => &[0, 3, 5, 7, 10],
+            Scale::MajorPentatonic => &[0, 2, 4, 7, 9],
+            Scale::Blues => &[0, 3, 5, 6, 7, 10],
             Scale::AcidMinor => &[0, 1, 3, 5, 7, 10],
         }
     }

@@ -8,8 +8,8 @@ use crate::{
         generate_melodic_tracks, load_pattern, load_project, note_name, root_name, save_pattern,
         save_project, voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel,
         DrumVoiceId, EgTarget, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
-        MonologueOscWave, MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, SongSection,
-        Tb303Wave, TrackId, Vibe, NOTE_NAMES, PROGRESSIONS,
+        MonologueOscWave, MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, Scale,
+        SongSection, Tb303Wave, TrackId, Vibe, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
         spawn_update_check, AppSettings, StudioTheme, UpdateStatus, CURRENT_VERSION, RELEASES_URL,
@@ -626,6 +626,16 @@ impl eframe::App for FunKeySynthApp {
                                     pat.tb303 = acid;
                                     pat.sampler = samp;
                                 }
+                            }
+                        });
+
+                    // Scale Picker (12 musical scales — updates Auto-Chords & keyboard quantization!)
+                    egui::ComboBox::from_id_salt("scale_picker")
+                        .width(106.0)
+                        .selected_text(proj.scale.name())
+                        .show_ui(ui, |ui| {
+                            for &sc in &Scale::ALL {
+                                ui.selectable_value(&mut proj.scale, sc, sc.name());
                             }
                         });
 
@@ -1448,7 +1458,7 @@ impl FunKeySynthApp {
                                         let presets = voice_preset_names(track);
                                         let cur_preset = proj.voice_presets[row_idx] % presets.len().max(1);
                                         egui::ComboBox::from_id_salt(("vp", row_idx))
-                                            .width(108.0)
+                                            .width(126.0)
                                             .selected_text(presets[cur_preset])
                                             .show_ui(ui, |ui| {
                                                 for (pi, &pname) in presets.iter().enumerate() {
@@ -2516,6 +2526,51 @@ impl FunKeySynthApp {
                         });
                     });
                     ui.add_space(6.0);
+
+                    // Quick Synth / Voice Preset Bar right inside Sound Lab!
+                    let lab_presets = voice_preset_names(self.selected_track);
+                    if !lab_presets.is_empty() {
+                        let slot_idx = TrackId::STUDIO_TRACKS
+                            .iter()
+                            .position(|&t| t == self.selected_track)
+                            .unwrap_or(0);
+                        let cur_p = proj.voice_presets[slot_idx] % lab_presets.len();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("PRESETS:")
+                                    .strong()
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(165, 176, 200)),
+                            );
+                            for (pi, &pname) in lab_presets.iter().enumerate() {
+                                let active = cur_p == pi;
+                                let pbtn = egui::Button::new(
+                                    RichText::new(pname)
+                                        .strong()
+                                        .size(11.5)
+                                        .color(if active {
+                                            Color32::from_rgb(12, 14, 20)
+                                        } else {
+                                            Color32::from_rgb(212, 220, 236)
+                                        }),
+                                )
+                                .fill(if active {
+                                    tc
+                                } else {
+                                    Color32::from_rgb(26, 31, 44)
+                                })
+                                .stroke(Stroke::new(
+                                    1.0_f32,
+                                    if active { tc } else { Color32::from_rgb(48, 56, 78) },
+                                ));
+                                if ui.add(pbtn).clicked() {
+                                    apply_voice_preset(proj, self.selected_track, pi);
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.separator();
+                    }
 
                     match self.selected_track {
                         TrackId::Moog => moog_controls(ui, &mut proj.moog, "moog_bass", tc),

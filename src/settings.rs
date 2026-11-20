@@ -15,16 +15,20 @@ pub enum StudioTheme {
     AmberAnalog,
     AcidTerminal,
     NordicFrost,
+    Oberheim80s,
+    Solina70s,
     Daylight,
 }
 
 impl StudioTheme {
-    pub const ALL: [StudioTheme; 6] = [
+    pub const ALL: [StudioTheme; 8] = [
         StudioTheme::Midnight,
         StudioTheme::NeonSynthwave,
         StudioTheme::AmberAnalog,
         StudioTheme::AcidTerminal,
         StudioTheme::NordicFrost,
+        StudioTheme::Oberheim80s,
+        StudioTheme::Solina70s,
         StudioTheme::Daylight,
     ];
 
@@ -35,6 +39,8 @@ impl StudioTheme {
             StudioTheme::AmberAnalog => "Amber Analog",
             StudioTheme::AcidTerminal => "Acid Terminal",
             StudioTheme::NordicFrost => "Nordic Frost",
+            StudioTheme::Oberheim80s => "80s OB-X Pinstripe",
+            StudioTheme::Solina70s => "70s Vintage Walnut",
             StudioTheme::Daylight => "Daylight Light",
         }
     }
@@ -50,6 +56,8 @@ impl StudioTheme {
             StudioTheme::AmberAnalog => Color32::from_rgb(20, 15, 12),
             StudioTheme::AcidTerminal => Color32::from_rgb(8, 12, 10),
             StudioTheme::NordicFrost => Color32::from_rgb(28, 34, 44),
+            StudioTheme::Oberheim80s => Color32::from_rgb(13, 16, 24),
+            StudioTheme::Solina70s => Color32::from_rgb(26, 18, 13),
             StudioTheme::Daylight => Color32::from_rgb(236, 240, 246),
         }
     }
@@ -61,6 +69,8 @@ impl StudioTheme {
             StudioTheme::AmberAnalog => Color32::from_rgb(28, 21, 16),
             StudioTheme::AcidTerminal => Color32::from_rgb(12, 18, 14),
             StudioTheme::NordicFrost => Color32::from_rgb(36, 44, 56),
+            StudioTheme::Oberheim80s => Color32::from_rgb(18, 23, 36),
+            StudioTheme::Solina70s => Color32::from_rgb(36, 25, 18),
             StudioTheme::Daylight => Color32::from_rgb(224, 230, 240),
         }
     }
@@ -72,6 +82,8 @@ impl StudioTheme {
             StudioTheme::AmberAnalog => Color32::from_rgb(30, 22, 17),
             StudioTheme::AcidTerminal => Color32::from_rgb(13, 20, 16),
             StudioTheme::NordicFrost => Color32::from_rgb(42, 50, 64),
+            StudioTheme::Oberheim80s => Color32::from_rgb(20, 26, 42),
+            StudioTheme::Solina70s => Color32::from_rgb(40, 28, 20),
             StudioTheme::Daylight => Color32::from_rgb(246, 248, 252),
         }
     }
@@ -83,6 +95,8 @@ impl StudioTheme {
             StudioTheme::AmberAnalog => Color32::from_rgb(68, 48, 32),
             StudioTheme::AcidTerminal => Color32::from_rgb(34, 62, 42),
             StudioTheme::NordicFrost => Color32::from_rgb(62, 74, 94),
+            StudioTheme::Oberheim80s => Color32::from_rgb(56, 118, 212),
+            StudioTheme::Solina70s => Color32::from_rgb(104, 72, 46),
             StudioTheme::Daylight => Color32::from_rgb(198, 206, 220),
         }
     }
@@ -94,6 +108,8 @@ impl StudioTheme {
             StudioTheme::AmberAnalog => [255, 178, 56],
             StudioTheme::AcidTerminal => [168, 255, 58],
             StudioTheme::NordicFrost => [136, 192, 208],
+            StudioTheme::Oberheim80s => [82, 168, 255],
+            StudioTheme::Solina70s => [244, 196, 92],
             StudioTheme::Daylight => [38, 126, 218],
         }
     }
