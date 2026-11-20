@@ -5,7 +5,7 @@ use crate::{
     },
     model::{
         arp_tones_for, bass_midi_for, chord_symbol, generate_auto_beat, progression_at,
-        voice_led_chord, ChordSlot, DrumVoiceId, MelodicStep, Project, TrackId,
+        voice_led_chord, ChordSlot, DrumVoiceId, MelodicStep, Project, TrackId, MAX_EXTRA_TRACKS,
     },
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -75,6 +75,15 @@ pub enum LiveEvent {
     },
     ReleaseSamplePart {
         part: usize,
+    },
+    PlayExtraNote {
+        idx: usize,
+        note: u8,
+        velocity: f32,
+    },
+    ReleaseExtraNote {
+        idx: usize,
+        note: u8,
     },
 }
 
@@ -230,6 +239,8 @@ struct Runtime {
     gate_mono: f32,
     gate_acid: f32,
     gate_sampler: f32,
+    extra_synths: Vec<MoogSynth>,
+    extra_gates: [f32; MAX_EXTRA_TRACKS],
     last_moog_note: Option<u8>,
     last_mono_note: Option<u8>,
     last_acid_note: Option<u8>,
@@ -295,6 +306,8 @@ impl Runtime {
             gate_mono: 0.0,
             gate_acid: 0.0,
             gate_sampler: 0.0,
+            extra_synths: (0..MAX_EXTRA_TRACKS).map(|_| MoogSynth::new(sr)).collect(),
+            extra_gates: [0.0; MAX_EXTRA_TRACKS],
             last_moog_note: None,
             last_mono_note: None,
             last_acid_note: None,
@@ -452,6 +465,16 @@ impl Runtime {
             LiveEvent::ReleaseSamplePart { part } => {
                 self.volca.release_part(part);
             }
+            LiveEvent::PlayExtraNote { idx, note, velocity } => {
+                if let (Some(synth), Some(tr)) = (self.extra_synths.get_mut(idx), p.extra_tracks.get(idx)) {
+                    synth.note_on(note, velocity, false, false, &tr.synth);
+                }
+            }
+            LiveEvent::ReleaseExtraNote { idx, note } => {
+                if let Some(synth) = self.extra_synths.get_mut(idx) {
+                    synth.note_off(note);
+                }
+            }
         }
     }
 
@@ -462,6 +485,10 @@ impl Runtime {
         self.acid.all_notes_off();
         self.sampler.all_notes_off();
         self.volca.all_notes_off();
+        for (i, s) in self.extra_synths.iter_mut().enumerate() {
+            s.all_notes_off();
+            self.extra_gates[i] = 0.0;
+        }
         self.gate_moog = 0.0;
         self.gate_pad = 0.0;
         self.gate_mono = 0.0;
@@ -781,6 +808,42 @@ impl Runtime {
             }
         }
 
+        // --- 3b. EXTRA DYNAMIC SYNTH TRACKS (tracks 7..=16) ---
+        if (section_mask & 0b000100) != 0 && !follow_override {
+            let extra_n = p.extra_tracks.len().min(MAX_EXTRA_TRACKS).min(pat.extra_seqs.len());
+            for ei in 0..extra_n {
+                let seq = &pat.extra_seqs[ei];
+                let st = seq.steps[global % seq.step_count.as_usize()];
+                if st.active {
+                    let synth = &mut self.extra_synths[ei];
+                    let tr = &p.extra_tracks[ei];
+                    if st.motion.any_locked() {
+                        synth.set_motion_locks(st.motion);
+                    } else {
+                        synth.clear_motion_locks();
+                    }
+                    synth.all_notes_off();
+                    if st.chord != crate::model::ChordType::Single {
+                        let notes_to_play = if p.party_mode && p.party_auto_evolve && self.party_cycle > 0 {
+                            pad_notes.clone()
+                        } else {
+                            let slot = ChordSlot {
+                                offset: (st.note + 12 - (p.root_note % 12)) % 12,
+                                chord: st.chord,
+                            };
+                            voice_led_chord(p.root_note, slot, 60)
+                        };
+                        for n in notes_to_play {
+                            synth.note_on(n, st.velocity, st.accent, false, &tr.synth);
+                        }
+                    } else {
+                        synth.note_on(st.note, st.velocity, st.accent, false, &tr.synth);
+                    }
+                    self.extra_gates[ei] = base_step_samples * st.gate.clamp(0.25, 16.0);
+                }
+            }
+        }
+
         // --- 4. ARP / MONOLOGUE (bit 3) ---
         if (section_mask & 0b001000) != 0 {
             let seq = &pat.monologue;
@@ -989,6 +1052,14 @@ impl Runtime {
                 self.sampler.all_notes_off();
             }
         }
+        for ei in 0..p.extra_tracks.len().min(MAX_EXTRA_TRACKS) {
+            if self.extra_gates[ei] > 0.0 {
+                self.extra_gates[ei] -= 1.0;
+                if self.extra_gates[ei] <= 0.0 {
+                    self.extra_synths[ei].all_notes_off();
+                }
+            }
+        }
 
         // Sidechain ducking envelope decay
         self.sidechain_env *= self.sidechain_decay;
@@ -1006,8 +1077,10 @@ impl Runtime {
             self.drop_env *= (-1.0 / (0.85 * self.sr)).exp();
         }
 
-        // Render all 6 studio voices
-        let any_solo = p.mixer.channels.iter().any(|c| c.solo) || p.mixer.moog_pad_solo;
+        // Render all studio voices (6 core + up to 10 dynamic extra tracks!)
+        let any_solo = p.mixer.channels.iter().any(|c| c.solo)
+            || p.mixer.moog_pad_solo
+            || p.extra_tracks.iter().any(|t| t.solo);
         let audible = |mute: bool, solo: bool| !mute && (!any_solo || solo);
 
         let ch = &p.mixer.channels;
@@ -1130,6 +1203,23 @@ impl Runtime {
             if p.mixer.moog_pad_reverb_enabled {
                 rev_l += sl * p.mixer.moog_pad_reverb_send;
                 rev_r += sr_v * p.mixer.moog_pad_reverb_send;
+            }
+        }
+
+        // 6+: Extra Dynamic Synth Tracks (tracks 7..=16)
+        let extra_duck = 0.30 + 0.70 * duck;
+        for (ei, tr) in p.extra_tracks.iter().take(MAX_EXTRA_TRACKS).enumerate() {
+            let s = self.extra_synths[ei].process_sample(&tr.synth) * extra_duck;
+            if audible(tr.mute, tr.solo) {
+                let (gl, gr) = pan_gains(tr.pan);
+                let sl = s * tr.volume * gl * 0.50;
+                let sr_v = s * tr.volume * gr * 0.50;
+                mix_l += sl;
+                mix_r += sr_v;
+                del_l += sl * tr.delay_send;
+                del_r += sr_v * tr.delay_send;
+                rev_l += sl * tr.reverb_send;
+                rev_r += sr_v * tr.reverb_send;
             }
         }
 

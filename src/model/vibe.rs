@@ -919,29 +919,29 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     p.moog.glide = 0.03;
                 }
                 5 => {
-                    // Electric Bass Pick (punchy picked rock electric bass)
-                    p.moog.osc1_wave = MoogWave::NarrowPulse;
+                    // Electric Bass Pick (thick, warm picked Fender P-Bass!)
+                    p.moog.osc1_wave = MoogWave::TriSaw;
                     p.moog.osc2_wave = MoogWave::Triangle;
                     p.moog.osc3_wave = MoogWave::Saw;
                     p.moog.osc2_octave = 0;
-                    p.moog.osc3_octave = 0;
+                    p.moog.osc3_octave = -1;
                     p.moog.osc2_detune = 3.0;
-                    p.moog.osc3_detune = -4.0;
-                    p.moog.osc1_level = 0.72;
-                    p.moog.osc2_level = 0.86;
-                    p.moog.osc3_level = 0.38;
-                    p.moog.noise_level = 0.10;
-                    p.moog.cutoff = 620.0;
+                    p.moog.osc3_detune = -3.0;
+                    p.moog.osc1_level = 0.88;
+                    p.moog.osc2_level = 0.80;
+                    p.moog.osc3_level = 0.36;
+                    p.moog.noise_level = 0.03;
+                    p.moog.cutoff = 520.0;
                     p.moog.resonance = 0.22;
-                    p.moog.env_amount = 0.62;
-                    p.moog.drive = 0.56;
+                    p.moog.env_amount = 0.52;
+                    p.moog.drive = 0.44;
                     p.moog.filt_attack = 0.002;
                     p.moog.filt_decay = 0.16;
-                    p.moog.filt_sustain = 0.24;
-                    p.moog.amp_attack = 0.002;
-                    p.moog.amp_decay = 0.34;
-                    p.moog.amp_sustain = 0.48;
-                    p.moog.amp_release = 0.12;
+                    p.moog.filt_sustain = 0.26;
+                    p.moog.amp_attack = 0.003;
+                    p.moog.amp_decay = 0.38;
+                    p.moog.amp_sustain = 0.52;
+                    p.moog.amp_release = 0.14;
                     p.moog.glide = 0.01;
                 }
                 6 => {
@@ -1083,90 +1083,90 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     p.moog_pad.amp_release = 0.24;
                 }
                 4 => {
-                    // 70s String Synth (ARP Solina / Omni ensemble shimmer!)
+                    // 70s String Synth (warm silky Solina / ARP string ensemble!)
                     p.moog_pad.osc1_wave = MoogWave::Saw;
-                    p.moog_pad.osc2_wave = MoogWave::Saw;
-                    p.moog_pad.osc3_wave = MoogWave::NarrowPulse;
-                    p.moog_pad.osc2_octave = 1; // Classic 8' + 4' string machine octave!
-                    p.moog_pad.osc3_octave = 0;
-                    p.moog_pad.osc2_detune = 12.0;
-                    p.moog_pad.osc3_detune = -14.0;
-                    p.moog_pad.osc1_level = 0.74;
-                    p.moog_pad.osc2_level = 0.46;
-                    p.moog_pad.osc3_level = 0.52;
-                    p.moog_pad.cutoff = 2550.0;
-                    p.moog_pad.resonance = 0.20;
-                    p.moog_pad.env_amount = 0.14;
-                    p.moog_pad.key_track = 0.65;
-                    p.moog_pad.drive = 0.16;
-                    p.moog_pad.lfo_rate = 5.8;
-                    p.moog_pad.lfo_to_pitch = 0.13; // Iconic Solina BBD ensemble vibrato!
-                    p.moog_pad.lfo_to_filter = 0.09;
-                    p.moog_pad.filt_attack = 0.24;
-                    p.moog_pad.filt_decay = 0.80;
-                    p.moog_pad.filt_sustain = 0.72;
-                    p.moog_pad.filt_release = 1.05;
-                    p.moog_pad.amp_attack = 0.26;
+                    p.moog_pad.osc2_wave = MoogWave::TriSaw;
+                    p.moog_pad.osc3_wave = MoogWave::Saw;
+                    p.moog_pad.osc2_octave = 0;
+                    p.moog_pad.osc3_octave = -1; // Warm cello foundation (no shrill +1 octave!)
+                    p.moog_pad.osc2_detune = 8.0;
+                    p.moog_pad.osc3_detune = -7.0;
+                    p.moog_pad.osc1_level = 0.72;
+                    p.moog_pad.osc2_level = 0.68;
+                    p.moog_pad.osc3_level = 0.44;
+                    p.moog_pad.cutoff = 1480.0;
+                    p.moog_pad.resonance = 0.14;
+                    p.moog_pad.env_amount = 0.18;
+                    p.moog_pad.key_track = 0.45;
+                    p.moog_pad.drive = 0.12;
+                    p.moog_pad.lfo_rate = 5.4;
+                    p.moog_pad.lfo_to_pitch = 0.016; // Subtle ~2.4 cent silky vibrato (in tune!)
+                    p.moog_pad.lfo_to_filter = 0.06;
+                    p.moog_pad.filt_attack = 0.22;
+                    p.moog_pad.filt_decay = 0.85;
+                    p.moog_pad.filt_sustain = 0.68;
+                    p.moog_pad.filt_release = 1.10;
+                    p.moog_pad.amp_attack = 0.24;
                     p.moog_pad.amp_decay = 0.60;
-                    p.moog_pad.amp_sustain = 0.86;
+                    p.moog_pad.amp_sustain = 0.84;
                     p.moog_pad.amp_release = 1.15;
                 }
                 5 => {
-                    // OB-X 80s Power (huge Oberheim OB-X/OB-Xa arena brass synth!)
+                    // OB-X 80s Power (fat in-tune Oberheim OB-X/OB-Xa arena brass!)
                     p.moog_pad.osc1_wave = MoogWave::Saw;
                     p.moog_pad.osc2_wave = MoogWave::Saw;
-                    p.moog_pad.osc3_wave = MoogWave::WidePulse;
+                    p.moog_pad.osc3_wave = MoogWave::TriSaw;
                     p.moog_pad.osc2_octave = 0;
                     p.moog_pad.osc3_octave = -1;
-                    p.moog_pad.osc2_detune = 18.0;
-                    p.moog_pad.osc3_detune = -14.0;
-                    p.moog_pad.osc1_level = 0.86;
-                    p.moog_pad.osc2_level = 0.84;
-                    p.moog_pad.osc3_level = 0.56;
-                    p.moog_pad.cutoff = 1580.0;
-                    p.moog_pad.resonance = 0.28;
-                    p.moog_pad.env_amount = 0.64;
-                    p.moog_pad.key_track = 0.60;
-                    p.moog_pad.drive = 0.44;
-                    p.moog_pad.lfo_rate = 4.6;
-                    p.moog_pad.lfo_to_pitch = 0.04;
-                    p.moog_pad.filt_attack = 0.018;
-                    p.moog_pad.filt_decay = 0.36;
-                    p.moog_pad.filt_sustain = 0.54;
-                    p.moog_pad.filt_release = 0.48;
-                    p.moog_pad.amp_attack = 0.009;
-                    p.moog_pad.amp_decay = 0.42;
+                    p.moog_pad.osc2_detune = 11.0;
+                    p.moog_pad.osc3_detune = -9.0;
+                    p.moog_pad.osc1_level = 0.84;
+                    p.moog_pad.osc2_level = 0.82;
+                    p.moog_pad.osc3_level = 0.58;
+                    p.moog_pad.cutoff = 1350.0;
+                    p.moog_pad.resonance = 0.22;
+                    p.moog_pad.env_amount = 0.56;
+                    p.moog_pad.key_track = 0.50;
+                    p.moog_pad.drive = 0.34;
+                    p.moog_pad.lfo_rate = 4.2;
+                    p.moog_pad.lfo_to_pitch = 0.010;
+                    p.moog_pad.filt_attack = 0.020;
+                    p.moog_pad.filt_decay = 0.42;
+                    p.moog_pad.filt_sustain = 0.50;
+                    p.moog_pad.filt_release = 0.55;
+                    p.moog_pad.amp_attack = 0.012;
+                    p.moog_pad.amp_decay = 0.45;
                     p.moog_pad.amp_sustain = 0.80;
-                    p.moog_pad.amp_release = 0.56;
+                    p.moog_pad.amp_release = 0.62;
                 }
                 6 => {
-                    // Electric Guitar (crunchy bridge-pickup overdriven power guitar!)
-                    p.moog_pad.osc1_wave = MoogWave::NarrowPulse;
+                    // Electric Guitar (warm, thick humbucker guitar through tube amp & 4x12 cab!)
+                    p.moog_pad.osc1_wave = MoogWave::TriSaw;
                     p.moog_pad.osc2_wave = MoogWave::Saw;
-                    p.moog_pad.osc3_wave = MoogWave::NarrowPulse;
+                    p.moog_pad.osc3_wave = MoogWave::Triangle;
                     p.moog_pad.osc2_octave = 0;
-                    p.moog_pad.osc3_octave = 1;
-                    p.moog_pad.osc2_detune = 5.0;
-                    p.moog_pad.osc3_detune = -6.0;
-                    p.moog_pad.osc1_level = 0.88;
-                    p.moog_pad.osc2_level = 0.66;
-                    p.moog_pad.osc3_level = 0.24;
-                    p.moog_pad.noise_level = 0.16; // Pick attack transient!
-                    p.moog_pad.cutoff = 1280.0;
-                    p.moog_pad.resonance = 0.34;
-                    p.moog_pad.env_amount = 0.54;
-                    p.moog_pad.key_track = 0.55;
-                    p.moog_pad.drive = 0.88; // Tube amp crunch!
-                    p.moog_pad.lfo_rate = 5.4;
-                    p.moog_pad.lfo_to_pitch = 0.05; // Subtle string vibrato
-                    p.moog_pad.filt_attack = 0.002;
-                    p.moog_pad.filt_decay = 0.36;
-                    p.moog_pad.filt_sustain = 0.30;
-                    p.moog_pad.filt_release = 0.20;
-                    p.moog_pad.amp_attack = 0.002;
-                    p.moog_pad.amp_decay = 0.62;
-                    p.moog_pad.amp_sustain = 0.40;
-                    p.moog_pad.amp_release = 0.22;
+                    p.moog_pad.osc3_octave = 0;
+                    p.moog_pad.osc2_detune = 4.0;
+                    p.moog_pad.osc3_detune = -3.0;
+                    p.moog_pad.osc1_level = 0.86;
+                    p.moog_pad.osc2_level = 0.64;
+                    p.moog_pad.osc3_level = 0.52;
+                    p.moog_pad.noise_level = 0.03; // Subtle woody pick transient
+                    p.moog_pad.cutoff = 760.0;     // Warm 4x12 cabinet roll-off
+                    p.moog_pad.resonance = 0.26;
+                    p.moog_pad.env_amount = 0.48;
+                    p.moog_pad.key_track = 0.48;
+                    p.moog_pad.drive = 0.64;       // Warm tube overdrive
+                    p.moog_pad.lfo_rate = 5.2;
+                    p.moog_pad.lfo_to_pitch = 0.014;
+                    p.moog_pad.filt_attack = 0.003;
+                    p.moog_pad.filt_decay = 0.22;
+                    p.moog_pad.filt_sustain = 0.32;
+                    p.moog_pad.filt_release = 0.24;
+                    p.moog_pad.amp_attack = 0.004;
+                    p.moog_pad.amp_decay = 0.78;
+                    p.moog_pad.amp_sustain = 0.44;
+                    p.moog_pad.amp_release = 0.28;
                 }
                 _ => {
                     // Wurlitzer Keys (warm vintage electric piano bark)
@@ -1267,64 +1267,64 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     // OB-X Power Lead (fat detuned 80s Oberheim arena synth lead)
                     p.monologue.vco1_wave = MonologueOscWave::Saw;
                     p.monologue.vco2_wave = MonologueOscWave::Saw;
-                    p.monologue.vco1_shape = 0.28;
-                    p.monologue.vco2_shape = 0.22;
-                    p.monologue.vco2_pitch = 0.14; // Lush 14-cent 80s detune!
-                    p.monologue.vco1_level = 0.90;
-                    p.monologue.vco2_level = 0.88;
-                    p.monologue.cutoff = 2150.0;
-                    p.monologue.resonance = 0.30;
-                    p.monologue.eg_int = 0.60;
+                    p.monologue.vco1_shape = 0.22;
+                    p.monologue.vco2_shape = 0.18;
+                    p.monologue.vco2_pitch = 0.10; // Lush 10-cent 80s detune!
+                    p.monologue.vco1_level = 0.88;
+                    p.monologue.vco2_level = 0.84;
+                    p.monologue.cutoff = 1750.0;
+                    p.monologue.resonance = 0.26;
+                    p.monologue.eg_int = 0.52;
                     p.monologue.eg_attack = 0.012;
                     p.monologue.eg_decay = 0.44;
                     p.monologue.amp_sustain = true;
-                    p.monologue.drive = 0.48;
+                    p.monologue.drive = 0.38;
                     p.monologue.glide = 0.07;
                     p.monologue.lfo_target = LfoTarget::Pitch;
-                    p.monologue.lfo_rate = 0.56;
-                    p.monologue.lfo_int = 0.04;
+                    p.monologue.lfo_rate = 0.54;
+                    p.monologue.lfo_int = 0.014;
                 }
                 5 => {
-                    // Electric Guitar Lead (high-drive singing rock/fusion guitar!)
-                    p.monologue.vco1_wave = MonologueOscWave::Square;
-                    p.monologue.vco2_wave = MonologueOscWave::Saw;
-                    p.monologue.vco1_shape = 0.78; // Narrow bridge-pickup pulse
-                    p.monologue.vco2_shape = 0.62;
-                    p.monologue.vco2_pitch = 0.06;
-                    p.monologue.vco1_level = 0.92;
-                    p.monologue.vco2_level = 0.68;
-                    p.monologue.cutoff = 1520.0;
-                    p.monologue.resonance = 0.36;
-                    p.monologue.eg_int = 0.58;
-                    p.monologue.eg_attack = 0.002;
-                    p.monologue.eg_decay = 0.42;
+                    // Electric Guitar Lead (warm creamy humbucker rock/fusion lead!)
+                    p.monologue.vco1_wave = MonologueOscWave::Saw;
+                    p.monologue.vco2_wave = MonologueOscWave::Triangle;
+                    p.monologue.vco1_shape = 0.36;
+                    p.monologue.vco2_shape = 0.44;
+                    p.monologue.vco2_pitch = 0.05;
+                    p.monologue.vco1_level = 0.88;
+                    p.monologue.vco2_level = 0.72;
+                    p.monologue.cutoff = 920.0; // Warm amp cabinet roll-off
+                    p.monologue.resonance = 0.28;
+                    p.monologue.eg_int = 0.44;
+                    p.monologue.eg_attack = 0.003;
+                    p.monologue.eg_decay = 0.34;
                     p.monologue.amp_sustain = true;
-                    p.monologue.drive = 0.92; // Full asymmetric amp distortion!
-                    p.monologue.glide = 0.05;
+                    p.monologue.drive = 0.72; // Warm asymmetric analog tube drive
+                    p.monologue.glide = 0.06;
                     p.monologue.lfo_target = LfoTarget::Pitch;
-                    p.monologue.lfo_rate = 0.58;
-                    p.monologue.lfo_int = 0.055; // Finger vibrato
+                    p.monologue.lfo_rate = 0.54;
+                    p.monologue.lfo_int = 0.018; // Subtle expressive finger vibrato
                 }
                 6 => {
-                    // 70s String Lead (vibrato-laced vintage string machine melody)
+                    // 70s String Lead (warm silky vintage string melody)
                     p.monologue.vco1_wave = MonologueOscWave::Saw;
-                    p.monologue.vco2_wave = MonologueOscWave::Saw;
-                    p.monologue.vco2_octave = 1;
-                    p.monologue.vco2_pitch = -0.10;
-                    p.monologue.vco1_shape = 0.20;
-                    p.monologue.vco1_level = 0.82;
-                    p.monologue.vco2_level = 0.52;
-                    p.monologue.cutoff = 2850.0;
-                    p.monologue.resonance = 0.22;
-                    p.monologue.eg_int = 0.24;
-                    p.monologue.eg_attack = 0.14;
-                    p.monologue.eg_decay = 0.65;
+                    p.monologue.vco2_wave = MonologueOscWave::Triangle;
+                    p.monologue.vco2_octave = 0;
+                    p.monologue.vco2_pitch = 0.09;
+                    p.monologue.vco1_shape = 0.14;
+                    p.monologue.vco1_level = 0.80;
+                    p.monologue.vco2_level = 0.65;
+                    p.monologue.cutoff = 1650.0;
+                    p.monologue.resonance = 0.16;
+                    p.monologue.eg_int = 0.20;
+                    p.monologue.eg_attack = 0.16;
+                    p.monologue.eg_decay = 0.68;
                     p.monologue.amp_sustain = true;
-                    p.monologue.drive = 0.16;
+                    p.monologue.drive = 0.12;
                     p.monologue.glide = 0.08;
                     p.monologue.lfo_target = LfoTarget::Pitch;
-                    p.monologue.lfo_rate = 0.62;
-                    p.monologue.lfo_int = 0.08;
+                    p.monologue.lfo_rate = 0.56;
+                    p.monologue.lfo_int = 0.020;
                 }
                 _ => {
                     // Sync Screamer (classic Korg VCO2 hard-sync ripping lead!)
@@ -2364,6 +2364,7 @@ pub fn apply_vibe_to_project(p: &mut Project, vibe: Vibe, prog_idx: Option<usize
     p.scale = vibe.default_scale();
     p.name = format!("{} Studio", vibe.name());
     p.party_seed = seed;
+    p.active_tracks = [true; 6];
 
     // Apply curated voice presets for this vibe
     match vibe {
@@ -2649,4 +2650,97 @@ pub fn default_vibe_sections(pat: usize) -> Vec<SongSection> {
             track_mask: 0b000101, // Wind down
         },
     ]
+}
+
+/// Applies one of the 8 polyphonic synth presets (MoogPad palette) to a dynamic ExtraTrack.
+pub fn apply_extra_track_preset(track: &mut super::ExtraTrack, preset_idx: usize) {
+    let idx = preset_idx % 8;
+    track.preset_idx = idx;
+    let mut tmp = Project::default();
+    apply_voice_preset(&mut tmp, TrackId::MoogPad, idx);
+    track.synth = tmp.moog_pad;
+}
+
+/// Generates a chord-locked 64-step melodic/chord pattern tailored to a dynamic ExtraTrack's preset.
+pub fn generate_extra_track_seq(
+    root_note: u8,
+    prog_idx: usize,
+    preset_idx: usize,
+    seed: u32,
+) -> MelodicTrackSeq {
+    let prog = progression_at(prog_idx);
+    let mut rng = Rng::new(seed ^ 0x51A7_900D);
+    let mut seq = MelodicTrackSeq::new(StepCount::Steps64);
+
+    for bar in 0..4 {
+        let slot = prog.slots[bar];
+        let base = bar * 16;
+        let pad_notes = voice_led_chord(root_note, slot, 60);
+        let pad_root = pad_notes.first().copied().unwrap_or(57);
+
+        match preset_idx % 8 {
+            2 => {
+                // Dub Chord: echo-ready offbeat stabs
+                for &st in &[2, 10] {
+                    let s = &mut seq.steps[base + st];
+                    s.active = true;
+                    s.note = pad_root;
+                    s.chord = slot.chord;
+                    s.velocity = if st == 2 { 0.84 } else { 0.68 };
+                    s.gate = 0.9;
+                    s.accent = st == 2;
+                }
+            }
+            3 | 5 => {
+                // Neon Brass / OB-X 80s Power: punchy anthem hits
+                for &(st, gate, vel) in &[(0, 4.5, 0.88), (6, 2.2, 0.76), (10, 4.5, 0.82)] {
+                    let s = &mut seq.steps[base + st];
+                    s.active = true;
+                    s.note = pad_root;
+                    s.chord = slot.chord;
+                    s.velocity = vel;
+                    s.gate = gate;
+                    s.accent = st == 0;
+                }
+            }
+            6 => {
+                // Electric Guitar: rhythmic strummed power/chord groove
+                let hits: &[(usize, f32, f32)] = if rng.range(2) == 0 {
+                    &[(0, 2.2, 0.88), (3, 1.4, 0.74), (6, 1.6, 0.80), (8, 2.2, 0.86), (12, 2.0, 0.82)]
+                } else {
+                    &[(0, 2.8, 0.88), (6, 1.8, 0.78), (10, 2.4, 0.84), (14, 1.4, 0.76)]
+                };
+                for &(st, gate, vel) in hits {
+                    let s = &mut seq.steps[base + st];
+                    s.active = true;
+                    s.note = pad_root;
+                    s.chord = slot.chord;
+                    s.velocity = vel;
+                    s.gate = gate;
+                    s.accent = st == 0 || st == 8;
+                }
+            }
+            7 => {
+                // Wurlitzer Keys: warm soul syncopation
+                for &(st, gate, vel) in &[(0, 5.5, 0.82), (10, 4.5, 0.74)] {
+                    let s = &mut seq.steps[base + st];
+                    s.active = true;
+                    s.note = pad_root;
+                    s.chord = slot.chord;
+                    s.velocity = vel;
+                    s.gate = gate;
+                }
+            }
+            _ => {
+                // Lush Pad / Warm Strings / 70s String Synth: smooth full-bar swells
+                let s = &mut seq.steps[base];
+                s.active = true;
+                s.note = pad_root;
+                s.chord = slot.chord;
+                s.velocity = 0.76;
+                s.gate = 14.5;
+            }
+        }
+    }
+    seq
 }

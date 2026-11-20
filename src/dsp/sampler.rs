@@ -397,101 +397,145 @@ pub fn generate_builtin_sample(id: u8, sample_rate: u32) -> Vec<f32> {
             out
         }
         5 => {
-            // 70s Solina / ARP Omni Ensemble String Synth (3-phase BBD chorus vibrato)
-            let len = (2.2 * sr) as usize;
-            let mut out = Vec::with_capacity(len);
-            let mut lp = 0.0_f32;
-            let mut hp = 0.0_f32;
+            // 70s Solina / ARP String Ensemble (alias-free harmonic string + 3-tap BBD chorus!)
+            let len = (2.4 * sr) as usize;
+            let mut dry = Vec::with_capacity(len);
+            // Warm cello + viola + violin harmonic profile (no aliasing, rich midrange!)
+            let harmonics: [(f32, f32); 10] = [
+                (0.5, 0.28), // Sub-cello octave warmth
+                (1.0, 0.90),
+                (2.0, 0.62),
+                (3.0, 0.44),
+                (4.0, 0.30),
+                (5.0, 0.20),
+                (6.0, 0.14),
+                (7.0, 0.09),
+                (8.0, 0.06),
+                (9.0, 0.035),
+            ];
             for i in 0..len {
                 let t = i as f32 / sr;
                 let mut sum = 0.0_f32;
-                // 3-phase ensemble chorus voices + octave shimmer
-                for k in 0..3 {
-                    let phase_off = (k as f32) * (TAU / 3.0);
-                    let vib = 1.0
-                        + 0.0055 * (t * 5.9 * TAU + phase_off).sin()
-                        + 0.0025 * (t * 0.72 * TAU + phase_off * 1.3).sin();
-                    let f = base_hz * vib;
-                    let saw_lo = (t * f).fract() * 2.0 - 1.0;
-                    let saw_hi = (t * f * 2.0).fract() * 2.0 - 1.0;
-                    sum += saw_lo * 0.42 + saw_hi * 0.24;
+                for &(mult, amp) in &harmonics {
+                    let ph = t * base_hz * mult * TAU;
+                    sum += ph.sin() * amp;
                 }
-                // Warm string-machine bandpass coloration
-                lp += 0.28 * (sum - lp);
-                hp += 0.012 * (lp - hp);
-                let shaped = lp - hp;
-                let attack = (t / 0.22).min(1.0);
-                let release = (1.0 - (t / 2.2)).max(0.0).powf(0.45);
-                out.push((shaped * attack * release * 0.78).tanh().clamp(-1.0, 1.0));
+                dry.push(sum * 0.45);
+            }
+
+            // Classic 3-phase BBD Ensemble Chorus (0.58 Hz slow + 5.8 Hz fast, ±1.4 ms)
+            let max_delay = (0.025 * sr) as usize;
+            let mut out = Vec::with_capacity(len);
+            let mut svf = Svf12Filter::new(sr);
+            for i in 0..len {
+                let t = i as f32 / sr;
+                let mut wet = dry[i] * 0.35;
+                for k in 0..3 {
+                    let ph_off = (k as f32) * (TAU / 3.0);
+                    let delay_s = 0.0085
+                        + 0.0014 * (t * 0.58 * TAU + ph_off).sin()
+                        + 0.00045 * (t * 5.8 * TAU + ph_off).sin();
+                    let d_samp = delay_s * sr;
+                    let idx_f = (i as f32 - d_samp).max(0.0);
+                    let i0 = (idx_f as usize).min(len - 1);
+                    let i1 = (i0 + 1).min(len - 1);
+                    let frac = idx_f - i0 as f32;
+                    let sample = dry[i0] * (1.0 - frac) + dry[i1] * frac;
+                    wet += sample * 0.36;
+                }
+                let _ = max_delay;
+                let warm = svf.process_lp(wet, 2200.0, 0.14);
+                let attack = (t / 0.24).min(1.0);
+                let release = (1.0 - (t / 2.4)).max(0.0).powf(0.45);
+                out.push(soft_tanh(warm * attack * release * 1.15).clamp(-1.0, 1.0));
             }
             out
         }
         6 => {
-            // 80s Oberheim OB-X Power Synth Brass (fat detuned unison + fifth weight)
-            let len = (1.5 * sr) as usize;
+            // 80s Oberheim OB-X Power Synth Brass (alias-free detuned unison + resonant brass sweep)
+            let len = (1.6 * sr) as usize;
             let mut out = Vec::with_capacity(len);
-            let mut lp = 0.0_f32;
-            let detunes = [0.992_f32, 0.997, 1.003, 1.009, 0.5, 1.498];
-            let weights = [0.30_f32, 0.34, 0.34, 0.30, 0.26, 0.16];
+            let mut svf = Svf12Filter::new(sr);
+            let detunes = [0.9935_f32, 0.9972, 1.0028, 1.0068, 0.5];
+            let weights = [0.30_f32, 0.36, 0.36, 0.30, 0.34];
             for i in 0..len {
                 let t = i as f32 / sr;
                 let mut sum = 0.0_f32;
-                for (k, &d) in detunes.iter().enumerate() {
+                for (v, &d) in detunes.iter().enumerate() {
                     let f = base_hz * d;
-                    let saw = (t * f).fract() * 2.0 - 1.0;
-                    sum += saw * weights[k];
+                    // Band-limited 12-harmonic sawtooth (zero harsh aliasing!)
+                    let mut saw = 0.0_f32;
+                    for h in 1..=12 {
+                        let hf = f * h as f32;
+                        if hf < sr * 0.42 {
+                            saw += (t * hf * TAU).sin() / (h as f32);
+                        }
+                    }
+                    sum += saw * 0.62 * weights[v];
                 }
-                // Iconic 80s brass filter sweep
-                let sweep = 0.14 + 0.56 * (-t * 4.2).exp();
-                lp += sweep.clamp(0.05, 0.75) * (sum - lp);
-                let attack = (t / 0.014).min(1.0);
-                let env = attack * (-t * 1.15).exp();
-                out.push(((lp * 1.45).tanh() * env * 0.92).clamp(-1.0, 1.0));
+                let cutoff = 680.0 + 3400.0 * (-t * 3.8).exp();
+                let filt = svf.process_lp(sum, cutoff, 0.24);
+                let attack = (t / 0.016).min(1.0);
+                let env = attack * (-t * 1.05).exp();
+                out.push(soft_tanh(filt * 1.55 * env).clamp(-1.0, 1.0));
             }
             out
         }
         _ => {
-            // Karplus-Strong Overdriven Electric Guitar (bridge pickup + tube amp)
-            let len = (1.6 * sr) as usize;
-            let delay_len = (sr / base_hz).round().max(16.0) as usize;
-            let pickup_tap = (delay_len / 5).max(3);
-            let mut ring = vec![0.0_f32; delay_len];
-            // Seed exciter with deterministic bright pick burst
-            let mut seed = 0x51A7_E1EC_u32;
-            for s in &mut ring {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                let n = ((seed & 0xFFFF) as f32 / 32768.0) - 1.0;
-                *s = n;
-            }
-            // Bridge pickup comb shaping on initial pluck
-            let orig = ring.clone();
-            for j in 0..delay_len {
-                ring[j] = orig[j] - 0.62 * orig[(j + delay_len - pickup_tap) % delay_len];
-            }
+            // Warm Double-Tracked Humbucker Electric Guitar (Karplus-Strong + 4x12 amp cab!)
+            let len = (1.8 * sr) as usize;
+            let make_string = |freq: f32, seed_init: u32| -> Vec<f32> {
+                let delay_len = (sr / freq).round().max(16.0) as usize;
+                let pickup_tap = ((delay_len as f32) / 3.6).round().max(3.0) as usize;
+                let mut ring = vec![0.0_f32; delay_len];
+                // Warm low-passed pick exciter (woody & musical, no harsh digital noise!)
+                let mut seed = seed_init;
+                let mut exc_lp = 0.0_f32;
+                for j in 0..delay_len {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let n = ((seed & 0xFFFF) as f32 / 32768.0) - 1.0;
+                    exc_lp += 0.22 * (n - exc_lp);
+                    let body = ((j as f32 / delay_len as f32) * TAU).sin() * 0.42;
+                    ring[j] = exc_lp * 0.78 + body;
+                }
+                // Warm humbucker pickup comb blend
+                let orig = ring.clone();
+                for j in 0..delay_len {
+                    ring[j] = orig[j] - 0.34 * orig[(j + delay_len - pickup_tap) % delay_len];
+                }
+                let mut s_out = Vec::with_capacity(len);
+                let mut idx = 0usize;
+                let mut prev = 0.0_f32;
+                for _ in 0..len {
+                    let cur = ring[idx];
+                    let damped = 0.9968 * (0.54 * cur + 0.46 * prev);
+                    prev = cur;
+                    ring[idx] = damped;
+                    idx = (idx + 1) % delay_len;
+                    s_out.push(cur);
+                }
+                s_out
+            };
 
+            let str_a = make_string(base_hz, 0x51A7_E1EC);
+            let str_b = make_string(base_hz * 1.0022, 0x9E37_79B9);
             let mut out = Vec::with_capacity(len);
-            let mut idx = 0usize;
-            let mut prev = 0.0_f32;
-            let mut cab_lp = 0.0_f32;
-            let mut cab_hp = 0.0_f32;
+            let mut cab_svf = Svf12Filter::new(sr);
+            let mut body_svf = Svf12Filter::new(sr);
             for i in 0..len {
                 let t = i as f32 / sr;
-                let cur = ring[idx];
-                let damped = 0.9962 * (0.52 * cur + 0.48 * prev);
-                prev = cur;
-                ring[idx] = damped;
-                idx = (idx + 1) % delay_len;
-
-                // Asymmetric tube overdrive + 4x12 guitar cabinet roll-off
-                let drive = cur * 3.6;
-                let amp = (drive + 0.16 * drive * drive).tanh();
-                cab_lp += 0.34 * (amp - cab_lp);
-                cab_hp += 0.015 * (cab_lp - cab_hp);
-                let cab = cab_lp - cab_hp;
-                let tail = if t > 1.25 { (1.0 - (t - 1.25) / 0.35).max(0.0) } else { 1.0 };
-                out.push((cab * 0.92 * tail).clamp(-1.0, 1.0));
+                let raw = str_a[i] * 0.62 + str_b[i] * 0.48;
+                // Warm 2-stage tube preamp overdrive
+                let pre = soft_tanh(raw * 2.8);
+                let driven = soft_tanh(pre * 1.65 + 0.12 * pre * pre);
+                // 4x12 speaker cabinet roll-off (~2.2 kHz) + warm 240 Hz body resonance
+                let cab = cab_svf.process_lp(driven, 2150.0, 0.22);
+                let body = body_svf.process_bp(driven, 240.0, 0.30) * 0.32;
+                let attack = (t / 0.004).min(1.0);
+                let tail = if t > 1.4 { (1.0 - (t - 1.4) / 0.4).max(0.0) } else { 1.0 };
+                out.push(soft_tanh((cab + body) * 1.15 * attack * tail).clamp(-1.0, 1.0));
             }
             out
         }

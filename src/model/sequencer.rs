@@ -766,6 +766,8 @@ pub struct Pattern {
     pub sample_lanes: Vec<DrumLane>,
     pub motion: MotionAutomation,
     pub midi_out: MidiTrackSeq,
+    #[serde(default)]
+    pub extra_seqs: Vec<MelodicTrackSeq>,
 }
 
 impl Default for Pattern {
@@ -785,6 +787,7 @@ impl Default for Pattern {
             sample_lanes,
             motion: MotionAutomation::default(),
             midi_out: MidiTrackSeq::default(),
+            extra_seqs: Vec::new(),
         }
     }
 }

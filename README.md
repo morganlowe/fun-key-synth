@@ -248,6 +248,14 @@ Every audio sample is rendered in real time by the lock-minimal stereo engine in
 
 ---
 
+## License
+
+**Fun Key Synth** is free, open-source, copyleft ("share-alike") software licensed under the **GNU General Public License v3.0 or later (`GPL-3.0-or-later`)**.
+
+You are free to use, study, modify, and redistribute this software — and any derivative works or modifications must also be shared under the same GPLv3 license. See [LICENSE](LICENSE) for the full text.
+
+---
+
 <p align="center">
   <sub>Built with Rust, <code>eframe</code>/<code>egui</code>, <code>cpal</code>, <code>symphonia</code>, and <code>hound</code>.</sub>
 </p>

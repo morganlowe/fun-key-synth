@@ -6,20 +6,21 @@ use serde::{Deserialize, Serialize};
 
 pub use project::{
     load_pattern, load_project, save_pattern, save_project, DelayDivision, DrumKitParams,
-    DrumModel, DrumVoiceParams, EgTarget, FactoryPreset, FxParams, GlobalFilterMode, LfoMode,
-    LfoTarget, LfoWave, LoopMode, MidiSettings, MixerParams, MonologueOscWave, MonologueParams,
-    MoogParams, MoogWave, Osc2ModMode, Project, SamplePart, SamplerMode, SamplerParams,
-    SavedSample, SongSection, Tb303Params, Tb303Wave, TrackMixerChannel,
+    DrumModel, DrumVoiceParams, EgTarget, ExtraTrack, FactoryPreset, FxParams, GlobalFilterMode,
+    LfoMode, LfoTarget, LfoWave, LoopMode, MidiSettings, MixerParams, MonologueOscWave,
+    MonologueParams, MoogParams, MoogWave, Osc2ModMode, Project, SamplePart, SamplerMode,
+    SamplerParams, SavedSample, SongSection, Tb303Params, Tb303Wave, TrackMixerChannel,
+    MAX_EXTRA_TRACKS,
 };
 pub use sequencer::{
     euclidean_rhythm, ChordType, DrumLane, DrumStep, DrumTrackSeq, DrumVoiceId, MelodicStep,
     MelodicTrackSeq, MidiStep, MidiTrackSeq, MotionAutomation, MotionLocks, Pattern,
 };
 pub use vibe::{
-    apply_vibe_to_project, apply_voice_preset, arp_tones_for, bass_midi_for, build_auto_chord_pads,
-    chord_symbol, default_vibe_sections, generate_auto_beat, generate_melodic_tracks,
-    progression_at, voice_led_chord, voice_preset_names, AutoChordPad, ChordProgression, ChordSlot,
-    Vibe, PROGRESSIONS,
+    apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, arp_tones_for,
+    bass_midi_for, build_auto_chord_pads, chord_symbol, default_vibe_sections, generate_auto_beat,
+    generate_extra_track_seq, generate_melodic_tracks, progression_at, voice_led_chord,
+    voice_preset_names, AutoChordPad, ChordProgression, ChordSlot, Vibe, PROGRESSIONS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

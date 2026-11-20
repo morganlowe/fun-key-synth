@@ -4,12 +4,13 @@ use crate::{
     mic::MicRecorder,
     midi::{MidiManager, MidiMsg},
     model::{
-        apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads, generate_auto_beat,
-        generate_melodic_tracks, load_pattern, load_project, note_name, root_name, save_pattern,
-        save_project, voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel,
-        DrumVoiceId, EgTarget, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
-        MonologueOscWave, MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, Scale,
-        SongSection, Tb303Wave, TrackId, Vibe, NOTE_NAMES, PROGRESSIONS,
+        apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads,
+        generate_auto_beat, generate_extra_track_seq, generate_melodic_tracks, load_pattern,
+        load_project, note_name, root_name, save_pattern, save_project, voice_preset_names,
+        AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack,
+        GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MonologueOscWave, MoogWave,
+        Osc2ModMode, Project, SamplerMode, SavedSample, Scale, SongSection, Tb303Wave, TrackId,
+        Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
         restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
@@ -39,6 +40,7 @@ pub struct FunKeySynthApp {
     engine: AudioEngine,
     tab: StudioTab,
     selected_track: TrackId,
+    selected_extra: Option<usize>,
     selected_step: usize,
     bar_page: usize,
     follow_playhead: bool,
@@ -84,6 +86,7 @@ impl FunKeySynthApp {
             engine,
             tab: StudioTab::Studio,
             selected_track: TrackId::Drums,
+            selected_extra: None,
             selected_step: 0,
             bar_page: 0,
             follow_playhead: true,
@@ -1347,16 +1350,92 @@ impl FunKeySynthApp {
             // Left: 6 Studio Tracks
             cols[0].vertical(|ui| {
                 card_frame(ui, |ui| {
+                    let active_core = proj.active_tracks.iter().filter(|&&a| a).count();
+                    let total_tracks = active_core + proj.extra_tracks.len();
+                    let mut add_extra_preset: Option<usize> = None;
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("STUDIO TRACKS").strong().size(12.5).color(accent));
+                        ui.label(
+                            RichText::new(format!("STUDIO TRACKS ({total_tracks}/{})", 6 + MAX_EXTRA_TRACKS))
+                                .strong()
+                                .size(12.5)
+                                .color(accent),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(RichText::new("Click a track to edit its steps").size(11.0).weak());
+                            if proj.extra_tracks.len() < MAX_EXTRA_TRACKS {
+                                ui.menu_button(
+                                    RichText::new("+ Add Track")
+                                        .strong()
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(82, 232, 180)),
+                                    |ui| {
+                                        ui.label(RichText::new("NEW SYNTH LAYER").strong().size(11.0).weak());
+                                        ui.separator();
+                                        let presets = voice_preset_names(TrackId::MoogPad);
+                                        for (pi, &pname) in presets.iter().enumerate() {
+                                            if ui.button(format!("+ {pname}")).clicked() {
+                                                add_extra_preset = Some(pi);
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                            if active_core < 6 {
+                                if ui
+                                    .small_button("+ Core")
+                                    .on_hover_text("Restore all 6 core studio tracks")
+                                    .clicked()
+                                {
+                                    for (idx, &t) in TrackId::STUDIO_TRACKS.iter().enumerate() {
+                                        if !proj.active_tracks[idx] {
+                                            proj.active_tracks[idx] = true;
+                                            let (_, mute, _) = track_mixer_mut(proj, t);
+                                            *mute = false;
+                                        }
+                                    }
+                                }
+                            }
                         });
                     });
+                    if let Some(pi) = add_extra_preset {
+                        let presets = voice_preset_names(TrackId::MoogPad);
+                        let palette: [[u8; 3]; 6] = [
+                            [255, 198, 72],
+                            [112, 196, 255],
+                            [255, 122, 92],
+                            [198, 138, 255],
+                            [92, 236, 188],
+                            [255, 118, 196],
+                        ];
+                        let n = proj.extra_tracks.len();
+                        let mut tr = ExtraTrack {
+                            name: presets[pi % presets.len()].to_string(),
+                            pan: if n % 2 == 0 { -0.28 } else { 0.28 },
+                            color: palette[n % palette.len()],
+                            ..ExtraTrack::default()
+                        };
+                        apply_extra_track_preset(&mut tr, pi);
+                        proj.extra_tracks.push(tr);
+                        let seed = self.next_seed();
+                        let seq = generate_extra_track_seq(
+                            proj.root_note,
+                            proj.progression_idx,
+                            pi,
+                            seed,
+                        );
+                        for pat in &mut proj.patterns {
+                            pat.extra_seqs.push(seq.clone());
+                        }
+                        self.selected_extra = Some(n);
+                    }
                     ui.add_space(4.0);
 
+                    let mut removed_track_idx: Option<usize> = None;
                     for (row_idx, &track) in TrackId::STUDIO_TRACKS.iter().enumerate() {
-                        let selected = self.selected_track == track;
+                        if !proj.active_tracks[row_idx] {
+                            continue;
+                        }
+                        let selected = self.selected_extra.is_none() && self.selected_track == track;
                         let tc = track_color(track);
                         let row_bg = if selected {
                             Color32::from_rgb(30, 38, 56)
@@ -1402,9 +1481,11 @@ impl FunKeySynthApp {
                                         .on_hover_text("Click: select  •  Double-click: open full synth  •  Right-click: instrument menu");
                                     if sel_resp.clicked() {
                                         self.selected_track = track;
+                                        self.selected_extra = None;
                                     }
                                     if sel_resp.double_clicked() {
                                         self.selected_track = track;
+                                        self.selected_extra = None;
                                         self.tab = if track == TrackId::Sampler {
                                             StudioTab::Sampler
                                         } else {
@@ -1644,7 +1725,7 @@ impl FunKeySynthApp {
                                             }
                                         }
                                     }
-                                    if ui.small_button("X").on_hover_text("Clear track pattern").clicked() {
+                                    if ui.small_button("CLR").on_hover_text("Clear track pattern").clicked() {
                                         let pat = proj.current_pattern_mut();
                                         if track == TrackId::Drums {
                                             for lane in &mut pat.drums.lanes {
@@ -1659,9 +1740,277 @@ impl FunKeySynthApp {
                                             seq.clear();
                                         }
                                     }
+                                    // Subtract track from mix
+                                    let sub_btn = egui::Button::new(
+                                        RichText::new("−")
+                                            .strong()
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(235, 130, 140)),
+                                    )
+                                    .fill(Color32::from_rgb(44, 26, 32));
+                                    if ui
+                                        .add(sub_btn)
+                                        .on_hover_text("Remove track from mix (mutes & hides it; re-add below anytime)")
+                                        .clicked()
+                                    {
+                                        removed_track_idx = Some(row_idx);
+                                    }
                                 });
                             });
                         ui.add_space(4.0);
+                    }
+
+                    if let Some(rm_idx) = removed_track_idx {
+                        let rm_track = TrackId::STUDIO_TRACKS[rm_idx];
+                        proj.active_tracks[rm_idx] = false;
+                        let (_, mute, solo) = track_mixer_mut(proj, rm_track);
+                        *mute = true;
+                        *solo = false;
+                        if self.selected_track == rm_track {
+                            if let Some((next_idx, _)) =
+                                proj.active_tracks.iter().enumerate().find(|(_, &a)| a)
+                            {
+                                self.selected_track = TrackId::STUDIO_TRACKS[next_idx];
+                            }
+                        }
+                    }
+
+                    // Render user-added Extra Synth Tracks (tracks 7..=16)
+                    let mut remove_extra_idx: Option<usize> = None;
+                    let pad_presets = voice_preset_names(TrackId::MoogPad);
+                    for ei in 0..proj.extra_tracks.len() {
+                        let selected = self.selected_extra == Some(ei);
+                        let [cr, cg, cb] = proj.extra_tracks[ei].color;
+                        let tc = Color32::from_rgb(cr, cg, cb);
+                        let row_bg = if selected {
+                            Color32::from_rgb(30, 38, 56)
+                        } else {
+                            Color32::from_rgb(20, 24, 34)
+                        };
+                        egui::Frame::none()
+                            .fill(row_bg)
+                            .rounding(Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                            .stroke(Stroke::new(
+                                if selected { 1.5_f32 } else { 1.0_f32 },
+                                if selected { tc } else { Color32::from_rgb(34, 40, 56) },
+                            ))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let is_muted_now = proj.extra_tracks[ei].mute;
+                                    let lbl = if is_muted_now {
+                                        format!("M {}", proj.extra_tracks[ei].name)
+                                    } else {
+                                        proj.extra_tracks[ei].name.clone()
+                                    };
+                                    let sel_btn = egui::Button::new(
+                                        RichText::new(lbl)
+                                            .strong()
+                                            .size(11.5)
+                                            .color(if is_muted_now {
+                                                Color32::from_rgb(120, 128, 148)
+                                            } else if selected {
+                                                tc
+                                            } else {
+                                                Color32::from_rgb(220, 226, 240)
+                                            }),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .min_size(Vec2::new(86.0, 22.0));
+                                    let resp = ui
+                                        .add(sel_btn)
+                                        .on_hover_text("Click: edit steps  •  Double-click: open in Sound Lab");
+                                    if resp.clicked() {
+                                        self.selected_extra = Some(ei);
+                                    }
+                                    if resp.double_clicked() {
+                                        self.selected_extra = Some(ei);
+                                        self.tab = StudioTab::SoundLab;
+                                    }
+
+                                    // Preset dropdown
+                                    let cur_p = proj.extra_tracks[ei].preset_idx % pad_presets.len();
+                                    egui::ComboBox::from_id_salt(("extra_vp", ei))
+                                        .width(126.0)
+                                        .selected_text(pad_presets[cur_p])
+                                        .show_ui(ui, |ui| {
+                                            for (pi, &pname) in pad_presets.iter().enumerate() {
+                                                if ui.selectable_label(cur_p == pi, pname).clicked() {
+                                                    apply_extra_track_preset(&mut proj.extra_tracks[ei], pi);
+                                                    proj.extra_tracks[ei].name = pname.to_string();
+                                                }
+                                            }
+                                        });
+
+                                    // Mute / Solo / Volume
+                                    let tr = &mut proj.extra_tracks[ei];
+                                    let m_btn = egui::Button::new(
+                                        RichText::new("M").strong().size(11.0).color(if tr.mute {
+                                            Color32::WHITE
+                                        } else {
+                                            Color32::from_rgb(160, 168, 188)
+                                        }),
+                                    )
+                                    .fill(if tr.mute {
+                                        Color32::from_rgb(200, 62, 74)
+                                    } else {
+                                        Color32::from_rgb(32, 38, 52)
+                                    });
+                                    if ui.add(m_btn).clicked() {
+                                        tr.mute = !tr.mute;
+                                    }
+
+                                    let s_btn = egui::Button::new(
+                                        RichText::new("S").strong().size(11.0).color(if tr.solo {
+                                            Color32::from_rgb(12, 14, 20)
+                                        } else {
+                                            Color32::from_rgb(160, 168, 188)
+                                        }),
+                                    )
+                                    .fill(if tr.solo {
+                                        Color32::from_rgb(245, 202, 72)
+                                    } else {
+                                        Color32::from_rgb(32, 38, 52)
+                                    });
+                                    if ui.add(s_btn).clicked() {
+                                        tr.solo = !tr.solo;
+                                    }
+
+                                    ui.add(
+                                        egui::Slider::new(&mut tr.volume, 0.0..=1.15)
+                                            .show_value(false)
+                                            .trailing_fill(true),
+                                    );
+
+                                    if ui
+                                        .small_button("RND")
+                                        .on_hover_text("Generate fresh chord-locked pattern for this track")
+                                        .clicked()
+                                    {
+                                        let seed = self.next_seed();
+                                        let seq = generate_extra_track_seq(
+                                            proj.root_note,
+                                            proj.progression_idx,
+                                            proj.extra_tracks[ei].preset_idx,
+                                            seed,
+                                        );
+                                        if let Some(slot) = proj.current_pattern_mut().extra_seqs.get_mut(ei) {
+                                            *slot = seq;
+                                        }
+                                    }
+                                    if ui.small_button("CLR").on_hover_text("Clear track pattern").clicked() {
+                                        if let Some(slot) = proj.current_pattern_mut().extra_seqs.get_mut(ei) {
+                                            slot.clear();
+                                        }
+                                    }
+                                    let sub_btn = egui::Button::new(
+                                        RichText::new("−")
+                                            .strong()
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(235, 130, 140)),
+                                    )
+                                    .fill(Color32::from_rgb(44, 26, 32));
+                                    if ui
+                                        .add(sub_btn)
+                                        .on_hover_text("Delete this synth track from the mix")
+                                        .clicked()
+                                    {
+                                        remove_extra_idx = Some(ei);
+                                    }
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                    if let Some(rm_e) = remove_extra_idx {
+                        proj.extra_tracks.remove(rm_e);
+                        for pat in &mut proj.patterns {
+                            if rm_e < pat.extra_seqs.len() {
+                                pat.extra_seqs.remove(rm_e);
+                            }
+                        }
+                        if self.selected_extra == Some(rm_e) {
+                            self.selected_extra = None;
+                        } else if let Some(cur) = self.selected_extra {
+                            if cur > rm_e {
+                                self.selected_extra = Some(cur - 1);
+                            }
+                        }
+                    }
+
+                    // Quick "+ Add Track" bar for any tracks currently subtracted from the mix
+                    if proj.active_tracks.iter().any(|&a| !a) {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                RichText::new("ADD TO MIX:")
+                                    .strong()
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(160, 172, 198)),
+                            );
+                            for (idx, &track) in TrackId::STUDIO_TRACKS.iter().enumerate() {
+                                if proj.active_tracks[idx] {
+                                    continue;
+                                }
+                                let tc = track_color(track);
+                                let add_btn = egui::Button::new(
+                                    RichText::new(format!("+ {}", track.role_name()))
+                                        .strong()
+                                        .size(11.5)
+                                        .color(tc),
+                                )
+                                .fill(Color32::from_rgb(24, 30, 44))
+                                .stroke(Stroke::new(1.0_f32, tc.gamma_multiply(0.65)));
+                                if ui
+                                    .add(add_btn)
+                                    .on_hover_text("Add this track back into the mix and unmute it")
+                                    .clicked()
+                                {
+                                    proj.active_tracks[idx] = true;
+                                    let (_, mute, _) = track_mixer_mut(proj, track);
+                                    *mute = false;
+                                    self.selected_track = track;
+                                    // If the track currently has no active steps, generate a chord-locked part!
+                                    let is_empty = {
+                                        let pat = proj.current_pattern();
+                                        match track {
+                                            TrackId::Drums => !pat.drums.lanes.iter().any(|l| l.steps.iter().any(|s| s.active)),
+                                            TrackId::Moog => !pat.moog.steps.iter().any(|s| s.active),
+                                            TrackId::MoogPad => !pat.moog_pad.steps.iter().any(|s| s.active),
+                                            TrackId::Monologue => !pat.monologue.steps.iter().any(|s| s.active),
+                                            TrackId::Tb303 => !pat.tb303.steps.iter().any(|s| s.active),
+                                            TrackId::Sampler => {
+                                                !pat.sampler.steps.iter().any(|s| s.active)
+                                                    && !pat.sample_lanes.iter().any(|l| l.steps.iter().any(|s| s.active))
+                                            }
+                                            _ => false,
+                                        }
+                                    };
+                                    if is_empty {
+                                        let seed = self.next_seed();
+                                        if track == TrackId::Drums {
+                                            let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                                            proj.current_pattern_mut().drums = drums;
+                                        } else {
+                                            let (bass, pad, arp, acid, samp) = generate_melodic_tracks(
+                                                proj.vibe,
+                                                proj.root_note,
+                                                proj.progression_idx,
+                                                seed,
+                                            );
+                                            let pat = proj.current_pattern_mut();
+                                            match track {
+                                                TrackId::Moog => pat.moog = bass,
+                                                TrackId::MoogPad => pat.moog_pad = pad,
+                                                TrackId::Monologue => pat.monologue = arp,
+                                                TrackId::Tb303 => pat.tb303 = acid,
+                                                TrackId::Sampler => pat.sampler = samp,
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
                     }
                 });
             });
@@ -1669,10 +2018,21 @@ impl FunKeySynthApp {
             // Right: Clean 16-Step Sequencer for Selected Track
             cols[1].vertical(|ui| {
                 card_frame(ui, |ui| {
-                    let tc = track_color(self.selected_track);
+                    let (seq_title, tc) = if let Some(ei) = self.selected_extra.filter(|&i| i < proj.extra_tracks.len()) {
+                        let [cr, cg, cb] = proj.extra_tracks[ei].color;
+                        (
+                            format!("{} SEQUENCER", proj.extra_tracks[ei].name.to_uppercase()),
+                            Color32::from_rgb(cr, cg, cb),
+                        )
+                    } else {
+                        (
+                            format!("{} SEQUENCER", self.selected_track.role_name()),
+                            track_color(self.selected_track),
+                        )
+                    };
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
-                            RichText::new(format!("{} SEQUENCER", self.selected_track.role_name()))
+                            RichText::new(seq_title)
                                 .strong()
                                 .size(12.5)
                                 .color(tc),
@@ -1758,7 +2118,7 @@ impl FunKeySynthApp {
                     let page_start = self.bar_page * 16;
                     let play_step = if playing { Some(cur_step % 64) } else { None };
 
-                    if self.selected_track == TrackId::Drums {
+                    if self.selected_extra.is_none() && self.selected_track == TrackId::Drums {
                         // Auto-Beat inline controls
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Beat Energy:").size(11.5));
@@ -2001,7 +2361,7 @@ impl FunKeySynthApp {
                                 vp.mute = false;
                             }
                         }
-                    } else if self.selected_track == TrackId::Sampler {
+                    } else if self.selected_extra.is_none() && self.selected_track == TrackId::Sampler {
                         // 8-Lane Volca Sampler Grid right inside STUDIO!
                         ui.horizontal(|ui| {
                             if ui.small_button("Open Volca Sampler Workbench ->").clicked() {
@@ -2095,8 +2455,14 @@ impl FunKeySynthApp {
                     } else {
                         // Melodic 16-Step Pad Grid with Human-Readable Note Names!
                         let target = self.selected_track;
+                        let extra_sel = self.selected_extra;
                         let pat = proj.current_pattern_mut();
-                        if let Some(seq) = pat.melodic_mut(target) {
+                        let seq_opt = if let Some(ei) = extra_sel {
+                            pat.extra_seqs.get_mut(ei)
+                        } else {
+                            pat.melodic_mut(target)
+                        };
+                        if let Some(seq) = seq_opt {
                             let len = seq.step_count.as_usize();
                             let pad_w = ((ui.available_width() - 7.0 * 6.0) / 8.0).clamp(44.0, 88.0);
                             let pad_h = 46.0;
@@ -2570,11 +2936,19 @@ impl FunKeySynthApp {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("EDIT SOUND:").strong().color(accent));
             for &track in &TrackId::STUDIO_TRACKS {
+                let active = self.selected_extra.is_none() && self.selected_track == track;
+                if ui.selectable_label(active, track.role_name()).clicked() {
+                    self.selected_track = track;
+                    self.selected_extra = None;
+                }
+            }
+            for (ei, tr) in proj.extra_tracks.iter().enumerate() {
+                let active = self.selected_extra == Some(ei);
                 if ui
-                    .selectable_label(self.selected_track == track, track.role_name())
+                    .selectable_label(active, format!("{} #{}", tr.name, ei + 7))
                     .clicked()
                 {
-                    self.selected_track = track;
+                    self.selected_extra = Some(ei);
                 }
             }
         });
@@ -2584,10 +2958,22 @@ impl FunKeySynthApp {
             // Left: Full Hardware Synth / Drum Engine Controls
             cols[0].vertical(|ui| {
                 card_frame(ui, |ui| {
-                    let tc = track_color(self.selected_track);
+                    let active_extra = self.selected_extra.filter(|&i| i < proj.extra_tracks.len());
+                    let (lab_title, tc) = if let Some(ei) = active_extra {
+                        let [cr, cg, cb] = proj.extra_tracks[ei].color;
+                        (
+                            format!("{} — EXTRA POLY SYNTH", proj.extra_tracks[ei].name.to_uppercase()),
+                            Color32::from_rgb(cr, cg, cb),
+                        )
+                    } else {
+                        (
+                            format!("{} — FULL HARDWARE SYNTH", self.selected_track.role_name()),
+                            track_color(self.selected_track),
+                        )
+                    };
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(format!("{} — FULL HARDWARE SYNTH", self.selected_track.role_name()))
+                            RichText::new(lab_title)
                                 .strong()
                                 .size(13.0)
                                 .color(tc),
@@ -2624,13 +3010,21 @@ impl FunKeySynthApp {
                     ui.add_space(6.0);
 
                     // Quick Synth / Voice Preset Bar right inside Sound Lab!
-                    let lab_presets = voice_preset_names(self.selected_track);
+                    let lab_presets = if active_extra.is_some() {
+                        voice_preset_names(TrackId::MoogPad)
+                    } else {
+                        voice_preset_names(self.selected_track)
+                    };
                     if !lab_presets.is_empty() {
-                        let slot_idx = TrackId::STUDIO_TRACKS
-                            .iter()
-                            .position(|&t| t == self.selected_track)
-                            .unwrap_or(0);
-                        let cur_p = proj.voice_presets[slot_idx] % lab_presets.len();
+                        let cur_p = if let Some(ei) = active_extra {
+                            proj.extra_tracks[ei].preset_idx % lab_presets.len()
+                        } else {
+                            let slot_idx = TrackId::STUDIO_TRACKS
+                                .iter()
+                                .position(|&t| t == self.selected_track)
+                                .unwrap_or(0);
+                            proj.voice_presets[slot_idx] % lab_presets.len()
+                        };
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
                                 RichText::new("PRESETS:")
@@ -2660,7 +3054,12 @@ impl FunKeySynthApp {
                                     if active { tc } else { Color32::from_rgb(48, 56, 78) },
                                 ));
                                 if ui.add(pbtn).clicked() {
-                                    apply_voice_preset(proj, self.selected_track, pi);
+                                    if let Some(ei) = active_extra {
+                                        apply_extra_track_preset(&mut proj.extra_tracks[ei], pi);
+                                        proj.extra_tracks[ei].name = pname.to_string();
+                                    } else {
+                                        apply_voice_preset(proj, self.selected_track, pi);
+                                    }
                                 }
                             }
                         });
@@ -2668,6 +3067,9 @@ impl FunKeySynthApp {
                         ui.separator();
                     }
 
+                    if let Some(ei) = active_extra {
+                        moog_controls(ui, &mut proj.extra_tracks[ei].synth, "extra_synth", tc);
+                    } else {
                     match self.selected_track {
                         TrackId::Moog => moog_controls(ui, &mut proj.moog, "moog_bass", tc),
                         TrackId::MoogPad => moog_controls(ui, &mut proj.moog_pad, "moog_pad", tc),
@@ -2801,6 +3203,7 @@ impl FunKeySynthApp {
                             ui.add(egui::Slider::new(&mut s.release, 0.02..=2.0).text("Release"));
                         }
                         TrackId::MidiOut => {}
+                    }
                     }
                 });
             });

@@ -7,6 +7,42 @@ use super::sequencer::{DrumStep, MelodicStep, MotionLocks, Pattern};
 use super::{Scale, StepCount, TrackId};
 
 pub const NUM_PATTERNS: usize = 8;
+pub const MAX_EXTRA_TRACKS: usize = 10;
+
+/// A user-added dynamic polyphonic/monophonic synth track in the mix (tracks 7..=16).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtraTrack {
+    pub name: String,
+    pub preset_idx: usize,
+    pub synth: MoogParams,
+    pub volume: f32,
+    pub pan: f32,
+    pub delay_send: f32,
+    pub reverb_send: f32,
+    pub mute: bool,
+    pub solo: bool,
+    pub color: [u8; 3],
+}
+
+impl Default for ExtraTrack {
+    fn default() -> Self {
+        let mut synth = MoogParams::default();
+        synth.poly_mode = true;
+        Self {
+            name: "Synth Layer".to_string(),
+            preset_idx: 4, // 70s String Synth
+            synth,
+            volume: 0.52,
+            pan: 0.0,
+            delay_send: 0.24,
+            reverb_send: 0.38,
+            mute: false,
+            solo: false,
+            color: [120, 210, 255],
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1031,6 +1067,10 @@ pub struct Project {
     pub party_energy: f32,
     pub party_auto_evolve: bool,
     pub voice_presets: [usize; 6],
+    #[serde(default = "default_active_tracks")]
+    pub active_tracks: [bool; 6],
+    #[serde(default)]
+    pub extra_tracks: Vec<ExtraTrack>,
     pub sample_generation: u64,
     pub moog: MoogParams,
     pub moog_pad: MoogParams,
@@ -1051,6 +1091,10 @@ pub struct Project {
     pub song_sections: Vec<SongSection>,
     pub party_mode: bool,
     pub party_seed: u32,
+}
+
+fn default_active_tracks() -> [bool; 6] {
+    [true; 6]
 }
 
 impl Default for Project {
@@ -1155,8 +1199,19 @@ impl Project {
             self.patterns.push(Pattern::named(format!("Bank {bank}")));
         }
         self.patterns.truncate(NUM_PATTERNS);
+        if self.extra_tracks.len() > MAX_EXTRA_TRACKS {
+            self.extra_tracks.truncate(MAX_EXTRA_TRACKS);
+        }
         for p in &mut self.patterns {
             p.normalize();
+            while p.extra_seqs.len() < self.extra_tracks.len() {
+                p.extra_seqs
+                    .push(super::MelodicTrackSeq::with_default_note(60, StepCount::Steps64));
+            }
+            p.extra_seqs.truncate(self.extra_tracks.len());
+            for seq in &mut p.extra_seqs {
+                seq.normalize();
+            }
         }
         if self.active_pattern >= NUM_PATTERNS {
             self.active_pattern = 0;
@@ -1270,6 +1325,8 @@ impl Project {
             party_energy: 0.70,
             party_auto_evolve: true,
             voice_presets: [0; 6],
+            active_tracks: [true; 6],
+            extra_tracks: Vec::new(),
             sample_generation: 1,
             moog: MoogParams::default(),
             moog_pad,
