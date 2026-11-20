@@ -1,6 +1,6 @@
 [package]
 name = "fun-key-synth"
-version = "1.2.2"
+version = "1.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Fun Key Synth: a beginner-friendly analog vibe studio & 8-part performance sampler"

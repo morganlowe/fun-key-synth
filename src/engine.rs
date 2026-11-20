@@ -1613,7 +1613,7 @@ mod tests {
             let sym = chord_symbol(0, ChordSlot { offset: 0, chord: ct });
             assert!(!sym.is_empty());
         }
-        assert_eq!(PROGRESSIONS.len(), 16);
+        assert_eq!(PROGRESSIONS.len(), 20);
 
         // 4. Every FactoryPreset builds cleanly
         for &fp in &FactoryPreset::ALL {

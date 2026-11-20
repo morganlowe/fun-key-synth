@@ -1116,11 +1116,17 @@ pub enum FactoryPreset {
     Disco70sStrings,
     Obx80sPower,
     ElectricRockJam,
+    BoomBapHipHop,
+    Trap808Banger,
+    DubstepWobble,
+    BigRoomFestival,
+    FutureBassEdm,
+    EuphoricTrance,
     BlankInit,
 }
 
 impl FactoryPreset {
-    pub const ALL: [FactoryPreset; 10] = [
+    pub const ALL: [FactoryPreset; 16] = [
         FactoryPreset::AcidWarehouse,
         FactoryPreset::ElectroFunkSk1,
         FactoryPreset::Detroit909Deep,
@@ -1130,6 +1136,12 @@ impl FactoryPreset {
         FactoryPreset::Disco70sStrings,
         FactoryPreset::Obx80sPower,
         FactoryPreset::ElectricRockJam,
+        FactoryPreset::BoomBapHipHop,
+        FactoryPreset::Trap808Banger,
+        FactoryPreset::DubstepWobble,
+        FactoryPreset::BigRoomFestival,
+        FactoryPreset::FutureBassEdm,
+        FactoryPreset::EuphoricTrance,
         FactoryPreset::BlankInit,
     ];
 
@@ -1144,6 +1156,12 @@ impl FactoryPreset {
             FactoryPreset::Disco70sStrings => "70s String Synth Disco",
             FactoryPreset::Obx80sPower => "80s OB-X Power Synth",
             FactoryPreset::ElectricRockJam => "Electric Guitar Rock Jam",
+            FactoryPreset::BoomBapHipHop => "90s Boom Bap Hip-Hop",
+            FactoryPreset::Trap808Banger => "Trap / 808 Half-Time",
+            FactoryPreset::DubstepWobble => "140 BPM Dubstep Wobble",
+            FactoryPreset::BigRoomFestival => "Big Room Mainstage EDM",
+            FactoryPreset::FutureBassEdm => "Future Bass Supersaw EDM",
+            FactoryPreset::EuphoricTrance => "Euphoric Uplifting Trance",
             FactoryPreset::BlankInit => "Blank Init",
         }
     }
@@ -1159,6 +1177,12 @@ impl FactoryPreset {
             FactoryPreset::Disco70sStrings => "disco70s",
             FactoryPreset::Obx80sPower => "obx80s",
             FactoryPreset::ElectricRockJam => "rock",
+            FactoryPreset::BoomBapHipHop => "boombap",
+            FactoryPreset::Trap808Banger => "trap",
+            FactoryPreset::DubstepWobble => "dubstep",
+            FactoryPreset::BigRoomFestival => "bigroom",
+            FactoryPreset::FutureBassEdm => "futurebass",
+            FactoryPreset::EuphoricTrance => "trance",
             FactoryPreset::BlankInit => "blank",
         }
     }
@@ -1174,6 +1198,12 @@ impl FactoryPreset {
             "disco" | "disco70s" | "strings" => Some(Self::Disco70sStrings),
             "obx" | "obx80s" | "arena" => Some(Self::Obx80sPower),
             "rock" | "guitar" => Some(Self::ElectricRockJam),
+            "boombap" | "hiphop" | "hip-hop" => Some(Self::BoomBapHipHop),
+            "trap" | "808" => Some(Self::Trap808Banger),
+            "dubstep" | "wobble" => Some(Self::DubstepWobble),
+            "bigroom" | "edm" | "festival" => Some(Self::BigRoomFestival),
+            "futurebass" | "future" => Some(Self::FutureBassEdm),
+            "trance" | "euphoric" => Some(Self::EuphoricTrance),
             "blank" | "init" => Some(Self::BlankInit),
             _ => None,
         }
@@ -1284,6 +1314,42 @@ impl Project {
             FactoryPreset::ElectricRockJam => {
                 let mut p = Self::factory(FactoryPreset::BlankInit);
                 super::apply_vibe_to_project(&mut p, super::Vibe::IndieRock, None, 0xE1EC_7A12);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::BoomBapHipHop => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::BoomBap, None, 0xB00B_9090);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::Trap808Banger => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::Trap808, None, 0x7A90_0808);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::DubstepWobble => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::Dubstep, None, 0xD0B5_7E90);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::BigRoomFestival => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::BigRoomEdm, None, 0xB16A_ED01);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::FutureBassEdm => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::FutureBass, None, 0xF070_BA55);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::EuphoricTrance => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::EuphoricTrance, None, 0xE0F0_1380);
                 p.name = preset.name().into();
                 return p;
             }
@@ -1712,7 +1778,13 @@ impl Project {
             | FactoryPreset::WarmHouse
             | FactoryPreset::Disco70sStrings
             | FactoryPreset::Obx80sPower
-            | FactoryPreset::ElectricRockJam => unreachable!(),
+            | FactoryPreset::ElectricRockJam
+            | FactoryPreset::BoomBapHipHop
+            | FactoryPreset::Trap808Banger
+            | FactoryPreset::DubstepWobble
+            | FactoryPreset::BigRoomFestival
+            | FactoryPreset::FutureBassEdm
+            | FactoryPreset::EuphoricTrance => unreachable!(),
         }
 
         p.patterns = patterns;
