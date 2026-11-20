@@ -12,7 +12,8 @@ use crate::{
         SongSection, Tb303Wave, TrackId, Vibe, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
-        spawn_update_check, AppSettings, StudioTheme, UpdateStatus, CURRENT_VERSION, RELEASES_URL,
+        restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
+        UpdateStatus, CURRENT_VERSION, RELEASES_URL,
     },
 };
 use eframe::egui::{self, Color32, Key, RichText, Rounding, Sense, Stroke, Vec2};
@@ -700,27 +701,76 @@ impl eframe::App for FunKeySynthApp {
                             self.show_settings = !self.show_settings;
                         }
 
-                        // Non-intrusive Update Available badge if GitHub has a newer release
+                        // Non-intrusive 1-click Update / Install / Restart badge
                         let upd_snapshot = self
                             .update_status
                             .lock()
                             .map(|g| g.clone())
                             .unwrap_or_default();
-                        if let UpdateStatus::UpdateAvailable { latest_tag, url } = upd_snapshot {
-                            let ubtn = egui::Button::new(
-                                RichText::new(format!("Update {latest_tag}"))
-                                    .strong()
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(12, 14, 20)),
-                            )
-                            .fill(Color32::from_rgb(72, 224, 148));
-                            if ui
-                                .add(ubtn)
-                                .on_hover_text("New release available on GitHub — click to open Releases")
-                                .clicked()
-                            {
-                                ctx.open_url(egui::OpenUrl::new_tab(url));
+                        match upd_snapshot {
+                            UpdateStatus::UpdateAvailable {
+                                latest_tag,
+                                url,
+                                asset_url,
+                                asset_name,
+                            } => {
+                                let label = if asset_url.is_some() {
+                                    format!("Install {latest_tag}")
+                                } else {
+                                    format!("Update {latest_tag}")
+                                };
+                                let hover = if asset_url.is_some() {
+                                    "Click to download and install this update automatically"
+                                } else {
+                                    "New release available on GitHub — click to open Releases"
+                                };
+                                let ubtn = egui::Button::new(
+                                    RichText::new(label)
+                                        .strong()
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(12, 14, 20)),
+                                )
+                                .fill(Color32::from_rgb(72, 224, 148));
+                                if ui.add(ubtn).on_hover_text(hover).clicked() {
+                                    if let (Some(a_url), Some(a_name)) = (asset_url, asset_name) {
+                                        spawn_install_update(
+                                            self.update_status.clone(),
+                                            latest_tag,
+                                            a_url,
+                                            a_name,
+                                        );
+                                    } else {
+                                        ctx.open_url(egui::OpenUrl::new_tab(url));
+                                    }
+                                }
                             }
+                            UpdateStatus::Installing { latest_tag, stage } => {
+                                let ubtn = egui::Button::new(
+                                    RichText::new(format!("Installing {latest_tag}..."))
+                                        .strong()
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(12, 14, 20)),
+                                )
+                                .fill(Color32::from_rgb(255, 198, 66));
+                                let _ = ui.add_enabled(false, ubtn).on_disabled_hover_text(stage);
+                            }
+                            UpdateStatus::Installed { latest_tag } => {
+                                let ubtn = egui::Button::new(
+                                    RichText::new(format!("Restart for {latest_tag}"))
+                                        .strong()
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(12, 14, 20)),
+                                )
+                                .fill(Color32::from_rgb(82, 240, 168));
+                                if ui
+                                    .add(ubtn)
+                                    .on_hover_text("Update installed! Click to relaunch into the new version")
+                                    .clicked()
+                                {
+                                    restart_app();
+                                }
+                            }
+                            _ => {}
                         }
 
                         if ui
@@ -1126,15 +1176,61 @@ impl eframe::App for FunKeySynthApp {
                                     .color(Color32::from_rgb(72, 224, 148)),
                             );
                         }
-                        UpdateStatus::UpdateAvailable { latest_tag, url } => {
+                        UpdateStatus::UpdateAvailable {
+                            latest_tag,
+                            url,
+                            asset_url,
+                            asset_name,
+                        } => {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(format!("New version available: {latest_tag}"))
                                         .strong()
                                         .color(Color32::from_rgb(72, 224, 148)),
                                 );
-                                if ui.button("Download").clicked() {
+                                if let (Some(a_url), Some(a_name)) = (asset_url, asset_name) {
+                                    let ibtn = egui::Button::new(
+                                        RichText::new("Install Now")
+                                            .strong()
+                                            .color(Color32::from_rgb(12, 14, 20)),
+                                    )
+                                    .fill(Color32::from_rgb(72, 224, 148));
+                                    if ui.add(ibtn).clicked() {
+                                        spawn_install_update(
+                                            self.update_status.clone(),
+                                            latest_tag,
+                                            a_url,
+                                            a_name,
+                                        );
+                                    }
+                                }
+                                if ui.button("GitHub").clicked() {
                                     ctx.open_url(egui::OpenUrl::new_tab(url));
+                                }
+                            });
+                        }
+                        UpdateStatus::Installing { latest_tag, stage } => {
+                            ui.label(
+                                RichText::new(format!("Installing {latest_tag}: {stage}"))
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 198, 66)),
+                            );
+                        }
+                        UpdateStatus::Installed { latest_tag } => {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Installed {latest_tag}!"))
+                                        .strong()
+                                        .color(Color32::from_rgb(82, 240, 168)),
+                                );
+                                let rbtn = egui::Button::new(
+                                    RichText::new("Restart Now")
+                                        .strong()
+                                        .color(Color32::from_rgb(12, 14, 20)),
+                                )
+                                .fill(Color32::from_rgb(82, 240, 168));
+                                if ui.add(rbtn).clicked() {
+                                    restart_app();
                                 }
                             });
                         }

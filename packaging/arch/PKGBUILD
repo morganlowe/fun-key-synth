@@ -1,5 +1,5 @@
 pkgname=fun-key-synth
-pkgver=1.2.0
+pkgver=1.2.1
 pkgrel=1
 pkgdesc="Fun Key Synth — Vibe Studio, Auto-Chord/Beat Groovebox & 8-Part Performance Sampler"
 arch=('x86_64')

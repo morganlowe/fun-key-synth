@@ -196,7 +196,19 @@ pub enum UpdateStatus {
     Idle,
     Checking,
     UpToDate,
-    UpdateAvailable { latest_tag: String, url: String },
+    UpdateAvailable {
+        latest_tag: String,
+        url: String,
+        asset_url: Option<String>,
+        asset_name: Option<String>,
+    },
+    Installing {
+        latest_tag: String,
+        stage: String,
+    },
+    Installed {
+        latest_tag: String,
+    },
     OfflineOrError(String),
 }
 
@@ -212,12 +224,38 @@ pub fn spawn_update_check(status: Arc<Mutex<UpdateStatus>>) {
     });
 }
 
+fn find_platform_asset(val: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let Some(assets) = val.get("assets").and_then(|v| v.as_array()) else {
+        return (None, None);
+    };
+    for asset in assets {
+        let Some(name) = asset.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(dl_url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        #[cfg(target_os = "linux")]
+        let matches = lower.contains("linux") && lower.ends_with(".tar.gz");
+        #[cfg(target_os = "windows")]
+        let matches = lower.contains("windows") && lower.ends_with(".zip");
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let matches = false;
+
+        if matches {
+            return (Some(dl_url.to_string()), Some(name.to_string()));
+        }
+    }
+    (None, None)
+}
+
 fn check_github_latest() -> UpdateStatus {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
             "--max-time",
-            "5",
+            "8",
             "-H",
             "User-Agent: fun-key-synth",
             API_LATEST_URL,
@@ -246,12 +284,210 @@ fn check_github_latest() -> UpdateStatus {
         .to_string();
 
     if is_newer_version(tag, CURRENT_VERSION) {
+        let (asset_url, asset_name) = find_platform_asset(&val);
         UpdateStatus::UpdateAvailable {
             latest_tag: tag.to_string(),
             url,
+            asset_url,
+            asset_name,
         }
     } else {
         UpdateStatus::UpToDate
+    }
+}
+
+/// Downloads and installs the release binary in-place on a background thread.
+pub fn spawn_install_update(
+    status: Arc<Mutex<UpdateStatus>>,
+    latest_tag: String,
+    asset_url: String,
+    asset_name: String,
+) {
+    let set_stage = |st: &Arc<Mutex<UpdateStatus>>, tag: &str, msg: &str| {
+        if let Ok(mut guard) = st.lock() {
+            *guard = UpdateStatus::Installing {
+                latest_tag: tag.to_string(),
+                stage: msg.to_string(),
+            };
+        }
+    };
+
+    set_stage(&status, &latest_tag, "Downloading release...");
+    std::thread::spawn(move || {
+        match install_update_blocking(&status, &latest_tag, &asset_url, &asset_name) {
+            Ok(()) => {
+                if let Ok(mut guard) = status.lock() {
+                    *guard = UpdateStatus::Installed { latest_tag };
+                }
+            }
+            Err(err) => {
+                if let Ok(mut guard) = status.lock() {
+                    *guard = UpdateStatus::OfflineOrError(format!("Install failed: {err}"));
+                }
+            }
+        }
+    });
+}
+
+fn find_file_recursive(dir: &std::path::Path, target_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(target_name) {
+            return Some(p);
+        }
+        if p.is_dir() {
+            if let Some(found) = find_file_recursive(&p, target_name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn install_update_blocking(
+    status: &Arc<Mutex<UpdateStatus>>,
+    latest_tag: &str,
+    asset_url: &str,
+    asset_name: &str,
+) -> Result<(), String> {
+    let update_dir = std::env::temp_dir().join(format!("fun-key-synth-update-{latest_tag}"));
+    let _ = std::fs::remove_dir_all(&update_dir);
+    std::fs::create_dir_all(&update_dir).map_err(|e| format!("temp dir: {e}"))?;
+
+    let archive_path = update_dir.join(asset_name);
+
+    // 1. Download asset
+    let dl = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "120",
+            "-H",
+            "User-Agent: fun-key-synth",
+            "-o",
+            archive_path.to_str().ok_or("invalid temp path")?,
+            asset_url,
+        ])
+        .output()
+        .map_err(|e| format!("curl launch: {e}"))?;
+    if !dl.status.success() {
+        return Err("download failed".into());
+    }
+
+    // 2. Extract archive
+    if let Ok(mut guard) = status.lock() {
+        *guard = UpdateStatus::Installing {
+            latest_tag: latest_tag.to_string(),
+            stage: "Extracting...".into(),
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let ex = std::process::Command::new("tar")
+            .args([
+                "-xzf",
+                archive_path.to_str().ok_or("invalid archive path")?,
+                "-C",
+                update_dir.to_str().ok_or("invalid extract dir")?,
+            ])
+            .output()
+            .map_err(|e| format!("tar launch: {e}"))?;
+        if !ex.status.success() {
+            return Err("tar extraction failed".into());
+        }
+
+        let new_bin = find_file_recursive(&update_dir, "fun-key-synth")
+            .ok_or("binary not found in archive")?;
+        let current_exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+
+        if let Ok(mut guard) = status.lock() {
+            *guard = UpdateStatus::Installing {
+                latest_tag: latest_tag.to_string(),
+                stage: "Installing binary...".into(),
+            };
+        }
+
+        // Make new binary executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&new_bin, std::fs::Permissions::from_mode(0o755));
+        }
+
+        // Try direct atomic swap in the current executable's directory
+        let staged = current_exe.with_extension("new");
+        match std::fs::copy(&new_bin, &staged).and_then(|_| std::fs::rename(&staged, &current_exe)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                // System-wide install (e.g. /usr/bin/fun-key-synth): prompt via pkexec
+                let _ = std::fs::remove_file(&staged);
+                let pk = std::process::Command::new("pkexec")
+                    .args([
+                        "install",
+                        "-Dm755",
+                        new_bin.to_str().ok_or("invalid bin path")?,
+                        current_exe.to_str().ok_or("invalid exe path")?,
+                    ])
+                    .output()
+                    .map_err(|err| format!("pkexec unavailable ({err})"))?;
+                if !pk.status.success() {
+                    return Err("elevated install cancelled or failed".into());
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(format!("replace failed: {e}"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let ps_cmd = format!(
+            "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
+            archive_path.display(),
+            update_dir.display()
+        );
+        let ex = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps_cmd])
+            .output()
+            .map_err(|e| format!("powershell launch: {e}"))?;
+        if !ex.status.success() {
+            return Err("zip extraction failed".into());
+        }
+
+        let new_bin = find_file_recursive(&update_dir, "fun-key-synth.exe")
+            .ok_or("fun-key-synth.exe not found in zip")?;
+        let current_exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+
+        if let Ok(mut guard) = status.lock() {
+            *guard = UpdateStatus::Installing {
+                latest_tag: latest_tag.to_string(),
+                stage: "Installing binary...".into(),
+            };
+        }
+
+        let old_exe = current_exe.with_extension("exe.old");
+        let _ = std::fs::remove_file(&old_exe);
+        std::fs::rename(&current_exe, &old_exe).map_err(|e| format!("rename old exe: {e}"))?;
+        if let Err(e) = std::fs::copy(&new_bin, &current_exe) {
+            let _ = std::fs::rename(&old_exe, &current_exe);
+            return Err(format!("copy new exe: {e}"));
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&update_dir);
+    Ok(())
+}
+
+/// Relaunches the newly installed binary and exits the current process.
+pub fn restart_app() {
+    if let Ok(exe) = std::env::current_exe() {
+        if std::process::Command::new(exe).spawn().is_ok() {
+            std::process::exit(0);
+        }
     }
 }
 
