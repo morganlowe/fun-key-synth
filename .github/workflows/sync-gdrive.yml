@@ -1,0 +1,108 @@
+name: Sync Latest Release to Google Drive
+
+on:
+  workflow_run:
+    workflows: ["Release Windows Binary"]
+    types: [completed]
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to sync (leave empty for latest release)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  sync-gdrive:
+    name: Sync Release & Info Page to Google Drive
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Check required secrets
+        env:
+          GDRIVE_RCLONE_CONF: ${{ secrets.GDRIVE_RCLONE_CONF }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          if [ -z "$GDRIVE_RCLONE_CONF" ] || [ -z "$GDRIVE_FOLDER_ID" ]; then
+            echo "::error::Missing GDRIVE_RCLONE_CONF or GDRIVE_FOLDER_ID repository secret."
+            exit 1
+          fi
+
+      - name: Resolve release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ -n "$EVENT_TAG" ]; then
+            TAG="$EVENT_TAG"
+          else
+            TAG="$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName -q '.[0].tagName')"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::No GitHub release found to sync."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Syncing release tag: $TAG"
+
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v4
+
+      - name: Checkout release tag sources
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          path: release-src
+
+      - name: Download release assets & notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          mkdir -p drive-sync
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --dir drive-sync \
+            --clobber
+          gh release view "$TAG" \
+            --repo "${{ github.repository }}" \
+            --json body -q '.body' > drive-sync/RELEASE_NOTES.md
+          cp release-src/README.md drive-sync/README.md
+
+      - name: Build standalone HTML info page
+        run: |
+          python3 -m pip install --quiet markdown
+          python3 scripts/build_info_page.py \
+            --tag "${{ steps.release.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --readme release-src/README.md \
+            --release-notes drive-sync/RELEASE_NOTES.md \
+            --assets-dir drive-sync \
+            --output drive-sync/Fun-Key-Synth-Info.html
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Sync to Google Drive folder
+        env:
+          GDRIVE_RCLONE_CONF: ${{ secrets.GDRIVE_RCLONE_CONF }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$GDRIVE_RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+          rclone sync ./drive-sync gdrive: \
+            --drive-root-folder-id "$GDRIVE_FOLDER_ID" \
+            --verbose
