@@ -4,8 +4,9 @@ use crate::{
         DrumMachine, MasterFx, MonologueSynth, MoogSynth, Sk1Sampler, Tb303Synth,
     },
     model::{
-        arp_tones_for, bass_midi_for, chord_symbol, generate_auto_beat, progression_at,
-        voice_led_chord, ChordSlot, DrumVoiceId, MelodicStep, Project, TrackId, MAX_EXTRA_TRACKS,
+        arp_tones_for, bass_midi_for, chord_symbol, generate_auto_beat, generate_melodic_tracks,
+        party_song_title, progression_at, vibe_progressions, voice_led_chord, ChordSlot,
+        DrumVoiceId, MelodicStep, MelodicTrackSeq, Project, TrackId, MAX_EXTRA_TRACKS,
     },
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -69,6 +70,7 @@ pub enum LiveEvent {
     TriggerBassDrop,
     TriggerFill,
     NextPartySection,
+    NextPartySong,
     TriggerSamplePart {
         part: usize,
         velocity: f32,
@@ -93,6 +95,8 @@ pub struct EngineTelemetry {
     pub party_section: String,
     pub party_bar: usize,
     pub party_section_bars: usize,
+    pub party_song_idx: u32,
+    pub party_song_title: String,
     pub peak_l: f32,
     pub peak_r: f32,
     pub sidechain_duck: f32,
@@ -163,6 +167,8 @@ struct PartySectionDef {
     filter_sweep: bool,
     snare_build_last_bar: bool,
     drop_on_start: bool,
+    energy_mul: f32,
+    evolve_progression: bool,
 }
 
 const PARTY_SECTIONS: [PartySectionDef; 6] = [
@@ -173,6 +179,8 @@ const PARTY_SECTIONS: [PartySectionDef; 6] = [
         filter_sweep: false,
         snare_build_last_bar: false,
         drop_on_start: false,
+        energy_mul: 0.50,
+        evolve_progression: true,
     },
     PartySectionDef {
         name: "GROOVE",
@@ -181,6 +189,8 @@ const PARTY_SECTIONS: [PartySectionDef; 6] = [
         filter_sweep: false,
         snare_build_last_bar: false,
         drop_on_start: false,
+        energy_mul: 0.80,
+        evolve_progression: false,
     },
     PartySectionDef {
         name: "BUILD",
@@ -189,6 +199,8 @@ const PARTY_SECTIONS: [PartySectionDef; 6] = [
         filter_sweep: true,
         snare_build_last_bar: true,
         drop_on_start: false,
+        energy_mul: 0.88,
+        evolve_progression: true,
     },
     PartySectionDef {
         name: "DROP 1",
@@ -197,6 +209,8 @@ const PARTY_SECTIONS: [PartySectionDef; 6] = [
         filter_sweep: false,
         snare_build_last_bar: false,
         drop_on_start: true,
+        energy_mul: 1.00,
+        evolve_progression: false,
     },
     PartySectionDef {
         name: "BREAK",
@@ -205,6 +219,8 @@ const PARTY_SECTIONS: [PartySectionDef; 6] = [
         filter_sweep: false,
         snare_build_last_bar: true,
         drop_on_start: false,
+        energy_mul: 0.42,
+        evolve_progression: true,
     },
     PartySectionDef {
         name: "DROP 2",
@@ -213,6 +229,8 @@ const PARTY_SECTIONS: [PartySectionDef; 6] = [
         filter_sweep: false,
         snare_build_last_bar: false,
         drop_on_start: true,
+        energy_mul: 1.08,
+        evolve_progression: false,
     },
 ];
 
@@ -265,6 +283,7 @@ struct Runtime {
     party_section_idx: usize,
     party_bar_in_sec: usize,
     party_cycle: u32,
+    party_evolution: u32,
     party_filter_mod: f32,
     // Motion automation live playback overrides
     auto_filter: Option<f32>,
@@ -273,9 +292,17 @@ struct Runtime {
     auto_glitch: Option<f32>,
     auto_iso_bass: Option<f32>,
     auto_iso_treble: Option<f32>,
-    // Auto-beat cache
+    // Auto-beat & Party DJ song cache
     auto_beat_drums: crate::model::DrumTrackSeq,
     auto_beat_sig: (u8, u32, u32),
+    party_melodic: (
+        MelodicTrackSeq,
+        MelodicTrackSeq,
+        MelodicTrackSeq,
+        MelodicTrackSeq,
+        MelodicTrackSeq,
+    ),
+    party_melodic_sig: (u8, u8, usize, u32),
     // Peak metering
     peak_l: f32,
     peak_r: f32,
@@ -326,6 +353,7 @@ impl Runtime {
             party_section_idx: 0,
             party_bar_in_sec: 0,
             party_cycle: 0,
+            party_evolution: 0,
             party_filter_mod: 1.0,
             auto_filter: None,
             auto_space: None,
@@ -335,6 +363,14 @@ impl Runtime {
             auto_iso_treble: None,
             auto_beat_drums: crate::model::DrumTrackSeq::default(),
             auto_beat_sig: (255, 0, 0),
+            party_melodic: (
+                MelodicTrackSeq::default(),
+                MelodicTrackSeq::default(),
+                MelodicTrackSeq::default(),
+                MelodicTrackSeq::default(),
+                MelodicTrackSeq::default(),
+            ),
+            party_melodic_sig: (255, 255, usize::MAX, 0),
             peak_l: 0.0,
             peak_r: 0.0,
         }
@@ -454,9 +490,24 @@ impl Runtime {
             LiveEvent::NextPartySection => {
                 self.party_section_idx = (self.party_section_idx + 1) % PARTY_SECTIONS.len();
                 self.party_bar_in_sec = 0;
+                if self.party_section_idx == 0 {
+                    self.party_cycle = self.party_cycle.wrapping_add(1);
+                }
+                if PARTY_SECTIONS[self.party_section_idx].evolve_progression {
+                    self.party_evolution = self.party_evolution.wrapping_add(1);
+                }
                 if PARTY_SECTIONS[self.party_section_idx].drop_on_start {
                     self.trigger_bass_drop(p.root_note);
                 }
+            }
+            LiveEvent::NextPartySong => {
+                // DJ mix straight into a brand-new song in the chosen genre!
+                self.party_cycle = self.party_cycle.wrapping_add(1);
+                self.party_evolution = self.party_evolution.wrapping_add(1);
+                self.party_section_idx = 0; // Fresh DJ Intro / Transition
+                self.party_bar_in_sec = 0;
+                self.force_fill_steps = 8; // Transition drum fill
+                self.trigger_bass_drop(p.root_note);
             }
             LiveEvent::TriggerSamplePart { part, velocity } => {
                 self.volca.sync_parts(&p.sample_parts);
@@ -524,6 +575,7 @@ impl Runtime {
         let mut section_fill = false;
         let mut party_filter = 1.0_f32;
         let mut party_snare_roll = false;
+        let mut party_section_energy = p.party_energy;
 
         if p.party_mode {
             let sec = &PARTY_SECTIONS[self.party_section_idx];
@@ -534,6 +586,11 @@ impl Runtime {
                     self.party_section_idx = (self.party_section_idx + 1) % PARTY_SECTIONS.len();
                     if self.party_section_idx == 0 {
                         self.party_cycle = self.party_cycle.wrapping_add(1);
+                        self.force_fill_steps = 8; // DJ song mix transition fill!
+                        self.trigger_bass_drop(p.root_note);
+                    }
+                    if PARTY_SECTIONS[self.party_section_idx].evolve_progression {
+                        self.party_evolution = self.party_evolution.wrapping_add(1);
                     }
                     if PARTY_SECTIONS[self.party_section_idx].drop_on_start {
                         self.trigger_bass_drop(p.root_note);
@@ -542,6 +599,7 @@ impl Runtime {
             }
             let sec = &PARTY_SECTIONS[self.party_section_idx];
             section_mask = sec.mask;
+            party_section_energy = (p.party_energy * sec.energy_mul).clamp(0.18, 1.0);
             // Energy scaling in Party Mode
             if p.party_energy < 0.35 {
                 section_mask &= !0b010000; // pull 303 on chill energy
@@ -551,6 +609,12 @@ impl Runtime {
             if sec.filter_sweep {
                 // Smooth DJ high-energy sweep during Build
                 party_filter = 0.25 + bar_progress * 0.75;
+            } else if self.party_section_idx == 0 {
+                // Gentle opening filter swell on Intro
+                party_filter = 0.55 + bar_progress * 0.35;
+            } else if self.party_section_idx == 4 {
+                // Atmospheric filter breath on Break
+                party_filter = 0.45 + bar_progress * 0.40;
             }
             if sec.snare_build_last_bar && self.party_bar_in_sec + 1 == sec.bars {
                 party_snare_roll = true;
@@ -561,6 +625,7 @@ impl Runtime {
             telemetry.party_section = sec.name.to_string();
             telemetry.party_bar = self.party_bar_in_sec + 1;
             telemetry.party_section_bars = sec.bars;
+            telemetry.party_song_idx = self.party_cycle;
         } else if p.song_mode && !p.song_sections.is_empty() {
             let total_steps: usize = p
                 .song_sections
@@ -595,12 +660,30 @@ impl Runtime {
         }
         self.party_filter_mod = party_filter;
 
-        // Active chord slot for telemetry & Party/Auto-Chord harmonic lock
+        // Active chord slot & Party DJ Song root/progression (harmonic key shifts between DJ songs!)
+        let dj_root = if p.party_mode && self.party_cycle > 0 {
+            const CIRCLE_OF_FIFTHS_SHIFTS: [u8; 6] = [0, 7, 5, 10, 3, 8];
+            let shift = CIRCLE_OF_FIFTHS_SHIFTS[(self.party_cycle as usize) % CIRCLE_OF_FIFTHS_SHIFTS.len()];
+            (p.root_note + shift) % 12
+        } else {
+            p.root_note
+        };
         let prog_offset = if p.party_mode && p.party_auto_evolve {
-            (p.progression_idx + (self.party_cycle as usize)) % crate::model::PROGRESSIONS.len()
+            let v_progs = vibe_progressions(p.vibe);
+            let base_pos = v_progs
+                .iter()
+                .position(|&pi| pi == p.progression_idx)
+                .unwrap_or(0);
+            let step_advance = (self.party_cycle as usize) + (self.party_evolution as usize);
+            v_progs[(base_pos + step_advance) % v_progs.len().max(1)]
         } else {
             p.progression_idx
         };
+        if p.party_mode {
+            telemetry.party_song_title = party_song_title(p.vibe, self.party_cycle, dj_root);
+        } else {
+            telemetry.party_song_title.clear();
+        }
         let prog = progression_at(prog_offset);
         let bpc = p.bars_per_chord.clamp(1, 4) as usize;
         let chord_idx = (global / (16 * bpc)) % 4;
@@ -609,10 +692,31 @@ impl Runtime {
         } else {
             prog.slots[chord_idx]
         };
-        telemetry.active_chord = chord_symbol(p.root_note, active_slot);
+        telemetry.active_chord = chord_symbol(dj_root, active_slot);
 
         let pat = &p.patterns[pat_idx];
-        let seed = p.party_seed.wrapping_add(self.party_cycle.wrapping_mul(7919));
+        let party_phrase = (global / 64) as u32;
+        let party_evolve_active = p.party_mode && (self.party_cycle > 0 || (p.party_auto_evolve && self.party_evolution > 0));
+        let song_seed = p
+            .party_seed
+            .wrapping_add(self.party_cycle.wrapping_mul(7919))
+            .wrapping_add(self.party_evolution.wrapping_mul(2053));
+        let seed = if p.party_mode {
+            song_seed
+                .wrapping_add((self.party_section_idx as u32).wrapping_mul(1031))
+                .wrapping_add(party_phrase.wrapping_mul(3571))
+        } else {
+            song_seed
+        };
+
+        // Refresh Party DJ Melodic Song Cache whenever a new song / progression / vibe starts!
+        if p.party_mode {
+            let msig = (p.vibe as u8, dj_root, prog_offset, song_seed);
+            if self.party_melodic_sig != msig {
+                self.party_melodic = generate_melodic_tracks(p.vibe, dj_root, prog_offset, song_seed);
+                self.party_melodic_sig = msig;
+            }
+        }
 
         // --- 0. MOTION AUTOMATION PLAYBACK ---
         let m_step = global % 64;
@@ -629,7 +733,7 @@ impl Runtime {
             let use_auto_beat = p.auto_beat_mode || p.party_mode;
             if use_auto_beat {
                 let energy = if p.party_mode {
-                    (p.party_energy * 0.85 + 0.15).clamp(0.15, 1.0)
+                    (party_section_energy * 0.85 + 0.15).clamp(0.15, 1.0)
                 } else {
                     p.beat_energy
                 };
@@ -729,34 +833,63 @@ impl Runtime {
         }
 
         // Helper: trigger a melodic step with proper gate/slide/motion
-        let bass_root = bass_midi_for(p.root_note, active_slot.offset);
-        let pad_notes = voice_led_chord(p.root_note, active_slot, 60);
-        let arp_tones = arp_tones_for(p.root_note, active_slot);
+        let bass_root = bass_midi_for(dj_root, active_slot.offset);
+        let pad_notes = voice_led_chord(dj_root, active_slot, 60);
+        let arp_tones = arp_tones_for(dj_root, active_slot);
         let follow_override = p.auto_chord_follow && self.live_chord_held;
 
         // --- 2. BASS / MOOG (bit 1) ---
         if (section_mask & 0b000010) != 0 && !follow_override {
-            let seq = &pat.moog;
+            let seq = if p.party_mode { &self.party_melodic.0 } else { &pat.moog };
             let mut st = seq.steps[global % seq.step_count.as_usize()];
-            // Party Mode subtle scale-safe bass variation
-            if p.party_mode && !st.active && global % 16 == 14 && hash_f32(seed, global, 11) < 0.30 {
-                st = MelodicStep {
-                    active: true,
-                    note: bass_root + 12,
-                    velocity: 0.72,
-                    gate: 1.2,
-                    slide: true,
-                    ..Default::default()
-                };
+            if p.party_mode {
+                let step16 = global % 16;
+                let bass_style = (party_phrase + self.party_section_idx as u32) % 4;
+                // Evolve rhythmic bass feel per 4-bar phrase & section
+                if bass_style == 1 && (step16 == 6 || step16 == 14) && !st.active {
+                    // Syncopated octave bounce
+                    st = MelodicStep {
+                        active: true,
+                        note: (bass_root + 12).min(60),
+                        velocity: 0.78,
+                        gate: 0.9,
+                        slide: step16 == 14,
+                        ..Default::default()
+                    };
+                } else if bass_style == 2 && party_section_energy >= 0.75 && step16 % 2 == 0 && !st.active {
+                    // Driving offbeat 8th-note pump during high-energy Groove/Drops
+                    let oct = if step16 % 4 == 2 { 12 } else { 0 };
+                    st = MelodicStep {
+                        active: true,
+                        note: (bass_root + oct).min(60),
+                        velocity: 0.74,
+                        gate: 0.65,
+                        ..Default::default()
+                    };
+                } else if bass_style == 3 && step16 == 10 && !st.active && hash_f32(seed, global, 13) < 0.65 {
+                    // Fifth / octave turnaround pickup
+                    let jump = if hash_f32(seed, global, 14) < 0.5 { 7 } else { 12 };
+                    st = MelodicStep {
+                        active: true,
+                        note: (bass_root + jump).min(60),
+                        velocity: 0.76,
+                        gate: 1.1,
+                        slide: true,
+                        ..Default::default()
+                    };
+                } else if !st.active && step16 == 14 && hash_f32(seed, global, 11) < 0.45 {
+                    st = MelodicStep {
+                        active: true,
+                        note: (bass_root + 12).min(60),
+                        velocity: 0.72,
+                        gate: 1.2,
+                        slide: true,
+                        ..Default::default()
+                    };
+                }
             }
             if st.active {
-                let note = if p.party_mode && p.party_auto_evolve && self.party_cycle > 0 {
-                    // Keep bass locked to evolving progression!
-                    let iv = (st.note as i32 - bass_midi_for(p.root_note, progression_at(p.progression_idx).slots[(global / 16) % 4].offset) as i32).clamp(-12, 12);
-                    (bass_root as i32 + iv).clamp(28, 60) as u8
-                } else {
-                    st.note
-                };
+                let note = st.note;
                 if st.motion.any_locked() {
                     self.moog.set_motion_locks(st.motion);
                 } else {
@@ -776,8 +909,33 @@ impl Runtime {
 
         // --- 3. CHORDS / MOOG PAD (bit 2) ---
         if (section_mask & 0b000100) != 0 && !follow_override {
-            let seq = &pat.moog_pad;
-            let st = seq.steps[global % seq.step_count.as_usize()];
+            let seq = if p.party_mode { &self.party_melodic.1 } else { &pat.moog_pad };
+            let mut st = seq.steps[global % seq.step_count.as_usize()];
+            if p.party_mode {
+                let step16 = global % 16;
+                let chord_rhythm = (party_phrase + self.party_section_idx as u32) % 3;
+                if chord_rhythm == 1 && !st.active && (step16 == 6 || step16 == 12) && party_section_energy >= 0.65 {
+                    // Rhythmic stab hits on Groove/Drops
+                    st = MelodicStep {
+                        active: true,
+                        note: dj_root,
+                        velocity: 0.68,
+                        gate: 1.5,
+                        chord: active_slot.chord,
+                        ..Default::default()
+                    };
+                } else if chord_rhythm == 2 && !st.active && step16 == 10 && hash_f32(seed, global, 19) < 0.55 {
+                    // Syncopated chord swell
+                    st = MelodicStep {
+                        active: true,
+                        note: dj_root,
+                        velocity: 0.64,
+                        gate: 3.0,
+                        chord: active_slot.chord,
+                        ..Default::default()
+                    };
+                }
+            }
             if st.active {
                 if st.motion.any_locked() {
                     self.pad_moog.set_motion_locks(st.motion);
@@ -787,15 +945,23 @@ impl Runtime {
                 self.pad_moog.all_notes_off();
                 if st.chord != crate::model::ChordType::Single {
                     // Voice-led lush chord!
-                    let notes_to_play = if p.party_mode && p.party_auto_evolve && self.party_cycle > 0 {
+                    let mut notes_to_play = if party_evolve_active || p.party_mode {
                         pad_notes.clone()
                     } else {
                         let slot = ChordSlot {
-                            offset: (st.note + 12 - (p.root_note % 12)) % 12,
+                            offset: (st.note + 12 - (dj_root % 12)) % 12,
                             chord: st.chord,
                         };
-                        voice_led_chord(p.root_note, slot, 60)
+                        voice_led_chord(dj_root, slot, 60)
                     };
+                    // Subtle octave lift on Drop 2 / odd cycles for harmonic bloom
+                    if p.party_mode && self.party_section_idx == 5 && (party_phrase % 2 == 1) {
+                        for n in &mut notes_to_play {
+                            if *n <= 72 {
+                                *n += 12;
+                            }
+                        }
+                    }
                     for n in notes_to_play {
                         self.pad_moog
                             .note_on(n, st.velocity, st.accent, false, &p.moog_pad);
@@ -824,14 +990,14 @@ impl Runtime {
                     }
                     synth.all_notes_off();
                     if st.chord != crate::model::ChordType::Single {
-                        let notes_to_play = if p.party_mode && p.party_auto_evolve && self.party_cycle > 0 {
+                        let notes_to_play = if party_evolve_active || p.party_mode {
                             pad_notes.clone()
                         } else {
                             let slot = ChordSlot {
-                                offset: (st.note + 12 - (p.root_note % 12)) % 12,
+                                offset: (st.note + 12 - (dj_root % 12)) % 12,
                                 chord: st.chord,
                             };
-                            voice_led_chord(p.root_note, slot, 60)
+                            voice_led_chord(dj_root, slot, 60)
                         };
                         for n in notes_to_play {
                             synth.note_on(n, st.velocity, st.accent, false, &tr.synth);
@@ -846,21 +1012,48 @@ impl Runtime {
 
         // --- 4. ARP / MONOLOGUE (bit 3) ---
         if (section_mask & 0b001000) != 0 {
-            let seq = &pat.monologue;
+            let seq = if p.party_mode { &self.party_melodic.2 } else { &pat.monologue };
             let mut st = seq.steps[global % seq.step_count.as_usize()];
-            // Party Mode sparkling chord-tone arp variation!
-            if p.party_mode && !st.active && global % 2 == 0 && hash_f32(seed, global, 23) < p.party_energy * 0.25 {
-                st = MelodicStep {
-                    active: true,
-                    note: arp_tones[(global / 2) % arp_tones.len().max(1)],
-                    velocity: 0.62,
-                    gate: 0.9,
-                    ..Default::default()
+            let arp_len = arp_tones.len().max(1);
+            let arp_mode = (party_phrase + self.party_section_idx as u32) % 5;
+            let pick_arp_note = |step_i: usize| -> u8 {
+                let idx = match arp_mode {
+                    0 => (step_i / 2) % arp_len,                                        // ascending
+                    1 => arp_len - 1 - ((step_i / 2) % arp_len),                        // descending
+                    2 => {                                                              // bounce up-down
+                        let span = (arp_len * 2).saturating_sub(2).max(1);
+                        let pos = (step_i / 2) % span;
+                        if pos < arp_len { pos } else { span - pos }
+                    }
+                    3 => ((step_i / 2) * 3) % arp_len,                                  // wide skip
+                    _ => ((step_i / 2) + (step_i / 16)) % arp_len,                      // shifting motif
                 };
+                let mut n = arp_tones[idx];
+                if p.party_mode && (self.party_section_idx == 3 || self.party_section_idx == 5) && step_i % 8 == 6 && n <= 76 {
+                    n += 12; // drop octave sparkle
+                }
+                n
+            };
+            // Party Mode evolving chord-tone arp phrases!
+            if p.party_mode {
+                let step16 = global % 16;
+                // Call-and-response mode breathes on beats 3-4 except on turnaround bar 4
+                let breathe = arp_mode == 4 && step16 >= 8 && (global / 16) % 4 != 3;
+                if breathe {
+                    st.active = false;
+                } else if !st.active && global % 2 == 0 && hash_f32(seed, global, 23) < party_section_energy * 0.42 {
+                    st = MelodicStep {
+                        active: true,
+                        note: pick_arp_note(global),
+                        velocity: 0.64,
+                        gate: 0.85,
+                        ..Default::default()
+                    };
+                }
             }
             if st.active {
-                let note = if follow_override || (p.party_mode && p.party_auto_evolve && self.party_cycle > 0) {
-                    arp_tones[(global / 2) % arp_tones.len().max(1)]
+                let note = if follow_override || (p.party_mode && party_phrase > 0) {
+                    pick_arp_note(global)
                 } else {
                     st.note
                 };
@@ -883,11 +1076,34 @@ impl Runtime {
 
         // --- 5. LEAD / TB-303 (bit 4) ---
         if (section_mask & 0b010000) != 0 {
-            let seq = &pat.tb303;
-            let st = seq.steps[global % seq.step_count.as_usize()];
+            let seq = if p.party_mode { &self.party_melodic.3 } else { &pat.tb303 };
+            let mut st = seq.steps[global % seq.step_count.as_usize()];
+            // Party Mode evolving acid/lead riffs locked to the active chord & section!
+            if p.party_mode && (party_phrase > 0 || self.party_section_idx >= 2) {
+                let step16 = global % 16;
+                let motif_hit = hash_f32(seed, step16, 41) < (0.28 + party_section_energy * 0.35);
+                if motif_hit {
+                    let tone = arp_tones[((step16 + self.party_section_idx) * 2) % arp_tones.len().max(1)];
+                    // Keep 303 in its punchy midrange (octave shift up on Drop 2)
+                    let target_base = if self.party_section_idx == 5 { 60 } else { 48 };
+                    let note = target_base + (tone % 12);
+                    st = MelodicStep {
+                        active: true,
+                        note: note.clamp(36, 76),
+                        velocity: if step16 % 4 == 0 { 0.88 } else { 0.72 },
+                        gate: if hash_f32(seed, step16, 42) < 0.35 { 1.3 } else { 0.65 },
+                        accent: hash_f32(seed, step16, 43) < 0.28,
+                        slide: hash_f32(seed, step16, 44) < 0.25,
+                        ..Default::default()
+                    };
+                } else if party_phrase % 2 == 1 {
+                    st.active = false;
+                }
+            }
             if st.active {
                 let note = if follow_override {
-                    bass_root + (st.note % 12)
+                    let tone = arp_tones[global % arp_tones.len().max(1)];
+                    (bass_root + 12 + (tone % 12)).clamp(36, 76)
                 } else {
                     st.note
                 };
@@ -910,11 +1126,11 @@ impl Runtime {
 
         // --- 6. SAMPLER / 8-PART VOLCA BANK (bit 5) ---
         if (section_mask & 0b100000) != 0 {
-            let seq = &pat.sampler;
+            let seq = if p.party_mode { &self.party_melodic.4 } else { &pat.sampler };
             let st = seq.steps[global % seq.step_count.as_usize()];
             if st.active {
                 let note = if follow_override {
-                    (48 + (p.root_note + active_slot.offset) % 12).clamp(48, 66)
+                    (48 + (dj_root + active_slot.offset) % 12).clamp(48, 66)
                 } else {
                     st.note
                 };
@@ -972,6 +1188,7 @@ impl Runtime {
             self.party_section_idx = 0;
             self.party_bar_in_sec = 0;
             self.party_cycle = 0;
+            self.party_evolution = 0;
             self.party_filter_mod = 1.0;
         }
         if !playing && self.was_playing {
@@ -1555,9 +1772,12 @@ mod tests {
 
     #[test]
     fn party_mode_evolves_cleanly() {
+        use std::collections::HashSet;
+
         let mut p = Project::default();
         apply_vibe_to_project(&mut p, Vibe::ElectroFunk, None, 0x9999);
         p.party_mode = true;
+        p.party_auto_evolve = true;
         let mut rt = Runtime::new(44_100.0);
         let mut tel = EngineTelemetry::default();
         let mut max_amp = 0.0_f32;
@@ -1569,6 +1789,45 @@ mod tests {
         assert!(max_amp > 0.05);
         assert!(!tel.active_chord.is_empty());
         assert!(!tel.party_section.is_empty());
+
+        // Step across 40 bars (640 steps) and verify sections, progressions, drum grooves, and full DJ songs actually evolve
+        let mut seen_sections = HashSet::new();
+        let mut seen_drum_sigs = HashSet::new();
+        let mut seen_melodic_sigs = HashSet::new();
+        let mut seen_song_titles = HashSet::new();
+        for _ in 0..640 {
+            rt.trigger_step(&p, false, false, &mut tel);
+            rt.step = rt.step.wrapping_add(1);
+            seen_sections.insert(tel.party_section.clone());
+            seen_drum_sigs.insert(rt.auto_beat_sig);
+            seen_melodic_sigs.insert(rt.party_melodic_sig);
+            seen_song_titles.insert(tel.party_song_title.clone());
+        }
+        assert!(
+            seen_sections.len() >= 6,
+            "Expected all 6 party sections, got {:?}",
+            seen_sections
+        );
+        assert!(
+            rt.party_evolution >= 3,
+            "Expected progression evolution >= 3 over 40 bars, got {}",
+            rt.party_evolution
+        );
+        assert!(
+            seen_drum_sigs.len() >= 6,
+            "Expected fresh drum grooves across phrases/sections, got only {}",
+            seen_drum_sigs.len()
+        );
+        assert!(
+            seen_melodic_sigs.len() >= 3,
+            "Expected Party DJ to generate fresh melodic arrangements as it transitions, got {}",
+            seen_melodic_sigs.len()
+        );
+        assert!(
+            seen_song_titles.len() >= 2,
+            "Expected Party DJ to transition to a new song after a full 36-bar cycle, got {:?}",
+            seen_song_titles
+        );
     }
 
     #[test]
@@ -1615,10 +1874,26 @@ mod tests {
         }
         assert_eq!(PROGRESSIONS.len(), 20);
 
-        // 4. Every FactoryPreset builds cleanly
+        // 4. Every FactoryPreset builds cleanly, and drum voice names adapt to 808/909 models
         for &fp in &FactoryPreset::ALL {
             let proj = Project::factory(fp);
             assert!(!proj.name.is_empty());
         }
+        assert_eq!(
+            DrumVoiceId::CowbellRim.short_name_for_model( crate::model::DrumModel::Tr808),
+            "COWBELL"
+        );
+        assert_eq!(
+            DrumVoiceId::CowbellRim.short_name_for_model(crate::model::DrumModel::Tr909),
+            "RIMSHOT"
+        );
+        assert_eq!(
+            DrumVoiceId::CowbellRim.full_name_for_model(crate::model::DrumModel::Tr808),
+            "TR-808 Cowbell"
+        );
+        assert_eq!(
+            DrumVoiceId::CowbellRim.full_name_for_model(crate::model::DrumModel::Tr909),
+            "TR-909 Rimshot"
+        );
     }
 }

@@ -373,11 +373,23 @@ impl DrumVoiceId {
             DrumVoiceId::Kick => "KICK",
             DrumVoiceId::Snare => "SNARE",
             DrumVoiceId::Clap => "CLAP",
-            DrumVoiceId::CowbellRim => "RIM",
+            DrumVoiceId::CowbellRim => "COWBELL",
             DrumVoiceId::ClosedHat => "C.HAT",
             DrumVoiceId::OpenHat => "O.HAT",
             DrumVoiceId::Tom => "TOM",
             DrumVoiceId::Cymbal => "CYM",
+        }
+    }
+
+    pub const fn short_name_for_model(self, model: super::DrumModel) -> &'static str {
+        match (self, model) {
+            (DrumVoiceId::Kick, super::DrumModel::Tr808) => "808 KICK",
+            (DrumVoiceId::Kick, super::DrumModel::Tr909) => "909 KICK",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Tr808) => "COWBELL",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Tr909) => "RIMSHOT",
+            (DrumVoiceId::Cymbal, super::DrumModel::Tr808) => "808 CYM",
+            (DrumVoiceId::Cymbal, super::DrumModel::Tr909) => "CRASH",
+            _ => self.short_name(),
         }
     }
 
@@ -386,11 +398,32 @@ impl DrumVoiceId {
             DrumVoiceId::Kick => "Bass Drum",
             DrumVoiceId::Snare => "Snare Drum",
             DrumVoiceId::Clap => "Hand Clap",
-            DrumVoiceId::CowbellRim => "Cowbell / Rim",
+            DrumVoiceId::CowbellRim => "808 Cowbell / 909 Rimshot",
             DrumVoiceId::ClosedHat => "Closed Hi-Hat",
             DrumVoiceId::OpenHat => "Open Hi-Hat",
             DrumVoiceId::Tom => "Tom",
             DrumVoiceId::Cymbal => "Crash / Ride",
+        }
+    }
+
+    pub const fn full_name_for_model(self, model: super::DrumModel) -> &'static str {
+        match (self, model) {
+            (DrumVoiceId::Kick, super::DrumModel::Tr808) => "TR-808 Bass Drum",
+            (DrumVoiceId::Kick, super::DrumModel::Tr909) => "TR-909 Bass Drum",
+            (DrumVoiceId::Snare, super::DrumModel::Tr808) => "TR-808 Snare Drum",
+            (DrumVoiceId::Snare, super::DrumModel::Tr909) => "TR-909 Snare Drum",
+            (DrumVoiceId::Clap, super::DrumModel::Tr808) => "TR-808 Hand Clap",
+            (DrumVoiceId::Clap, super::DrumModel::Tr909) => "TR-909 Hand Clap",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Tr808) => "TR-808 Cowbell",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Tr909) => "TR-909 Rimshot",
+            (DrumVoiceId::ClosedHat, super::DrumModel::Tr808) => "TR-808 Closed Hi-Hat",
+            (DrumVoiceId::ClosedHat, super::DrumModel::Tr909) => "TR-909 Closed Hi-Hat",
+            (DrumVoiceId::OpenHat, super::DrumModel::Tr808) => "TR-808 Open Hi-Hat",
+            (DrumVoiceId::OpenHat, super::DrumModel::Tr909) => "TR-909 Open Hi-Hat",
+            (DrumVoiceId::Tom, super::DrumModel::Tr808) => "TR-808 Conga / Tom",
+            (DrumVoiceId::Tom, super::DrumModel::Tr909) => "TR-909 Low / Mid Tom",
+            (DrumVoiceId::Cymbal, super::DrumModel::Tr808) => "TR-808 Cymbal",
+            (DrumVoiceId::Cymbal, super::DrumModel::Tr909) => "TR-909 Crash / Ride",
         }
     }
 }

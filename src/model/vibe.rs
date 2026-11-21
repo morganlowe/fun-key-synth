@@ -476,6 +476,58 @@ pub fn progression_at(idx: usize) -> &'static ChordProgression {
     &PROGRESSIONS[idx % PROGRESSIONS.len()]
 }
 
+/// Curated chord progression indices that fit each Vibe's genre so Party DJ Mode
+/// mixes through authentic genre-matched songs instead of out-of-style progressions.
+pub const fn vibe_progressions(vibe: Vibe) -> &'static [usize] {
+    match vibe {
+        Vibe::DeepHouse => &[0, 1, 7, 11, 12],
+        Vibe::ElectroFunk => &[3, 14, 9, 11],
+        Vibe::LofiChill => &[4, 11, 16, 0],
+        Vibe::ElectroSoul => &[1, 7, 11, 0, 19],
+        Vibe::Synthwave => &[2, 12, 8, 13, 1],
+        Vibe::AcidClub => &[5, 6, 17, 2],
+        Vibe::AmbientDub => &[6, 0, 12, 5],
+        Vibe::UkGarage => &[0, 11, 3, 1, 4],
+        Vibe::JungleDnb => &[6, 12, 2, 0],
+        Vibe::DetroitTechno => &[5, 6, 0, 12],
+        Vibe::DreamPop => &[7, 1, 8, 15, 19],
+        Vibe::Disco70s => &[9, 3, 11, 13],
+        Vibe::Arena80s => &[8, 2, 7, 10, 15],
+        Vibe::IndieRock => &[10, 8, 2, 1],
+        Vibe::NeoSoul => &[11, 4, 0, 16, 3],
+        Vibe::ItaloCosmic => &[13, 2, 9, 12],
+        Vibe::BoomBap => &[16, 4, 11, 0],
+        Vibe::Trap808 => &[17, 12, 5, 18],
+        Vibe::Dubstep => &[18, 17, 5, 6],
+        Vibe::BigRoomEdm => &[1, 15, 7, 8, 19],
+        Vibe::FutureBass => &[19, 7, 1, 11, 15],
+        Vibe::EuphoricTrance => &[15, 7, 1, 19, 2],
+    }
+}
+
+/// Generates a stylish DJ track title for Party Mode based on the Vibe and song number.
+pub fn party_song_title(vibe: Vibe, song_idx: u32, root_note: u8) -> String {
+    const ADJ: [&str; 12] = [
+        "Midnight", "Neon", "Velvet", "Electric", "Cosmic", "Golden",
+        "Underground", "Solar", "Crystal", "Analogue", "Hyper", "Sunset",
+    ];
+    const NOUN: [&str; 12] = [
+        "Groove", "Odyssey", "Pulse", "Mirage", "Horizon", "Bounce",
+        "Warehouse", "Dream", "Anthem", "Session", "Cascade", "Vortex",
+    ];
+    let h = song_idx.wrapping_mul(2654435761) ^ (vibe as u32).wrapping_mul(97);
+    let a = ADJ[(h as usize) % ADJ.len()];
+    let n = NOUN[((h >> 4) as usize) % NOUN.len()];
+    format!(
+        "#{} \"{} {}\" ({} • {})",
+        song_idx + 1,
+        a,
+        n,
+        vibe.name(),
+        root_name(root_note)
+    )
+}
+
 /// Returns the human-readable chord symbol (e.g. "Am9", "Fmaj9").
 pub fn chord_symbol(root_pc: u8, slot: ChordSlot) -> String {
     let pc = (root_pc + slot.offset) % 12;

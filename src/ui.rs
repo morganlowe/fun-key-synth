@@ -6,11 +6,11 @@ use crate::{
     model::{
         apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads,
         generate_auto_beat, generate_extra_track_seq, generate_melodic_tracks, load_pattern,
-        load_project, note_name, root_name, save_pattern, save_project, voice_preset_names,
-        AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack,
-        GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MonologueOscWave, MoogWave,
-        Osc2ModMode, Project, SamplerMode, SavedSample, Scale, SongSection, Tb303Wave, TrackId,
-        Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
+        load_project, note_name, root_name, save_pattern, save_project, vibe_progressions,
+        voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId,
+        EgTarget, ExtraTrack, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
+        MonologueOscWave, MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, Scale,
+        SongSection, Tb303Wave, TrackId, Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
         restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
@@ -660,19 +660,49 @@ impl eframe::App for FunKeySynthApp {
                     );
                     if toggle_pill(
                         ui,
-                        if proj.party_mode { "PARTY ON" } else { "PARTY MODE" },
+                        if proj.party_mode { "PARTY DJ ON" } else { "PARTY DJ" },
                         &mut proj.party_mode,
                         Color32::from_rgb(244, 92, 186),
-                        "Generates and evolves full tracks on the fly for your chosen Vibe!",
+                        "Party DJ Mode: continuously generates, plays, and mixes into new songs in your chosen Vibe!",
                     ) && proj.party_mode
                         && !playing
                     {
                         self.engine.playing.store(true, Ordering::Relaxed);
                     }
+                    if proj.party_mode {
+                        if ui
+                            .button("Next Song ⏭")
+                            .on_hover_text("DJ mix into a fresh generated song in this genre right now!")
+                            .clicked()
+                        {
+                            let seed = self.next_seed();
+                            let v_progs = vibe_progressions(proj.vibe);
+                            let next_pos = (v_progs
+                                .iter()
+                                .position(|&pi| pi == proj.progression_idx)
+                                .unwrap_or(0)
+                                + 1)
+                                % v_progs.len().max(1);
+                            let cur_vibe = proj.vibe;
+                            apply_vibe_to_project(&mut proj, cur_vibe, Some(v_progs[next_pos]), seed);
+                            proj.party_mode = true;
+                            self.engine.send_live(LiveEvent::NextPartySong);
+                            self.engine.playing.store(true, Ordering::Relaxed);
+                        }
+                    }
 
                     // Live Chord Readout Badge
                     let chord_text = if telemetry.active_chord.is_empty() {
                         "Ready".to_string()
+                    } else if !telemetry.party_song_title.is_empty() {
+                        format!(
+                            "DJ {}  •  {} {}/{}  •  {}",
+                            telemetry.party_song_title,
+                            telemetry.party_section,
+                            telemetry.party_bar,
+                            telemetry.party_section_bars,
+                            telemetry.active_chord
+                        )
                     } else if !telemetry.party_section.is_empty() {
                         format!(
                             "{}  •  {} {}/{}",
@@ -2026,7 +2056,7 @@ impl FunKeySynthApp {
                         )
                     } else {
                         (
-                            format!("{} SEQUENCER", self.selected_track.role_name()),
+                            format!("{} SEQUENCER", self.selected_track.track_instrument_title(proj)),
                             track_color(self.selected_track),
                         )
                     };
@@ -2146,13 +2176,16 @@ impl FunKeySynthApp {
 
                         // 8-lane compact Drum Beat Grid (16 steps per bar page)
                         let active_pat = proj.active_pattern;
-                        let cell_w = ((ui.available_width() - 62.0 - 15.0 * 3.0) / 16.0).clamp(18.0, 34.0);
+                        let cell_w = ((ui.available_width() - 68.0 - 15.0 * 3.0) / 16.0).clamp(18.0, 34.0);
                         let cell_h = 22.0;
                         let mut solo_drum_lane: Option<usize> = None;
                         let mut unmute_all_drums = false;
 
                         for lane_idx in 0..8 {
                             let voice = DrumVoiceId::from_index(lane_idx).unwrap();
+                            let v_model = proj.drums.voices[lane_idx].model;
+                            let v_short = voice.short_name_for_model(v_model);
+                            let v_full = voice.full_name_for_model(v_model);
                             let is_muted = proj.drums.voices[lane_idx].mute;
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;
@@ -2160,11 +2193,11 @@ impl FunKeySynthApp {
                                 // Clickable drum voice label: Left-click = Mute, Right-click = Full Voice Options & Tuning!
                                 let lbl_btn = egui::Button::new(
                                     RichText::new(if is_muted {
-                                        format!("X {}", voice.short_name())
+                                        format!("X {v_short}")
                                     } else {
-                                        voice.short_name().to_string()
+                                        v_short.to_string()
                                     })
-                                    .size(10.5)
+                                    .size(10.0)
                                     .strong()
                                     .color(if is_muted {
                                         Color32::from_rgb(115, 122, 140)
@@ -2177,17 +2210,17 @@ impl FunKeySynthApp {
                                 } else {
                                     Color32::from_rgb(24, 29, 42)
                                 })
-                                .min_size(Vec2::new(54.0, cell_h));
+                                .min_size(Vec2::new(60.0, cell_h));
 
                                 let lbl_resp = ui
                                     .add(lbl_btn)
-                                    .on_hover_text("Left-click: Mute/Unmute  •  Right-click: Tune, 808/909 & Fill options");
+                                    .on_hover_text(format!("{v_full} — Left-click: Mute/Unmute  •  Right-click: Tune, 808/909 & Fill options"));
                                 if lbl_resp.clicked() {
                                     proj.drums.voices[lane_idx].mute = !proj.drums.voices[lane_idx].mute;
                                 }
                                 lbl_resp.context_menu(|ui| {
                                     ui.set_min_width(220.0);
-                                    ui.label(RichText::new(voice.full_name()).strong().color(tc));
+                                    ui.label(RichText::new(v_full).strong().color(tc));
                                     ui.separator();
                                     ui.horizontal(|ui| {
                                         if ui.button("Audition").clicked() {
@@ -2300,7 +2333,7 @@ impl FunKeySynthApp {
                                     }
                                     resp.context_menu(|ui| {
                                         ui.set_min_width(190.0);
-                                        ui.label(RichText::new(format!("{} — Step {}", voice.short_name(), idx + 1)).strong().color(tc));
+                                        ui.label(RichText::new(format!("{v_short} — Step {}", idx + 1)).strong().color(tc));
                                         ui.separator();
                                         ui.horizontal(|ui| {
                                             ui.label("Ratchet:");
@@ -2371,19 +2404,24 @@ impl FunKeySynthApp {
                         });
                         ui.add_space(4.0);
                         let active_pat = proj.active_pattern;
-                        let cell_w = ((ui.available_width() - 62.0 - 15.0 * 3.0) / 16.0).clamp(18.0, 34.0);
+                        let cell_w = ((ui.available_width() - 68.0 - 15.0 * 3.0) / 16.0).clamp(18.0, 34.0);
                         let cell_h = 22.0;
                         for part_idx in 0..8 {
                             let is_muted = proj.sample_parts[part_idx].mute;
+                            let short_name: String = proj.sample_parts[part_idx]
+                                .name
+                                .chars()
+                                .take(7)
+                                .collect();
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 3.0;
                                 let lbl = egui::Button::new(
                                     RichText::new(if is_muted {
-                                        format!("X P{}", part_idx + 1)
+                                        format!("X {short_name}")
                                     } else {
-                                        format!("P{}", part_idx + 1)
+                                        short_name.clone()
                                     })
-                                    .size(10.5)
+                                    .size(10.0)
                                     .strong()
                                     .color(if is_muted { Color32::GRAY } else { tc }),
                                 )
@@ -2392,10 +2430,10 @@ impl FunKeySynthApp {
                                 } else {
                                     Color32::from_rgb(24, 29, 42)
                                 })
-                                .min_size(Vec2::new(54.0, cell_h));
+                                .min_size(Vec2::new(60.0, cell_h));
                                 if ui
                                     .add(lbl)
-                                    .on_hover_text(format!("{} — Click to Mute/Unmute", proj.sample_parts[part_idx].name))
+                                    .on_hover_text(format!("Pad {} ({}) — Click to Mute/Unmute", part_idx + 1, proj.sample_parts[part_idx].name))
                                     .clicked()
                                 {
                                     proj.sample_parts[part_idx].mute = !proj.sample_parts[part_idx].mute;
@@ -2793,11 +2831,11 @@ impl FunKeySynthApp {
         playing: bool,
         accent: Color32,
     ) {
-        // 1. PARTY MODE DIRECTOR CARD
+        // 1. PARTY DJ MODE DIRECTOR CARD
         card_frame(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new("PARTY MODE — LOCAL VIBE SONG GENERATOR")
+                    RichText::new("PARTY DJ MODE — CONTINUOUS GENRE SONG MIXER")
                         .strong()
                         .size(14.0)
                         .color(Color32::from_rgb(244, 92, 186)),
@@ -2805,26 +2843,34 @@ impl FunKeySynthApp {
                 ui.separator();
                 if toggle_pill(
                     ui,
-                    if proj.party_mode { "PARTY ACTIVE" } else { "START PARTY" },
+                    if proj.party_mode { "PARTY DJ ACTIVE" } else { "START PARTY DJ" },
                     &mut proj.party_mode,
                     Color32::from_rgb(244, 92, 186),
-                    "Automatically cycles Intro -> Groove -> Build -> Drop -> Break -> Drop 2 in your Vibe!",
+                    "Generates full songs in your chosen Vibe (Intro -> Groove -> Build -> Drop -> Break -> Drop 2) and automatically mixes into a brand-new song at the end of each cycle!",
                 ) && proj.party_mode
                     && !playing
                 {
                     self.engine.playing.store(true, Ordering::Relaxed);
                 }
-                if ui.button("Next Section").clicked() {
+                if ui.button("Next Section").on_hover_text("Jump to the next section of the current song").clicked() {
                     self.engine.send_live(LiveEvent::NextPartySection);
                 }
-                if ui.button("Drop Now").clicked() {
+                if ui.button("Drop Now").on_hover_text("Fire a key-locked sub bass drop right now").clicked() {
                     self.engine.send_live(LiveEvent::TriggerBassDrop);
                 }
-                if ui.button("Fresh Party Song").clicked() {
+                if ui.button("Mix Next Song ⏭").on_hover_text("Generate a brand-new song in the chosen genre and DJ-transition into it right now!").clicked() {
                     let seed = self.next_seed();
-                    let next_prog = (proj.progression_idx + 1) % PROGRESSIONS.len();
-                    apply_vibe_to_project(proj, proj.vibe, Some(next_prog), seed);
+                    let v_progs = vibe_progressions(proj.vibe);
+                    let next_pos = (v_progs
+                        .iter()
+                        .position(|&pi| pi == proj.progression_idx)
+                        .unwrap_or(0)
+                        + 1)
+                        % v_progs.len().max(1);
+                    let cur_vibe = proj.vibe;
+                    apply_vibe_to_project(proj, cur_vibe, Some(v_progs[next_pos]), seed);
                     proj.party_mode = true;
+                    self.engine.send_live(LiveEvent::NextPartySong);
                     self.engine.playing.store(true, Ordering::Relaxed);
                 }
             });
@@ -2833,7 +2879,7 @@ impl FunKeySynthApp {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Party Energy:");
                 ui.add(egui::Slider::new(&mut proj.party_energy, 0.15..=1.0).max_decimals(2));
-                ui.checkbox(&mut proj.party_auto_evolve, "Auto-Evolve Progressions");
+                ui.checkbox(&mut proj.party_auto_evolve, "Auto-Mix New Songs & Progressions");
                 ui.separator();
                 ui.label("Chord Speed:");
                 for &bpc in &[1u8, 2, 4] {
@@ -2845,8 +2891,16 @@ impl FunKeySynthApp {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(format!(
-                        "LIVE: {}  •  Bar {} / {}  •  Active Chord: {}",
-                        tel.party_section, tel.party_bar, tel.party_section_bars, tel.active_chord
+                        "NOW PLAYING: {}  •  Section: {} (Bar {} / {})  •  Active Chord: {}",
+                        if tel.party_song_title.is_empty() {
+                            proj.vibe.name()
+                        } else {
+                            &tel.party_song_title
+                        },
+                        tel.party_section,
+                        tel.party_bar,
+                        tel.party_section_bars,
+                        tel.active_chord
                     ))
                     .strong()
                     .color(accent),
@@ -3113,7 +3167,9 @@ impl FunKeySynthApp {
                             ui.add(egui::Slider::new(&mut proj.drums.accent_level, 0.0..=1.0).text("Global Accent"));
                             ui.separator();
                             for (i, v) in proj.drums.voices.iter_mut().enumerate() {
-                                let name = DrumVoiceId::from_index(i).map(|d| d.full_name()).unwrap_or("Drum");
+                                let name = DrumVoiceId::from_index(i)
+                                    .map(|d| d.full_name_for_model(v.model))
+                                    .unwrap_or("Drum");
                                 egui::CollapsingHeader::new(
                                     RichText::new(format!(
                                         "{}  [{}]{}",

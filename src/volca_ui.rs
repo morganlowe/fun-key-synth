@@ -573,22 +573,27 @@ pub fn render_volca_sampler(
                 let page_start = (*bar_page) * 16;
                 let play_step = if playing { Some(cur_step % 64) } else { None };
                 let active_pat = proj.active_pattern;
-                let cell_w = ((ui.available_width() - 62.0 - 15.0 * 3.0) / 16.0).clamp(16.0, 34.0);
+                let cell_w = ((ui.available_width() - 68.0 - 15.0 * 3.0) / 16.0).clamp(16.0, 34.0);
                 let cell_h = 22.0;
 
                 for part_idx in 0..8 {
                     let pc = PAD_COLORS[part_idx];
                     let is_muted = proj.sample_parts[part_idx].mute;
                     let is_sel = sel == part_idx;
+                    let short_name: String = proj.sample_parts[part_idx]
+                        .name
+                        .chars()
+                        .take(7)
+                        .collect();
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
                         let lbl = egui::Button::new(
                             RichText::new(if is_muted {
-                                format!("X P{}", part_idx + 1)
+                                format!("X {short_name}")
                             } else {
-                                format!("P{}", part_idx + 1)
+                                short_name.clone()
                             })
-                            .size(10.5)
+                            .size(10.0)
                             .strong()
                             .color(if is_muted {
                                 Color32::from_rgb(115, 122, 140)
@@ -605,7 +610,7 @@ pub fn render_volca_sampler(
                         } else {
                             Color32::from_rgb(24, 29, 42)
                         })
-                        .min_size(Vec2::new(50.0, cell_h));
+                        .min_size(Vec2::new(60.0, cell_h));
 
                         let lresp = ui.add(lbl);
                         if lresp.clicked() {

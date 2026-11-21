@@ -19,8 +19,9 @@ pub use sequencer::{
 pub use vibe::{
     apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, arp_tones_for,
     bass_midi_for, build_auto_chord_pads, chord_symbol, default_vibe_sections, generate_auto_beat,
-    generate_extra_track_seq, generate_melodic_tracks, progression_at, voice_led_chord,
-    voice_preset_names, AutoChordPad, ChordProgression, ChordSlot, Vibe, PROGRESSIONS,
+    generate_extra_track_seq, generate_melodic_tracks, party_song_title, progression_at,
+    vibe_progressions, voice_led_chord, voice_preset_names, AutoChordPad, ChordProgression,
+    ChordSlot, Vibe, PROGRESSIONS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,6 +104,35 @@ impl TrackId {
             TrackId::Tb303 => "LEAD / 303",
             TrackId::Sampler => "SAMPLER",
             TrackId::MidiOut => "MIDI",
+        }
+    }
+
+    pub const fn studio_index(self) -> Option<usize> {
+        match self {
+            TrackId::Drums => Some(0),
+            TrackId::Moog => Some(1),
+            TrackId::MoogPad => Some(2),
+            TrackId::Monologue => Some(3),
+            TrackId::Tb303 => Some(4),
+            TrackId::Sampler => Some(5),
+            TrackId::MidiOut => None,
+        }
+    }
+
+    /// Context-aware track & instrument title that combines the track's role with its active instrument preset.
+    pub fn track_instrument_title(self, p: &Project) -> String {
+        if self == TrackId::Sampler {
+            if p.sample_parts[0].sample.builtin_id.is_none() {
+                format!("SAMPLER ({})", p.sample_parts[0].name)
+            } else {
+                format!("SAMPLER ({})", p.sample_data.name)
+            }
+        } else if let Some(s_idx) = self.studio_index() {
+            let presets = voice_preset_names(self);
+            let pname = presets[p.voice_presets[s_idx] % presets.len().max(1)];
+            format!("{} — {}", self.role_name(), pname)
+        } else {
+            self.role_name().to_string()
         }
     }
 
