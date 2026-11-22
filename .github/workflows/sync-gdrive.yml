@@ -2,7 +2,7 @@ name: Sync Latest Release to Google Drive
 
 on:
   workflow_run:
-    workflows: ["Release Windows Binary"]
+    workflows: ["Release Packages"]
     types: [completed]
   release:
     types: [published, edited]

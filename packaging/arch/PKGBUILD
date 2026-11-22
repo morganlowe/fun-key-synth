@@ -7,6 +7,7 @@ url="https://github.com/morganlowe/fun-key-synth"
 license=('GPL-3.0-or-later')
 depends=('alsa-lib' 'libxkbcommon' 'wayland' 'libglvnd')
 makedepends=('cargo' 'rust')
+options=('!debug' '!lto')
 
 build() {
     cd "$startdir/../.."
@@ -19,4 +20,7 @@ package() {
     install -Dm644 "packaging/fun-key-synth.desktop" "$pkgdir/usr/share/applications/fun-key-synth.desktop"
     install -Dm644 "packaging/fun-key-synth.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/fun-key-synth.png"
     install -Dm644 "README.md" "$pkgdir/usr/share/doc/fun-key-synth/README.md"
+    if [ -f "LICENSE" ]; then
+        install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/fun-key-synth/LICENSE"
+    fi
 }
