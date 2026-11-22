@@ -37,8 +37,9 @@ jobs:
           VER="${VER#V}"
           HOST_UID="$(id -u)"
           HOST_GID="$(id -g)"
+          export VER HOST_UID HOST_GID
           docker run --rm \
-            -e TAG -e VER -e HOST_UID -e HOST_GID \
+            -e TAG="$TAG" -e VER="$VER" -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" \
             -v "$PWD:/work" -w /work \
             ubuntu:22.04 bash -euxo pipefail -c '
               DEBIAN_FRONTEND=noninteractive apt-get update
@@ -91,8 +92,9 @@ jobs:
           VER="${VER#V}"
           HOST_UID="$(id -u)"
           HOST_GID="$(id -g)"
+          export VER HOST_UID HOST_GID
           docker run --rm \
-            -e VER -e HOST_UID -e HOST_GID \
+            -e VER="$VER" -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" \
             -v "$PWD:/work" -w /work \
             almalinux:9 bash -euxo pipefail -c '
               dnf install -y gcc gcc-c++ pkgconf-pkg-config alsa-lib-devel rpm-build binutils tar
@@ -142,8 +144,9 @@ jobs:
           VER="${VER#V}"
           HOST_UID="$(id -u)"
           HOST_GID="$(id -g)"
+          export VER HOST_UID HOST_GID
           docker run --rm \
-            -e VER -e HOST_UID -e HOST_GID \
+            -e VER="$VER" -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" \
             -v "$PWD:/work" -w /work \
             archlinux:latest bash -euxo pipefail -c '
               pacman -Syu --noconfirm --needed base-devel rust alsa-lib libxkbcommon wayland libglvnd
