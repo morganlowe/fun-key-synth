@@ -1047,6 +1047,58 @@ impl Default for MidiSettings {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum PartyMixMode {
+    SingleVibe,
+    #[default]
+    RelatedVibes,
+    AllVibes,
+}
+
+impl PartyMixMode {
+    pub const ALL: [PartyMixMode; 3] = [
+        PartyMixMode::SingleVibe,
+        PartyMixMode::RelatedVibes,
+        PartyMixMode::AllVibes,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            PartyMixMode::SingleVibe => "Same Vibe",
+            PartyMixMode::RelatedVibes => "Related Vibes",
+            PartyMixMode::AllVibes => "All Vibes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum PartyPace {
+    Fast,
+    #[default]
+    Normal,
+    Extended,
+}
+
+impl PartyPace {
+    pub const ALL: [PartyPace; 3] = [
+        PartyPace::Fast,
+        PartyPace::Normal,
+        PartyPace::Extended,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            PartyPace::Fast => "Fast",
+            PartyPace::Normal => "Normal",
+            PartyPace::Extended => "Extended",
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Project {
@@ -1066,6 +1118,12 @@ pub struct Project {
     pub sidechain_amount: f32,
     pub party_energy: f32,
     pub party_auto_evolve: bool,
+    #[serde(default)]
+    pub party_mix_mode: PartyMixMode,
+    #[serde(default)]
+    pub party_pace: PartyPace,
+    #[serde(default = "default_true")]
+    pub party_sound_morph: bool,
     pub voice_presets: [usize; 6],
     #[serde(default = "default_active_tracks")]
     pub active_tracks: [bool; 6],
@@ -1100,7 +1158,7 @@ fn default_active_tracks() -> [bool; 6] {
 impl Default for Project {
     fn default() -> Self {
         let mut p = Self::factory(FactoryPreset::BlankInit);
-        super::apply_vibe_to_project(&mut p, super::Vibe::DeepHouse, None, 0xF00D_5EED);
+        super::apply_vibe_to_project(&mut p, super::Vibe::ElectroFunk, None, 0xF00D_5EED);
         p
     }
 }
@@ -1379,8 +1437,8 @@ impl Project {
             bpm: 122.0,
             swing: 0.12,
             root_note: 9, // A
-            scale: Scale::Minor,
-            vibe: super::Vibe::DeepHouse,
+            scale: Scale::Dorian,
+            vibe: super::Vibe::ElectroFunk,
             progression_idx: 0,
             bars_per_chord: 1,
             auto_chord_mode: true,
@@ -1390,6 +1448,9 @@ impl Project {
             sidechain_amount: 0.55,
             party_energy: 0.70,
             party_auto_evolve: true,
+            party_mix_mode: PartyMixMode::RelatedVibes,
+            party_pace: PartyPace::Normal,
+            party_sound_morph: true,
             voice_presets: [0; 6],
             active_tracks: [true; 6],
             extra_tracks: Vec::new(),

@@ -8,9 +8,9 @@ pub use project::{
     load_pattern, load_project, save_pattern, save_project, DelayDivision, DrumKitParams,
     DrumModel, DrumVoiceParams, EgTarget, ExtraTrack, FactoryPreset, FxParams, GlobalFilterMode,
     LfoMode, LfoTarget, LfoWave, LoopMode, MidiSettings, MixerParams, MonologueOscWave,
-    MonologueParams, MoogParams, MoogWave, Osc2ModMode, Project, SamplePart, SamplerMode,
-    SamplerParams, SavedSample, SongSection, Tb303Params, Tb303Wave, TrackMixerChannel,
-    MAX_EXTRA_TRACKS,
+    MonologueParams, MoogParams, MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project,
+    SamplePart, SamplerMode, SamplerParams, SavedSample, SongSection, Tb303Params, Tb303Wave,
+    TrackMixerChannel, MAX_EXTRA_TRACKS,
 };
 pub use sequencer::{
     euclidean_rhythm, ChordType, DrumLane, DrumStep, DrumTrackSeq, DrumVoiceId, MelodicStep,
@@ -18,10 +18,11 @@ pub use sequencer::{
 };
 pub use vibe::{
     apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, arp_tones_for,
-    bass_midi_for, build_auto_chord_pads, chord_symbol, default_vibe_sections, generate_auto_beat,
-    generate_extra_track_seq, generate_melodic_tracks, party_song_title, progression_at,
-    vibe_progressions, voice_led_chord, voice_preset_names, AutoChordPad, ChordProgression,
-    ChordSlot, Vibe, PROGRESSIONS,
+    bass_midi_for, build_auto_chord_pads, build_party_song_rig, chord_symbol,
+    default_vibe_sections, generate_auto_beat, generate_extra_track_seq, generate_melodic_tracks,
+    party_song_title, pick_party_vibe, progression_at, vibe_neighbors, vibe_progressions,
+    voice_led_chord, voice_preset_names, AutoChordPad, ChordProgression, ChordSlot, PartySongRig,
+    Vibe, PROGRESSIONS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

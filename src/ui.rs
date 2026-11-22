@@ -6,11 +6,11 @@ use crate::{
     model::{
         apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads,
         generate_auto_beat, generate_extra_track_seq, generate_melodic_tracks, load_pattern,
-        load_project, note_name, root_name, save_pattern, save_project, vibe_progressions,
-        voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId,
-        EgTarget, ExtraTrack, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
-        MonologueOscWave, MoogWave, Osc2ModMode, Project, SamplerMode, SavedSample, Scale,
-        SongSection, Tb303Wave, TrackId, Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
+        load_project, note_name, root_name, save_pattern, save_project, voice_preset_names,
+        AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
+        MonologueOscWave, MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project, SamplerMode,
+        SavedSample, Scale, SongSection, Tb303Wave, TrackId, Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES,
+        PROGRESSIONS,
     },
     settings::{
         restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
@@ -672,19 +672,10 @@ impl eframe::App for FunKeySynthApp {
                     if proj.party_mode {
                         if ui
                             .button("Next Song ⏭")
-                            .on_hover_text("DJ mix into a fresh generated song in this genre right now!")
+                            .on_hover_text("DJ mix into a fresh generated song with new sounds, groove & arrangement right now!")
                             .clicked()
                         {
-                            let seed = self.next_seed();
-                            let v_progs = vibe_progressions(proj.vibe);
-                            let next_pos = (v_progs
-                                .iter()
-                                .position(|&pi| pi == proj.progression_idx)
-                                .unwrap_or(0)
-                                + 1)
-                                % v_progs.len().max(1);
-                            let cur_vibe = proj.vibe;
-                            apply_vibe_to_project(&mut proj, cur_vibe, Some(v_progs[next_pos]), seed);
+                            proj.party_seed = self.next_seed();
                             proj.party_mode = true;
                             self.engine.send_live(LiveEvent::NextPartySong);
                             self.engine.playing.store(true, Ordering::Relaxed);
@@ -695,9 +686,15 @@ impl eframe::App for FunKeySynthApp {
                     let chord_text = if telemetry.active_chord.is_empty() {
                         "Ready".to_string()
                     } else if !telemetry.party_song_title.is_empty() {
+                        let bpm_disp = if telemetry.party_bpm >= 40.0 {
+                            telemetry.party_bpm.round() as u32
+                        } else {
+                            proj.bpm.round() as u32
+                        };
                         format!(
-                            "DJ {}  •  {} {}/{}  •  {}",
+                            "DJ {}  •  {} BPM  •  {} {}/{}  •  {}",
                             telemetry.party_song_title,
+                            bpm_disp,
                             telemetry.party_section,
                             telemetry.party_bar,
                             telemetry.party_section_bars,
@@ -2858,17 +2855,8 @@ impl FunKeySynthApp {
                 if ui.button("Drop Now").on_hover_text("Fire a key-locked sub bass drop right now").clicked() {
                     self.engine.send_live(LiveEvent::TriggerBassDrop);
                 }
-                if ui.button("Mix Next Song ⏭").on_hover_text("Generate a brand-new song in the chosen genre and DJ-transition into it right now!").clicked() {
-                    let seed = self.next_seed();
-                    let v_progs = vibe_progressions(proj.vibe);
-                    let next_pos = (v_progs
-                        .iter()
-                        .position(|&pi| pi == proj.progression_idx)
-                        .unwrap_or(0)
-                        + 1)
-                        % v_progs.len().max(1);
-                    let cur_vibe = proj.vibe;
-                    apply_vibe_to_project(proj, cur_vibe, Some(v_progs[next_pos]), seed);
+                if ui.button("Mix Next Song ⏭").on_hover_text("Generate a brand-new song with fresh voice palette, groove & arrangement and DJ-transition into it right now!").clicked() {
+                    proj.party_seed = self.next_seed();
                     proj.party_mode = true;
                     self.engine.send_live(LiveEvent::NextPartySong);
                     self.engine.playing.store(true, Ordering::Relaxed);
@@ -2887,16 +2875,38 @@ impl FunKeySynthApp {
                 }
             });
 
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Mix:");
+                for &mode in &PartyMixMode::ALL {
+                    ui.selectable_value(&mut proj.party_mix_mode, mode, mode.name());
+                }
+                ui.separator();
+                ui.label("Pace:");
+                for &pace in &PartyPace::ALL {
+                    ui.selectable_value(&mut proj.party_pace, pace, pace.name());
+                }
+                ui.separator();
+                ui.checkbox(&mut proj.party_sound_morph, "Dynamic Sound Morph")
+                    .on_hover_text("Swaps synth/drum/sampler voice palettes between songs and dynamically sweeps filters, space FX, and timbres live!");
+            });
+
             if proj.party_mode {
+                let bpm_disp = if tel.party_bpm >= 40.0 {
+                    tel.party_bpm.round() as u32
+                } else {
+                    proj.bpm.round() as u32
+                };
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(format!(
-                        "NOW PLAYING: {}  •  Section: {} (Bar {} / {})  •  Active Chord: {}",
+                        "NOW PLAYING: {}  •  {} BPM  •  Section: {} (Bar {} / {})  •  Active Chord: {}",
                         if tel.party_song_title.is_empty() {
                             proj.vibe.name()
                         } else {
                             &tel.party_song_title
                         },
+                        bpm_disp,
                         tel.party_section,
                         tel.party_bar,
                         tel.party_section_bars,
@@ -2905,6 +2915,13 @@ impl FunKeySynthApp {
                     .strong()
                     .color(accent),
                 );
+                if !tel.party_palette.is_empty() {
+                    ui.label(
+                        RichText::new(format!("Live Rig: {}", tel.party_palette))
+                            .size(12.0)
+                            .color(Color32::from_rgb(176, 186, 206)),
+                    );
+                }
             }
         });
 

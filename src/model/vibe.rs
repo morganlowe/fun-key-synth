@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    root_name, ChordType, DelayDivision, DrumModel, DrumTrackSeq, DrumVoiceId, EgTarget,
-    GlobalFilterMode, LfoMode, LfoTarget, LfoWave, MelodicTrackSeq, MonologueOscWave, MoogWave,
-    Osc2ModMode, Project, SamplerMode, Scale, SongSection, StepCount, Tb303Wave, TrackId,
+    root_name, ChordType, DelayDivision, DrumKitParams, DrumModel, DrumTrackSeq, DrumVoiceId,
+    EgTarget, FactoryPreset, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, MelodicTrackSeq,
+    MonologueOscWave, MonologueParams, MoogParams, MoogWave, MotionLocks, Osc2ModMode,
+    PartyMixMode, Project, SamplerMode, SamplerParams, Scale, SongSection, StepCount, Tb303Params,
+    Tb303Wave, TrackId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -505,19 +507,224 @@ pub const fn vibe_progressions(vibe: Vibe) -> &'static [usize] {
     }
 }
 
+/// Returns 5 musically related neighbor vibes (starting with `vibe` itself)
+/// so Party DJ Mode can morph smoothly across adjacent genres without whiplash.
+pub const fn vibe_neighbors(vibe: Vibe) -> &'static [Vibe] {
+    match vibe {
+        Vibe::DeepHouse => &[
+            Vibe::DeepHouse,
+            Vibe::UkGarage,
+            Vibe::DetroitTechno,
+            Vibe::ElectroSoul,
+            Vibe::Disco70s,
+        ],
+        Vibe::ElectroFunk => &[
+            Vibe::ElectroFunk,
+            Vibe::Disco70s,
+            Vibe::ItaloCosmic,
+            Vibe::NeoSoul,
+            Vibe::BoomBap,
+        ],
+        Vibe::LofiChill => &[
+            Vibe::LofiChill,
+            Vibe::NeoSoul,
+            Vibe::BoomBap,
+            Vibe::DreamPop,
+            Vibe::AmbientDub,
+        ],
+        Vibe::ElectroSoul => &[
+            Vibe::ElectroSoul,
+            Vibe::DeepHouse,
+            Vibe::DreamPop,
+            Vibe::FutureBass,
+            Vibe::Synthwave,
+        ],
+        Vibe::Synthwave => &[
+            Vibe::Synthwave,
+            Vibe::Arena80s,
+            Vibe::ItaloCosmic,
+            Vibe::DreamPop,
+            Vibe::ElectroSoul,
+        ],
+        Vibe::AcidClub => &[
+            Vibe::AcidClub,
+            Vibe::DetroitTechno,
+            Vibe::BigRoomEdm,
+            Vibe::EuphoricTrance,
+            Vibe::ElectroFunk,
+        ],
+        Vibe::AmbientDub => &[
+            Vibe::AmbientDub,
+            Vibe::DeepHouse,
+            Vibe::LofiChill,
+            Vibe::JungleDnb,
+            Vibe::DreamPop,
+        ],
+        Vibe::UkGarage => &[
+            Vibe::UkGarage,
+            Vibe::DeepHouse,
+            Vibe::JungleDnb,
+            Vibe::NeoSoul,
+            Vibe::FutureBass,
+        ],
+        Vibe::JungleDnb => &[
+            Vibe::JungleDnb,
+            Vibe::UkGarage,
+            Vibe::Dubstep,
+            Vibe::DetroitTechno,
+            Vibe::AmbientDub,
+        ],
+        Vibe::DetroitTechno => &[
+            Vibe::DetroitTechno,
+            Vibe::AcidClub,
+            Vibe::DeepHouse,
+            Vibe::EuphoricTrance,
+            Vibe::BigRoomEdm,
+        ],
+        Vibe::DreamPop => &[
+            Vibe::DreamPop,
+            Vibe::Synthwave,
+            Vibe::IndieRock,
+            Vibe::ElectroSoul,
+            Vibe::LofiChill,
+        ],
+        Vibe::Disco70s => &[
+            Vibe::Disco70s,
+            Vibe::ElectroFunk,
+            Vibe::ItaloCosmic,
+            Vibe::DeepHouse,
+            Vibe::Arena80s,
+        ],
+        Vibe::Arena80s => &[
+            Vibe::Arena80s,
+            Vibe::Synthwave,
+            Vibe::IndieRock,
+            Vibe::Disco70s,
+            Vibe::ItaloCosmic,
+        ],
+        Vibe::IndieRock => &[
+            Vibe::IndieRock,
+            Vibe::Arena80s,
+            Vibe::DreamPop,
+            Vibe::Synthwave,
+            Vibe::ElectroSoul,
+        ],
+        Vibe::NeoSoul => &[
+            Vibe::NeoSoul,
+            Vibe::LofiChill,
+            Vibe::BoomBap,
+            Vibe::ElectroFunk,
+            Vibe::UkGarage,
+        ],
+        Vibe::ItaloCosmic => &[
+            Vibe::ItaloCosmic,
+            Vibe::Synthwave,
+            Vibe::Disco70s,
+            Vibe::ElectroFunk,
+            Vibe::EuphoricTrance,
+        ],
+        Vibe::BoomBap => &[
+            Vibe::BoomBap,
+            Vibe::LofiChill,
+            Vibe::NeoSoul,
+            Vibe::Trap808,
+            Vibe::ElectroFunk,
+        ],
+        Vibe::Trap808 => &[
+            Vibe::Trap808,
+            Vibe::BoomBap,
+            Vibe::Dubstep,
+            Vibe::FutureBass,
+            Vibe::UkGarage,
+        ],
+        Vibe::Dubstep => &[
+            Vibe::Dubstep,
+            Vibe::Trap808,
+            Vibe::JungleDnb,
+            Vibe::BigRoomEdm,
+            Vibe::FutureBass,
+        ],
+        Vibe::BigRoomEdm => &[
+            Vibe::BigRoomEdm,
+            Vibe::EuphoricTrance,
+            Vibe::FutureBass,
+            Vibe::AcidClub,
+            Vibe::Dubstep,
+        ],
+        Vibe::FutureBass => &[
+            Vibe::FutureBass,
+            Vibe::Trap808,
+            Vibe::BigRoomEdm,
+            Vibe::EuphoricTrance,
+            Vibe::ElectroSoul,
+        ],
+        Vibe::EuphoricTrance => &[
+            Vibe::EuphoricTrance,
+            Vibe::BigRoomEdm,
+            Vibe::FutureBass,
+            Vibe::DetroitTechno,
+            Vibe::ItaloCosmic,
+        ],
+    }
+}
+
+/// Picks the Vibe for a given Party DJ `song_cycle` without repeating two songs
+/// back-to-back when rotating across related or all vibes.
+pub fn pick_party_vibe(base_vibe: Vibe, mix_mode: PartyMixMode, song_cycle: u32, seed: u32) -> Vibe {
+    if song_cycle == 0 || matches!(mix_mode, PartyMixMode::SingleVibe) {
+        return base_vibe;
+    }
+
+    let pool: &[Vibe] = match mix_mode {
+        PartyMixMode::SingleVibe => return base_vibe,
+        PartyMixMode::RelatedVibes => vibe_neighbors(base_vibe),
+        PartyMixMode::AllVibes => &Vibe::ALL,
+    };
+
+    let base_idx = pool.iter().position(|&v| v == base_vibe).unwrap_or(0);
+    let start = song_cycle.saturating_sub(8).max(1);
+    let mut last_idx = if start > 1 {
+        let mut r = Rng::new(
+            seed ^ (start - 1).wrapping_mul(0x9E37_79B9) ^ (base_vibe as u32).wrapping_mul(131),
+        );
+        r.range(pool.len())
+    } else {
+        base_idx
+    };
+
+    for c in start..=song_cycle {
+        let mut r = Rng::new(
+            seed ^ c.wrapping_mul(0x9E37_79B9) ^ (base_vibe as u32).wrapping_mul(131),
+        );
+        let mut idx = r.range(pool.len());
+        if pool.len() > 1 && idx == last_idx {
+            idx = (idx + 1 + ((c as usize) % (pool.len() - 1))) % pool.len();
+        }
+        last_idx = idx;
+    }
+    pool[last_idx]
+}
+
 /// Generates a stylish DJ track title for Party Mode based on the Vibe and song number.
 pub fn party_song_title(vibe: Vibe, song_idx: u32, root_note: u8) -> String {
-    const ADJ: [&str; 12] = [
-        "Midnight", "Neon", "Velvet", "Electric", "Cosmic", "Golden",
-        "Underground", "Solar", "Crystal", "Analogue", "Hyper", "Sunset",
+    const ADJ: [&str; 20] = [
+        "Midnight", "Neon", "Velvet", "Electric", "Cosmic",
+        "Golden", "Underground", "Solar", "Crystal", "Analogue",
+        "Hyper", "Sunset", "Magnetic", "Prism", "Subterranean",
+        "Crimson", "Emerald", "Starlight", "Mirrored", "Afterhours",
     ];
-    const NOUN: [&str; 12] = [
-        "Groove", "Odyssey", "Pulse", "Mirage", "Horizon", "Bounce",
-        "Warehouse", "Dream", "Anthem", "Session", "Cascade", "Vortex",
+    const NOUN: [&str; 20] = [
+        "Groove", "Odyssey", "Pulse", "Mirage", "Horizon",
+        "Bounce", "Warehouse", "Dream", "Anthem", "Session",
+        "Cascade", "Vortex", "Circuit", "Skyline", "Signal",
+        "Drift", "Frequencies", "Voyage", "Echoes", "Rush",
     ];
-    let h = song_idx.wrapping_mul(2654435761) ^ (vibe as u32).wrapping_mul(97);
+    let h = song_idx
+        .wrapping_mul(2654435761)
+        ^ (vibe as u32).wrapping_mul(0x517C_C1B7)
+        ^ (root_note as u32).wrapping_mul(313);
     let a = ADJ[(h as usize) % ADJ.len()];
-    let n = NOUN[((h >> 4) as usize) % NOUN.len()];
+    let n = NOUN[((h >> 5) as usize) % NOUN.len()];
     format!(
         "#{} \"{} {}\" ({} • {})",
         song_idx + 1,
@@ -526,6 +733,277 @@ pub fn party_song_title(vibe: Vibe, song_idx: u32, root_note: u8) -> String {
         vibe.name(),
         root_name(root_note)
     )
+}
+
+/// Complete per-song synth, drum, sampler, tempo, and FX rig used by Party DJ Mode
+/// so each generated song gets its own distinct voice palette and sonic character.
+#[derive(Debug, Clone)]
+pub struct PartySongRig {
+    pub vibe: Vibe,
+    pub bpm: f32,
+    pub swing: f32,
+    pub sidechain_amount: f32,
+    pub moog: MoogParams,
+    pub moog_pad: MoogParams,
+    pub monologue: MonologueParams,
+    pub tb303: Tb303Params,
+    pub drums: DrumKitParams,
+    pub sampler: SamplerParams,
+    pub sampler_builtin_id: Option<u8>,
+    pub delay_div: DelayDivision,
+    pub reverb_mix: f32,
+    pub delay_mix: f32,
+    pub reverb_size: f32,
+    pub analog_warmth: f32,
+    pub enable_303: bool,
+    pub enable_sampler: bool,
+    pub tb303_vol: f32,
+    pub sampler_vol: f32,
+    pub palette_label: String,
+}
+
+/// Curated (Drums, Moog, MoogPad, Monologue, Tb303, Sampler) voice preset indices
+/// matched to each genre so Party DJ Mode swaps authentic palettes between songs.
+const fn vibe_voice_pools(
+    vibe: Vibe,
+) -> (
+    &'static [usize],
+    &'static [usize],
+    &'static [usize],
+    &'static [usize],
+    &'static [usize],
+    &'static [usize],
+) {
+    match vibe {
+        Vibe::DeepHouse => (&[0, 1, 5, 2], &[0, 1, 6, 3], &[0, 7, 3, 2], &[0, 2, 1], &[2, 1, 5], &[0, 3, 5]),
+        Vibe::ElectroFunk => (&[2, 5, 0, 7], &[1, 6, 7], &[3, 7, 2, 5], &[2, 7, 4, 0], &[2, 0, 4], &[1, 0, 6]),
+        Vibe::LofiChill => (&[3, 7, 2, 0], &[0, 1, 5, 3], &[7, 0, 2, 1], &[1, 2, 5, 0], &[2, 3, 5, 1], &[0, 4, 5, 7]),
+        Vibe::ElectroSoul => (&[1, 2, 0, 7], &[1, 0, 6, 4], &[7, 3, 1, 0], &[2, 1, 3, 9], &[2, 1, 5], &[3, 0, 1]),
+        Vibe::Synthwave => (&[1, 4, 5, 2], &[2, 6, 4, 1], &[3, 1, 5, 4], &[3, 2, 7, 4], &[2, 3, 1, 0], &[2, 6, 1]),
+        Vibe::AcidClub => (&[1, 6, 2, 0], &[7, 1, 0, 3], &[2, 3, 0, 8], &[2, 7, 0, 9], &[0, 2, 4, 1], &[2, 1, 6]),
+        Vibe::AmbientDub => (&[0, 3, 7, 2], &[3, 1, 0, 8], &[2, 7, 0, 1], &[2, 1, 6, 0], &[2, 3, 1, 5], &[2, 3, 5]),
+        Vibe::UkGarage => (&[2, 7, 1], &[1, 6, 0, 3], &[2, 7, 3, 0], &[2, 0, 1], &[2, 1, 5], &[0, 3, 1]),
+        Vibe::JungleDnb => (&[7, 1, 6, 2], &[3, 1, 9, 8], &[1, 2, 0, 4], &[2, 7, 1, 8], &[2, 3, 4, 0], &[2, 5, 3]),
+        Vibe::DetroitTechno => (&[1, 6, 4, 2], &[0, 7, 1, 3], &[2, 3, 0, 1], &[0, 2, 7, 9], &[1, 2, 0, 4], &[2, 6, 1]),
+        Vibe::DreamPop => (&[4, 3, 1, 5], &[0, 6, 5, 2], &[4, 7, 1, 0], &[5, 2, 6, 1], &[5, 2, 1, 3], &[5, 7, 3, 4]),
+        Vibe::Disco70s => (&[5, 2, 0], &[6, 1, 5], &[3, 7, 4, 1], &[2, 6, 1, 7], &[2, 5, 1], &[5, 1, 0]),
+        Vibe::Arena80s => (&[4, 1, 5, 2], &[4, 6, 2, 1], &[5, 3, 8, 7], &[4, 7, 2, 3], &[2, 4, 0, 5], &[6, 1, 2]),
+        Vibe::IndieRock => (&[5, 7, 4, 2], &[5, 1, 4, 6], &[6, 7, 5, 3], &[5, 2, 4, 7], &[2, 4, 5], &[7, 6, 0]),
+        Vibe::NeoSoul => (&[3, 2, 0], &[1, 0, 5], &[7, 3, 0, 1], &[2, 1, 5], &[2, 3, 5, 1], &[0, 7, 1]),
+        Vibe::ItaloCosmic => (&[1, 4, 5, 2], &[6, 1, 2, 7], &[4, 3, 5, 2], &[7, 2, 3, 9], &[0, 2, 4], &[5, 1, 3, 6]),
+        Vibe::BoomBap => (&[3, 7, 2, 0], &[0, 1, 8, 5], &[7, 3, 0, 1], &[2, 1, 5], &[2, 3, 5], &[0, 1, 7, 4]),
+        Vibe::Trap808 => (&[8, 6, 2, 0], &[8, 1, 3, 0], &[0, 7, 9, 2], &[1, 2, 3, 9], &[2, 3, 4, 0], &[3, 2, 1]),
+        Vibe::Dubstep => (&[9, 6, 8], &[9, 7, 3], &[8, 3, 5, 2], &[8, 7, 2, 4], &[4, 2, 0, 3], &[1, 2, 6]),
+        Vibe::BigRoomEdm => (&[1, 6, 9, 2], &[10, 6, 4, 9], &[8, 3, 5, 9], &[9, 7, 4, 2], &[0, 2, 4, 5], &[2, 6, 1]),
+        Vibe::FutureBass => (&[8, 1, 7, 2], &[8, 1, 0, 3], &[9, 7, 8, 0], &[1, 2, 9, 3], &[2, 5, 1, 3], &[3, 0, 1]),
+        Vibe::EuphoricTrance => (&[1, 4, 6, 5], &[10, 6, 2, 0], &[8, 3, 1, 4], &[9, 2, 3, 6], &[1, 2, 5, 0], &[2, 5, 3]),
+    }
+}
+
+/// Builds a fresh, genre-authentic `PartySongRig` for `song_cycle` without mutating
+/// the user's saved `Project` state.
+pub fn build_party_song_rig(
+    base: &Project,
+    song_vibe: Vibe,
+    song_cycle: u32,
+    seed: u32,
+    sound_morph: bool,
+) -> PartySongRig {
+    let cur_palette = format!(
+        "{} • {} • {} • {}",
+        voice_preset_names(TrackId::Moog)[base.voice_presets[1] % 11],
+        voice_preset_names(TrackId::MoogPad)[base.voice_presets[2] % 10],
+        voice_preset_names(TrackId::Monologue)[base.voice_presets[3] % 10],
+        voice_preset_names(TrackId::Drums)[base.voice_presets[0] % 10],
+    );
+
+    if !sound_morph || (song_cycle == 0 && song_vibe == base.vibe) {
+        return PartySongRig {
+            vibe: song_vibe,
+            bpm: base.bpm,
+            swing: base.swing,
+            sidechain_amount: base.sidechain_amount,
+            moog: base.moog.clone(),
+            moog_pad: base.moog_pad.clone(),
+            monologue: base.monologue.clone(),
+            tb303: base.tb303.clone(),
+            drums: base.drums.clone(),
+            sampler: base.sampler.clone(),
+            sampler_builtin_id: base.sample_data.builtin_id,
+            delay_div: base.fx.delay_div,
+            reverb_mix: base.fx.reverb_mix,
+            delay_mix: base.fx.delay_mix,
+            reverb_size: base.fx.reverb_size,
+            analog_warmth: base.fx.analog_warmth,
+            enable_303: if sound_morph { true } else { !base.mixer.channels[2].mute },
+            enable_sampler: if sound_morph { true } else { !base.mixer.channels[4].mute },
+            tb303_vol: if sound_morph {
+                base.mixer.channels[2].volume.max(0.40)
+            } else {
+                base.mixer.channels[2].volume
+            },
+            sampler_vol: if sound_morph {
+                base.mixer.channels[4].volume.max(0.44)
+            } else {
+                base.mixer.channels[4].volume
+            },
+            palette_label: cur_palette,
+        };
+    }
+
+    let mut rng = Rng::new(
+        seed ^ song_cycle.wrapping_mul(0x9E37_79B9) ^ (song_vibe as u32).wrapping_mul(0x517C_C1B7),
+    );
+    let mut tmp = Project::factory(FactoryPreset::BlankInit);
+    let (drums_p, moog_p, pad_p, mono_p, tb_p, samp_p) = vibe_voice_pools(song_vibe);
+
+    let d_idx = drums_p[(song_cycle as usize + rng.range(drums_p.len())) % drums_p.len()];
+    let b_idx = moog_p[(song_cycle as usize + rng.range(moog_p.len())) % moog_p.len()];
+    let p_idx = pad_p[(song_cycle as usize + rng.range(pad_p.len())) % pad_p.len()];
+    let m_idx = mono_p[(song_cycle as usize + rng.range(mono_p.len())) % mono_p.len()];
+    let t_idx = tb_p[(song_cycle as usize + rng.range(tb_p.len())) % tb_p.len()];
+    let s_idx = samp_p[(song_cycle as usize + rng.range(samp_p.len())) % samp_p.len()];
+
+    apply_voice_preset(&mut tmp, TrackId::Drums, d_idx);
+    apply_voice_preset(&mut tmp, TrackId::Moog, b_idx);
+    apply_voice_preset(&mut tmp, TrackId::MoogPad, p_idx);
+    apply_voice_preset(&mut tmp, TrackId::Monologue, m_idx);
+    apply_voice_preset(&mut tmp, TrackId::Tb303, t_idx);
+    apply_voice_preset(&mut tmp, TrackId::Sampler, s_idx);
+
+    // Subtle tasteful per-song analog sculpting so every song feels freshly mixed
+    tmp.drums.voices[0].tune = (tmp.drums.voices[0].tune + (rng.f32() - 0.5) * 3.0).clamp(-12.0, 12.0);
+    tmp.drums.voices[1].snappy = (tmp.drums.voices[1].snappy + (rng.f32() - 0.5) * 0.20).clamp(0.1, 1.0);
+    tmp.moog.cutoff = (tmp.moog.cutoff * (0.85 + rng.f32() * 0.35)).clamp(180.0, 14_000.0);
+    tmp.moog_pad.cutoff = (tmp.moog_pad.cutoff * (0.85 + rng.f32() * 0.35)).clamp(260.0, 15_000.0);
+    tmp.monologue.cutoff = (tmp.monologue.cutoff * (0.85 + rng.f32() * 0.35)).clamp(320.0, 16_000.0);
+    tmp.tb303.cutoff = (tmp.tb303.cutoff * (0.82 + rng.f32() * 0.45)).clamp(140.0, 7_000.0);
+    tmp.tb303.resonance = (tmp.tb303.resonance + (rng.f32() - 0.5) * 0.16).clamp(0.25, 0.90);
+
+    const BPM_DELTAS: [f32; 5] = [-4.0, -2.0, 0.0, 2.0, 4.0];
+    let target_bpm = if song_vibe == base.vibe {
+        (base.bpm + BPM_DELTAS[rng.range(BPM_DELTAS.len())]).clamp(68.0, 182.0)
+    } else {
+        (song_vibe.default_bpm() + (rng.range(5) as f32 - 2.0)).clamp(68.0, 182.0)
+    };
+    let swing_floor = if matches!(
+        song_vibe,
+        Vibe::ElectroFunk
+            | Vibe::DeepHouse
+            | Vibe::LofiChill
+            | Vibe::UkGarage
+            | Vibe::Disco70s
+            | Vibe::NeoSoul
+            | Vibe::BoomBap
+    ) {
+        0.14
+    } else {
+        0.08
+    };
+    let swing = (song_vibe.default_swing().max(swing_floor) + (rng.f32() - 0.5) * 0.04).clamp(0.06, 0.34);
+
+    let sidechain_amount = match song_vibe {
+        Vibe::DeepHouse | Vibe::AcidClub | Vibe::BigRoomEdm | Vibe::FutureBass | Vibe::EuphoricTrance => {
+            0.58 + rng.f32() * 0.18
+        }
+        Vibe::AmbientDub | Vibe::LofiChill | Vibe::NeoSoul | Vibe::IndieRock => 0.25 + rng.f32() * 0.15,
+        _ => 0.40 + rng.f32() * 0.20,
+    };
+
+    const DELAY_DIVS: [DelayDivision; 3] = [
+        DelayDivision::DottedEighth,
+        DelayDivision::Eighth,
+        DelayDivision::Quarter,
+    ];
+    let delay_div = DELAY_DIVS[(song_cycle as usize + rng.range(DELAY_DIVS.len())) % DELAY_DIVS.len()];
+    let reverb_mix = if matches!(song_vibe, Vibe::AmbientDub) {
+        0.54
+    } else if matches!(
+        song_vibe,
+        Vibe::Arena80s | Vibe::Disco70s | Vibe::EuphoricTrance | Vibe::BigRoomEdm | Vibe::FutureBass | Vibe::DreamPop
+    ) {
+        0.36 + rng.f32() * 0.10
+    } else {
+        0.26 + rng.f32() * 0.10
+    };
+    let delay_mix = if matches!(song_vibe, Vibe::AmbientDub) {
+        0.52
+    } else if matches!(song_vibe, Vibe::EuphoricTrance | Vibe::DreamPop | Vibe::ItaloCosmic) {
+        0.34 + rng.f32() * 0.08
+    } else {
+        0.24 + rng.f32() * 0.08
+    };
+    let reverb_size = if matches!(song_vibe, Vibe::AmbientDub) {
+        0.84
+    } else if matches!(
+        song_vibe,
+        Vibe::Synthwave | Vibe::ElectroSoul | Vibe::Arena80s | Vibe::Disco70s | Vibe::EuphoricTrance | Vibe::BigRoomEdm | Vibe::FutureBass
+    ) {
+        0.66 + rng.f32() * 0.12
+    } else {
+        0.50 + rng.f32() * 0.12
+    };
+    let analog_warmth = if matches!(
+        song_vibe,
+        Vibe::LofiChill | Vibe::ElectroFunk | Vibe::NeoSoul | Vibe::IndieRock | Vibe::BoomBap | Vibe::Dubstep
+    ) {
+        0.34 + rng.f32() * 0.12
+    } else {
+        0.18 + rng.f32() * 0.10
+    };
+
+    let tb303_vol = if matches!(
+        song_vibe,
+        Vibe::AcidClub | Vibe::ElectroFunk | Vibe::ItaloCosmic | Vibe::DetroitTechno
+    ) {
+        0.56
+    } else {
+        0.42
+    };
+    let sampler_vol = if matches!(
+        song_vibe,
+        Vibe::LofiChill | Vibe::NeoSoul | Vibe::BoomBap | Vibe::Disco70s | Vibe::Arena80s | Vibe::IndieRock
+    ) {
+        0.52
+    } else {
+        0.44
+    };
+
+    let palette_label = format!(
+        "{} • {} • {} • {}",
+        voice_preset_names(TrackId::Moog)[b_idx % 11],
+        voice_preset_names(TrackId::MoogPad)[p_idx % 10],
+        voice_preset_names(TrackId::Monologue)[m_idx % 10],
+        voice_preset_names(TrackId::Drums)[d_idx % 10],
+    );
+
+    PartySongRig {
+        vibe: song_vibe,
+        bpm: target_bpm,
+        swing,
+        sidechain_amount,
+        moog: tmp.moog,
+        moog_pad: tmp.moog_pad,
+        monologue: tmp.monologue,
+        tb303: tmp.tb303,
+        drums: tmp.drums,
+        sampler: tmp.sampler,
+        sampler_builtin_id: if base.sample_data.builtin_id.is_some() {
+            tmp.sample_data.builtin_id
+        } else {
+            None
+        },
+        delay_div,
+        reverb_mix,
+        delay_mix,
+        reverb_size,
+        analog_warmth,
+        enable_303: true,
+        enable_sampler: true,
+        tb303_vol,
+        sampler_vol,
+        palette_label,
+    }
 }
 
 /// Returns the human-readable chord symbol (e.g. "Am9", "Fmaj9").
@@ -1009,45 +1487,45 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
             p.moog.filt_attack = 0.004;
             match p.voice_presets[1] {
                 0 => {
-                    // Warm Sub
+                    // Warm Sub (rubbery finger-bass thump)
                     p.moog.osc1_wave = MoogWave::Triangle;
                     p.moog.osc2_wave = MoogWave::Saw;
                     p.moog.osc2_octave = 0;
                     p.moog.osc2_detune = 5.0;
                     p.moog.osc1_level = 0.95;
-                    p.moog.osc2_level = 0.50;
-                    p.moog.osc3_level = 0.32;
-                    p.moog.cutoff = 420.0;
-                    p.moog.resonance = 0.18;
-                    p.moog.env_amount = 0.42;
-                    p.moog.drive = 0.22;
-                    p.moog.filt_decay = 0.24;
-                    p.moog.filt_sustain = 0.20;
-                    p.moog.amp_attack = 0.005;
-                    p.moog.amp_decay = 0.30;
-                    p.moog.amp_sustain = 0.65;
+                    p.moog.osc2_level = 0.56;
+                    p.moog.osc3_level = 0.34;
+                    p.moog.cutoff = 540.0;
+                    p.moog.resonance = 0.34;
+                    p.moog.env_amount = 0.66;
+                    p.moog.drive = 0.34;
+                    p.moog.filt_decay = 0.20;
+                    p.moog.filt_sustain = 0.18;
+                    p.moog.amp_attack = 0.004;
+                    p.moog.amp_decay = 0.28;
+                    p.moog.amp_sustain = 0.62;
                     p.moog.amp_release = 0.12;
                     p.moog.glide = 0.04;
                 }
                 1 => {
-                    // Funk Slap (rubbery resonant Moog funk bass!)
+                    // Funk Slap (snappy Mutron auto-wah thumb slap!)
                     p.moog.osc1_wave = MoogWave::Saw;
                     p.moog.osc2_wave = MoogWave::Square;
                     p.moog.osc2_octave = -1;
                     p.moog.osc2_detune = 7.0;
                     p.moog.osc1_level = 0.88;
-                    p.moog.osc2_level = 0.72;
-                    p.moog.osc3_level = 0.20;
-                    p.moog.cutoff = 360.0;
-                    p.moog.resonance = 0.48;
-                    p.moog.env_amount = 0.78;
-                    p.moog.drive = 0.42;
-                    p.moog.filt_attack = 0.003;
-                    p.moog.filt_decay = 0.18;
-                    p.moog.filt_sustain = 0.12;
-                    p.moog.amp_attack = 0.003;
-                    p.moog.amp_decay = 0.22;
-                    p.moog.amp_sustain = 0.42;
+                    p.moog.osc2_level = 0.74;
+                    p.moog.osc3_level = 0.24;
+                    p.moog.cutoff = 440.0;
+                    p.moog.resonance = 0.64;
+                    p.moog.env_amount = 0.88;
+                    p.moog.drive = 0.56;
+                    p.moog.filt_attack = 0.002;
+                    p.moog.filt_decay = 0.16;
+                    p.moog.filt_sustain = 0.10;
+                    p.moog.amp_attack = 0.002;
+                    p.moog.amp_decay = 0.20;
+                    p.moog.amp_sustain = 0.40;
                     p.moog.amp_release = 0.08;
                     p.moog.glide = 0.05;
                 }
@@ -1272,24 +1750,26 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
             p.moog_pad.glide = 0.0;
             match p.voice_presets[2] {
                 0 => {
-                    // Lush Pad
+                    // Lush Pad (animated breathing chords)
                     p.moog_pad.osc1_wave = MoogWave::TriSaw;
                     p.moog_pad.osc2_wave = MoogWave::Saw;
                     p.moog_pad.osc2_detune = 9.0;
                     p.moog_pad.osc1_level = 0.78;
-                    p.moog_pad.osc2_level = 0.62;
-                    p.moog_pad.osc3_level = 0.24;
-                    p.moog_pad.cutoff = 1350.0;
-                    p.moog_pad.resonance = 0.16;
-                    p.moog_pad.env_amount = 0.26;
-                    p.moog_pad.drive = 0.14;
-                    p.moog_pad.amp_attack = 0.06;
-                    p.moog_pad.amp_decay = 0.55;
-                    p.moog_pad.amp_sustain = 0.72;
-                    p.moog_pad.amp_release = 0.75;
-                    p.moog_pad.filt_attack = 0.08;
-                    p.moog_pad.filt_decay = 0.70;
-                    p.moog_pad.filt_sustain = 0.42;
+                    p.moog_pad.osc2_level = 0.64;
+                    p.moog_pad.osc3_level = 0.26;
+                    p.moog_pad.cutoff = 1550.0;
+                    p.moog_pad.resonance = 0.26;
+                    p.moog_pad.env_amount = 0.46;
+                    p.moog_pad.drive = 0.22;
+                    p.moog_pad.lfo_rate = 3.4;
+                    p.moog_pad.lfo_to_filter = 0.16;
+                    p.moog_pad.amp_attack = 0.03;
+                    p.moog_pad.amp_decay = 0.50;
+                    p.moog_pad.amp_sustain = 0.70;
+                    p.moog_pad.amp_release = 0.70;
+                    p.moog_pad.filt_attack = 0.02;
+                    p.moog_pad.filt_decay = 0.55;
+                    p.moog_pad.filt_sustain = 0.36;
                 }
                 1 => {
                     // Warm Strings
@@ -1334,18 +1814,18 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     p.moog_pad.osc2_detune = 10.0;
                     p.moog_pad.osc1_level = 0.78;
                     p.moog_pad.osc2_level = 0.70;
-                    p.moog_pad.osc3_level = 0.26;
-                    p.moog_pad.cutoff = 1100.0;
-                    p.moog_pad.resonance = 0.26;
-                    p.moog_pad.env_amount = 0.58;
-                    p.moog_pad.drive = 0.26;
-                    p.moog_pad.filt_attack = 0.015;
-                    p.moog_pad.filt_decay = 0.28;
-                    p.moog_pad.filt_sustain = 0.35;
-                    p.moog_pad.amp_attack = 0.012;
-                    p.moog_pad.amp_decay = 0.30;
-                    p.moog_pad.amp_sustain = 0.48;
-                    p.moog_pad.amp_release = 0.24;
+                    p.moog_pad.osc3_level = 0.28;
+                    p.moog_pad.cutoff = 1320.0;
+                    p.moog_pad.resonance = 0.36;
+                    p.moog_pad.env_amount = 0.74;
+                    p.moog_pad.drive = 0.36;
+                    p.moog_pad.filt_attack = 0.008;
+                    p.moog_pad.filt_decay = 0.26;
+                    p.moog_pad.filt_sustain = 0.30;
+                    p.moog_pad.amp_attack = 0.010;
+                    p.moog_pad.amp_decay = 0.28;
+                    p.moog_pad.amp_sustain = 0.46;
+                    p.moog_pad.amp_release = 0.22;
                 }
                 4 => {
                     // 70s String Synth (warm silky Solina / ARP string ensemble!)
@@ -1434,7 +1914,7 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     p.moog_pad.amp_release = 0.28;
                 }
                 7 => {
-                    // Wurlitzer Keys (warm vintage electric piano bark)
+                    // Wurlitzer Keys (barky vintage Wurli wah!)
                     p.moog_pad.osc1_wave = MoogWave::Triangle;
                     p.moog_pad.osc2_wave = MoogWave::NarrowPulse;
                     p.moog_pad.osc3_wave = MoogWave::Triangle;
@@ -1442,21 +1922,21 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     p.moog_pad.osc3_octave = 0;
                     p.moog_pad.osc2_detune = 3.0;
                     p.moog_pad.osc1_level = 0.90;
-                    p.moog_pad.osc2_level = 0.34;
-                    p.moog_pad.osc3_level = 0.20;
-                    p.moog_pad.cutoff = 1120.0;
-                    p.moog_pad.resonance = 0.22;
-                    p.moog_pad.env_amount = 0.52;
-                    p.moog_pad.drive = 0.34;
+                    p.moog_pad.osc2_level = 0.38;
+                    p.moog_pad.osc3_level = 0.22;
+                    p.moog_pad.cutoff = 1280.0;
+                    p.moog_pad.resonance = 0.36;
+                    p.moog_pad.env_amount = 0.68;
+                    p.moog_pad.drive = 0.44;
                     p.moog_pad.lfo_rate = 4.8;
-                    p.moog_pad.lfo_to_filter = 0.14; // Vintage Wurli tremolo-wah
+                    p.moog_pad.lfo_to_filter = 0.22; // Vintage Wurli tremolo-wah
                     p.moog_pad.filt_attack = 0.002;
-                    p.moog_pad.filt_decay = 0.32;
-                    p.moog_pad.filt_sustain = 0.18;
+                    p.moog_pad.filt_decay = 0.28;
+                    p.moog_pad.filt_sustain = 0.16;
                     p.moog_pad.amp_attack = 0.003;
-                    p.moog_pad.amp_decay = 0.72;
-                    p.moog_pad.amp_sustain = 0.32;
-                    p.moog_pad.amp_release = 0.32;
+                    p.moog_pad.amp_decay = 0.68;
+                    p.moog_pad.amp_sustain = 0.30;
+                    p.moog_pad.amp_release = 0.30;
                 }
                 8 => {
                     // Festival Supersaw (wide detuned 3-osc saw stack for Big Room EDM & Trance)
@@ -1531,12 +2011,12 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     p.monologue.vco1_wave = MonologueOscWave::Saw;
                     p.monologue.vco2_wave = MonologueOscWave::Triangle;
                     p.monologue.vco1_shape = 0.35;
-                    p.monologue.cutoff = 1600.0;
-                    p.monologue.resonance = 0.26;
-                    p.monologue.eg_int = 0.55;
-                    p.monologue.eg_attack = 0.004;
-                    p.monologue.eg_decay = 0.22;
-                    p.monologue.drive = 0.18;
+                    p.monologue.cutoff = 1850.0;
+                    p.monologue.resonance = 0.38;
+                    p.monologue.eg_int = 0.72;
+                    p.monologue.eg_attack = 0.003;
+                    p.monologue.eg_decay = 0.20;
+                    p.monologue.drive = 0.28;
                     p.monologue.glide = 0.02;
                 }
                 1 => {
@@ -1553,16 +2033,16 @@ pub fn apply_voice_preset(p: &mut Project, track: TrackId, preset_idx: usize) {
                     p.monologue.glide = 0.01;
                 }
                 2 => {
-                    // Funk Clav
+                    // Funk Clav (Hohner D6 Clavinet through CryBaby wah)
                     p.monologue.vco1_wave = MonologueOscWave::Square;
                     p.monologue.vco2_wave = MonologueOscWave::Saw;
                     p.monologue.vco1_shape = 0.72;
-                    p.monologue.cutoff = 1100.0;
-                    p.monologue.resonance = 0.46;
-                    p.monologue.eg_int = 0.72;
+                    p.monologue.cutoff = 1280.0;
+                    p.monologue.resonance = 0.62;
+                    p.monologue.eg_int = 0.86;
                     p.monologue.eg_attack = 0.002;
-                    p.monologue.eg_decay = 0.16;
-                    p.monologue.drive = 0.32;
+                    p.monologue.eg_decay = 0.15;
+                    p.monologue.drive = 0.48;
                     p.monologue.glide = 0.01;
                 }
                 3 => {
@@ -2527,6 +3007,192 @@ pub fn generate_auto_beat(vibe: Vibe, energy: f32, seed: u32) -> DrumTrackSeq {
             }
         }
     }
+
+    // Seed-driven groove variation pass so consecutive songs & patterns in the
+    // same Vibe feature distinct kick pockets, hat patterns, stereo perc, and fills.
+    let mut vrng = Rng::new(seed ^ 0xD1B5_4A32);
+    let kick_var = vrng.range(6);
+    let hat_var = vrng.range(5);
+    let fill_var = vrng.range(6);
+
+    for bar in 0..4 {
+        let base = bar * 16;
+        match kick_var {
+            1 => {
+                if bar % 2 == 1 && !seq.lanes[DrumVoiceId::Kick.index()].steps[base + 14].active {
+                    set(&mut seq, DrumVoiceId::Kick, base + 14, 0.68, false, 1);
+                }
+                if bar == 2 && e > 0.45 && !seq.lanes[DrumVoiceId::Kick.index()].steps[base + 7].active {
+                    set(&mut seq, DrumVoiceId::Kick, base + 7, 0.60, false, 1);
+                }
+            }
+            2 => {
+                if bar % 2 == 0 && !seq.lanes[DrumVoiceId::Kick.index()].steps[base + 14].active {
+                    set(&mut seq, DrumVoiceId::Kick, base + 14, 0.72, false, 1);
+                }
+                if bar == 3 && e > 0.45 {
+                    seq.lanes[DrumVoiceId::Kick.index()].steps[base].active = false;
+                }
+            }
+            3 => {
+                if bar % 2 == 1 {
+                    let k_idx = DrumVoiceId::Kick.index();
+                    if seq.lanes[k_idx].steps[base + 10].active && !seq.lanes[k_idx].steps[base + 11].active {
+                        seq.lanes[k_idx].steps[base + 10].active = false;
+                        set(&mut seq, DrumVoiceId::Kick, base + 11, 0.78, false, 1);
+                    } else if !seq.lanes[k_idx].steps[base + 6].active {
+                        set(&mut seq, DrumVoiceId::Kick, base + 6, 0.72, false, 1);
+                    }
+                }
+            }
+            4 => {
+                if e > 0.55 && bar % 2 == 1 {
+                    set(&mut seq, DrumVoiceId::Kick, base + 15, 0.72, false, 1);
+                } else if e <= 0.55 && bar == 2 {
+                    seq.lanes[DrumVoiceId::Kick.index()].steps[base + 8].active = false;
+                }
+            }
+            5 => {
+                if e > 0.50 && bar % 2 == 1 {
+                    set(&mut seq, DrumVoiceId::Kick, base + 14, 0.70, false, 2);
+                }
+            }
+            _ => {}
+        }
+
+        match hat_var {
+            1 => {
+                for s in 0..16 {
+                    if s % 4 == 2 {
+                        continue;
+                    }
+                    let vel = if s % 4 == 0 { 0.46 } else { 0.32 };
+                    if e > 0.30 || s % 2 == 0 {
+                        set(&mut seq, DrumVoiceId::ClosedHat, base + s, vel, false, 1);
+                    }
+                }
+                set(&mut seq, DrumVoiceId::OpenHat, base + 14, 0.72, false, 1);
+                if bar % 2 == 1 {
+                    set(&mut seq, DrumVoiceId::OpenHat, base + 6, 0.62, false, 1);
+                }
+            }
+            2 => {
+                if bar < 3 {
+                    let ch_idx = DrumVoiceId::ClosedHat.index();
+                    for s in 0..16 {
+                        if s % 2 == 0 {
+                            seq.lanes[ch_idx].steps[base + s].active = false;
+                        }
+                    }
+                }
+            }
+            3 => {
+                if e > 0.40 && bar % 2 == 1 {
+                    for &(s, r) in &[(7usize, 2u8), (11, 2), (15, 3)] {
+                        set(&mut seq, DrumVoiceId::ClosedHat, base + s, 0.58, false, r);
+                    }
+                }
+            }
+            4 => {
+                for &(s, pv) in &[(3usize, 0.54_f32), (11, 0.68)] {
+                    let st = &mut seq.lanes[DrumVoiceId::CowbellRim.index()].steps[base + s];
+                    st.active = true;
+                    st.velocity = pv;
+                    st.probability = 1.0;
+                    st.ratchet = 1;
+                    st.pan_lock = Some(-0.42);
+                }
+                for &(s, po) in &[(7usize, 2i8), (14, -2)] {
+                    let st = &mut seq.lanes[DrumVoiceId::Tom.index()].steps[base + s];
+                    st.active = true;
+                    st.velocity = 0.60;
+                    st.probability = 1.0;
+                    st.ratchet = 1;
+                    st.pitch_offset = po;
+                    st.pan_lock = Some(0.42);
+                }
+            }
+            _ => {}
+        }
+
+        // Funk pocket embellishments: syncopated ghost snares, cowbell/rim clave, and open-hat barks
+        if e > 0.30 {
+            if !seq.lanes[DrumVoiceId::Snare.index()].steps[base + 7].active && (bar % 2 == 0 || vrng.f32() < 0.65) {
+                set(&mut seq, DrumVoiceId::Snare, base + 7, 0.32, false, 1);
+            }
+            if !seq.lanes[DrumVoiceId::Snare.index()].steps[base + 9].active && (bar % 2 == 1 || e > 0.55) {
+                set(&mut seq, DrumVoiceId::Snare, base + 9, 0.38, false, 1);
+            }
+            if bar % 2 == 1 && !seq.lanes[DrumVoiceId::Snare.index()].steps[base + 15].active {
+                set(&mut seq, DrumVoiceId::Snare, base + 15, 0.44, false, 1);
+            }
+        }
+        if e > 0.38 && hat_var != 2 {
+            for &(step_c, vel_c, pan_c) in &[(2usize, 0.48_f32, -0.32_f32), (11, 0.62, 0.34)] {
+                let st = &mut seq.lanes[DrumVoiceId::CowbellRim.index()].steps[base + step_c];
+                if !st.active && vrng.f32() < 0.72 {
+                    st.active = true;
+                    st.velocity = vel_c;
+                    st.probability = 1.0;
+                    st.ratchet = 1;
+                    st.pan_lock = Some(pan_c);
+                }
+            }
+            if bar % 2 == 1 && !seq.lanes[DrumVoiceId::OpenHat.index()].steps[base + 2].active && vrng.f32() < 0.55 {
+                set(&mut seq, DrumVoiceId::OpenHat, base + 2, 0.62, false, 1);
+            }
+        }
+    }
+
+    match fill_var {
+        1 => {
+            let pitches = [4i8, 2, 0, -3];
+            let pans = [-0.50_f32, -0.15, 0.20, 0.55];
+            for i in 0..4 {
+                let st = &mut seq.lanes[DrumVoiceId::Tom.index()].steps[60 + i];
+                st.active = true;
+                st.velocity = 0.70 + i as f32 * 0.06;
+                st.accent = i == 3;
+                st.probability = 1.0;
+                st.ratchet = 1;
+                st.pitch_offset = pitches[i];
+                st.pan_lock = Some(pans[i]);
+            }
+        }
+        2 => {
+            let sn = &mut seq.lanes[DrumVoiceId::Snare.index()];
+            sn.steps[58].active = true;
+            sn.steps[58].velocity = 0.76;
+            sn.steps[58].flam = true;
+            sn.steps[58].probability = 1.0;
+            sn.steps[60].active = true;
+            sn.steps[60].velocity = 0.84;
+            sn.steps[60].flam = true;
+            sn.steps[60].probability = 1.0;
+            set(&mut seq, DrumVoiceId::Snare, 62, 0.86, true, 2);
+            set(&mut seq, DrumVoiceId::Snare, 63, 0.90, true, 2);
+        }
+        3 => {
+            for s in 60..64 {
+                seq.lanes[DrumVoiceId::Kick.index()].steps[s].active = false;
+                seq.lanes[DrumVoiceId::ClosedHat.index()].steps[s].active = false;
+            }
+            set(&mut seq, DrumVoiceId::Clap, 60, 0.92, true, 1);
+        }
+        4 => {
+            set(&mut seq, DrumVoiceId::CowbellRim, 58, 0.72, false, 1);
+            set(&mut seq, DrumVoiceId::Snare, 60, 0.48, false, 1);
+            set(&mut seq, DrumVoiceId::CowbellRim, 61, 0.78, true, 1);
+            set(&mut seq, DrumVoiceId::Snare, 63, 0.82, true, 2);
+        }
+        5 => {
+            set(&mut seq, DrumVoiceId::Kick, 61, 0.84, false, 1);
+            set(&mut seq, DrumVoiceId::Kick, 63, 0.90, true, 1);
+            set(&mut seq, DrumVoiceId::Cymbal, 0, 0.78, true, 1);
+        }
+        _ => {}
+    }
+
     seq
 }
 
@@ -2547,6 +3213,105 @@ pub fn generate_melodic_tracks(
     let mut acid = MelodicTrackSeq::new(StepCount::Steps64);
     let mut sampler = MelodicTrackSeq::new(StepCount::Steps64);
 
+    let chord_var = rng.range(5);
+    let bass_var = rng.range(5);
+    let hook_var = rng.range(6);
+    let acid_var = rng.range(4);
+    let sampler_var = rng.range(4);
+    let scale_notes = vibe.default_scale().notes_in_range(root_note, 60, 84);
+
+    // Pre-generate a coherent 16-step melodic motif so each song develops a memorable hook.
+    let mut motif_hit = [false; 16];
+    let mut motif_deg = [0usize; 16];
+    let mut motif_gate = [0.95_f32; 16];
+    let mut motif_slide = [false; 16];
+    let mut motif_use_scale = [false; 16];
+    match hook_var {
+        0 => {
+            // Shimmering Funk Arp (offbeat 16th syncopations)
+            let steps: &[usize] = match rng.range(4) {
+                0 => &[0, 2, 3, 6, 8, 10, 11, 14],
+                1 => &[0, 3, 5, 6, 9, 11, 14, 15],
+                2 => &[0, 3, 6, 7, 10, 12, 15],
+                _ => &[0, 2, 6, 9, 10, 14],
+            };
+            let dir = rng.range(3);
+            for (i, &st) in steps.iter().enumerate() {
+                motif_hit[st] = true;
+                motif_deg[st] = match dir {
+                    0 => i,
+                    1 => steps.len().saturating_sub(1 + i),
+                    _ => if i % 2 == 0 { i / 2 } else { i / 2 + 2 },
+                };
+                motif_gate[st] = if matches!(vibe, Vibe::Dubstep) { 1.6 } else { 0.85 };
+                motif_slide[st] = st == 15;
+            }
+        }
+        1 => {
+            // Catchy Funky Clav / Syncopated Lead Hook (hero notes + 16th ghost chucks)
+            let steps: &[usize] = if rng.range(2) == 0 {
+                &[0, 3, 5, 6, 9, 11, 14, 15]
+            } else {
+                &[0, 2, 3, 6, 7, 10, 12, 15]
+            };
+            for (i, &st) in steps.iter().enumerate() {
+                motif_hit[st] = true;
+                motif_deg[st] = (i * 2 + rng.range(3)) % 8;
+                motif_use_scale[st] = i % 2 == 1;
+                motif_gate[st] = if st == 0 || st == 6 || st == 10 { 1.6 } else { 0.72 };
+                motif_slide[st] = st == 14 || st == 15 || st == 5;
+            }
+        }
+        2 => {
+            // Call-and-Response Funk Clav Riff
+            for &st in &[0usize, 3, 5, 6, 10, 11, 14, 15] {
+                motif_hit[st] = true;
+                motif_deg[st] = (st / 2 + rng.range(3)) % 7;
+                motif_use_scale[st] = st >= 8 || st == 5;
+                motif_gate[st] = if st == 6 || st == 14 { 1.4 } else { 0.68 };
+                motif_slide[st] = st == 11 || st == 15;
+            }
+        }
+        3 => {
+            // Driving 16th-Note Clavinet Ostinato
+            let steps: &[usize] = if rng.range(2) == 0 {
+                &[0, 2, 3, 5, 6, 8, 10, 11, 14, 15]
+            } else {
+                &[0, 2, 4, 5, 6, 9, 10, 11, 13, 15]
+            };
+            for (i, &st) in steps.iter().enumerate() {
+                motif_hit[st] = true;
+                motif_deg[st] = (i + rng.range(2)) % 6;
+                motif_gate[st] = if st % 2 == 1 { 0.58 } else { 0.78 };
+                motif_slide[st] = st == 5 || st == 15;
+            }
+        }
+        4 => {
+            // Dotted-8th Funk Echo Motif
+            let steps: &[usize] = if rng.range(2) == 0 {
+                &[0, 3, 6, 9, 11, 14, 15]
+            } else {
+                &[0, 3, 6, 7, 10, 14]
+            };
+            for (i, &st) in steps.iter().enumerate() {
+                motif_hit[st] = true;
+                motif_deg[st] = (i * 2 + rng.range(2)) % 6;
+                motif_gate[st] = if st == 7 || st == 15 { 0.65 } else { 1.15 };
+                motif_slide[st] = st == 14;
+            }
+        }
+        _ => {
+            // Expressive Talkbox / Blue-Note Glide Solo
+            for (i, &st) in [0usize, 3, 5, 7, 10, 11, 14, 15].iter().enumerate() {
+                motif_hit[st] = true;
+                motif_deg[st] = (i + 1 + rng.range(3)) % 7;
+                motif_use_scale[st] = true;
+                motif_gate[st] = if st == 0 || st == 7 { 2.2 } else { 1.1 };
+                motif_slide[st] = st == 3 || st == 5 || st == 11 || st == 15;
+            }
+        }
+    }
+
     for bar in 0..4 {
         let slot = prog.slots[bar];
         let base = bar * 16;
@@ -2556,7 +3321,8 @@ pub fn generate_melodic_tracks(
         let arp_tones = arp_tones_for(root_note, slot);
 
         // 1. CHORDS / PAD (MoogPad)
-        match vibe {
+        if chord_var == 0 {
+            match vibe {
             Vibe::ElectroFunk => {
                 // Punchy funky offbeat chord stabs!
                 for &(st, gate, vel) in &[(0, 0.70, 0.82), (6, 0.55, 0.74), (10, 0.85, 0.80)] {
@@ -2669,26 +3435,74 @@ pub fn generate_melodic_tracks(
                 }
             }
             _ => {
-                // Lush sustained chord (holds across the whole bar smoothly!)
-                let s = &mut pad.steps[base];
+                // Syncopated funk/soul keyboard comping instead of a flat whole-bar drone
+                let comp_hits: &[(usize, f32, f32)] = if bar % 2 == 0 {
+                    &[(0, 4.8, 0.80), (6, 1.1, 0.70), (10, 3.4, 0.76)]
+                } else {
+                    &[(0, 4.6, 0.82), (7, 1.0, 0.72), (10, 2.8, 0.78), (15, 0.85, 0.74)]
+                };
+                for &(st, gate, vel) in comp_hits {
+                    let s = &mut pad.steps[base + st];
+                    s.active = true;
+                    s.note = pad_root;
+                    s.chord = slot.chord;
+                    s.velocity = vel;
+                    s.gate = gate;
+                    s.accent = st == 0 || st == 15;
+                }
+            }
+        }
+        } else {
+            let hits: &[(usize, f32, f32)] = match chord_var {
+                1 => {
+                    if bar % 2 == 1 {
+                        &[(0, 4.8, 0.80), (6, 1.1, 0.70), (10, 3.4, 0.76), (15, 0.85, 0.74)]
+                    } else {
+                        &[(0, 5.2, 0.82), (7, 1.2, 0.72), (10, 3.8, 0.78)]
+                    }
+                }
+                2 => &[(0, 1.2, 0.86), (3, 0.65, 0.66), (6, 1.1, 0.76), (7, 0.65, 0.70), (10, 2.0, 0.84), (12, 0.8, 0.72), (15, 0.7, 0.78)],
+                3 => &[(0, 1.8, 0.90), (2, 0.8, 0.72), (6, 1.5, 0.82), (9, 0.9, 0.74), (11, 1.6, 0.86), (14, 1.0, 0.78)],
+                _ => {
+                    if bar % 2 == 0 {
+                        &[(2, 1.3, 0.84), (7, 0.8, 0.72), (10, 1.6, 0.78)]
+                    } else {
+                        &[(0, 1.8, 0.82), (6, 0.9, 0.74), (10, 1.4, 0.78), (15, 0.75, 0.76)]
+                    }
+                }
+            };
+            for &(st, gate, vel) in hits {
+                let s = &mut pad.steps[base + st];
                 s.active = true;
                 s.note = pad_root;
                 s.chord = slot.chord;
-                s.velocity = 0.78;
-                s.gate = 14.5; // sustained 14.5 sixteenths (nearly full bar!)
-                if matches!(vibe, Vibe::DeepHouse | Vibe::LofiChill | Vibe::NeoSoul | Vibe::Trap808) && bar % 2 == 1 {
-                    // Subtle warm rhythmic re-trigger on beat 3.5
-                    let s2 = &mut pad.steps[base + 10];
-                    s2.active = true;
-                    s2.note = pad_root;
-                    s2.chord = slot.chord;
-                    s2.velocity = 0.62;
-                    s2.gate = 5.5;
-                }
+                s.velocity = vel;
+                s.gate = gate;
+                s.accent = st == 0 || st == 15;
+            }
+        }
+        // Stamp expressive wah/comping MotionLocks across active chord hits
+        for st in 0..16 {
+            let s = &mut pad.steps[base + st];
+            if s.active {
+                let offbeat = st % 2 == 1 || st == 2 || st == 6 || st == 10 || st == 14;
+                s.motion = MotionLocks {
+                    cutoff: Some(if st == 0 {
+                        0.54
+                    } else if offbeat {
+                        0.76
+                    } else {
+                        0.64
+                    }),
+                    resonance: Some(if offbeat { 0.48 } else { 0.28 }),
+                    drive: Some(if st == 0 || offbeat { 0.36 } else { 0.22 }),
+                    shape: None,
+                };
             }
         }
 
         // 2. BASS (Moog)
+        if bass_var == 0 {
         match vibe {
             Vibe::DeepHouse => {
                 // Warm syncopated house sub-bass
@@ -3007,149 +3821,319 @@ pub fn generate_melodic_tracks(
                 }
             }
         }
+        } else {
+            let chord_ivs = slot.chord.intervals();
+            match bass_var {
+                1 => {
+                    // Syncopated octave bounce with slides
+                    let hits: &[(usize, u8, f32, f32, bool)] = if bar % 2 == 0 {
+                        &[(0, 0, 2.2, 0.94, false), (3, 12, 1.1, 0.80, false), (6, 0, 1.8, 0.86, false), (10, 7, 1.8, 0.84, false), (14, 12, 1.4, 0.82, true)]
+                    } else {
+                        &[(0, 0, 2.0, 0.94, false), (6, 7, 1.5, 0.82, true), (8, 0, 1.6, 0.88, false), (11, 12, 1.2, 0.80, false), (14, 10, 1.4, 0.84, true)]
+                    };
+                    for &(st, iv, gate, vel, slide) in hits {
+                        let s = &mut bass.steps[base + st];
+                        s.active = true;
+                        s.note = (bass_root + iv).min(58);
+                        s.velocity = vel;
+                        s.gate = gate;
+                        s.accent = st == 0 || st == 8;
+                        s.slide = slide;
+                    }
+                }
+                2 => {
+                    // Driving rhythmic 8th / offbeat bass pulse
+                    let steps: &[usize] = if matches!(vibe, Vibe::DeepHouse | Vibe::DetroitTechno | Vibe::AcidClub) {
+                        &[2, 6, 10, 14]
+                    } else {
+                        &[0, 2, 4, 6, 8, 10, 12, 14]
+                    };
+                    for &st in steps {
+                        let s = &mut bass.steps[base + st];
+                        s.active = true;
+                        let iv = if st == 14 { 7 } else if st % 4 == 2 { 12 } else { 0 };
+                        s.note = (bass_root + iv).min(58);
+                        s.velocity = if st % 4 == 0 { 0.92 } else { 0.78 };
+                        s.gate = 1.25;
+                        s.accent = st % 4 == 0;
+                    }
+                }
+                3 => {
+                    // Deep gliding sub pocket with 5th / 7th turnaround
+                    for &(st, iv, gate, slide) in &[(0usize, 0u8, 5.2_f32, false), (7, 7, 2.0, true), (10, 0, 3.2, false), (14, 10, 1.6, true)] {
+                        let s = &mut bass.steps[base + st];
+                        s.active = true;
+                        s.note = (bass_root + iv).min(56);
+                        s.velocity = if st == 0 || st == 10 { 0.92 } else { 0.78 };
+                        s.gate = gate;
+                        s.accent = st == 0;
+                        s.slide = slide;
+                    }
+                }
+                _ => {
+                    // Melodic walking chord-tone bass
+                    for (i, &st) in [0usize, 4, 6, 10, 12, 14].iter().enumerate() {
+                        let iv = chord_ivs[(i + bar) % chord_ivs.len()] % 12;
+                        let s = &mut bass.steps[base + st];
+                        s.active = true;
+                        s.note = (bass_root + iv).min(58);
+                        s.velocity = if st == 0 || st == 10 { 0.90 } else { 0.76 };
+                        s.gate = 1.5;
+                        s.accent = st == 0;
+                        s.slide = st == 14;
+                    }
+                }
+            }
+        }
 
-        // 3. ARP / MELODY (Monologue) — 100% locked to active chord tones!
-        let arp_steps: &[usize] = match vibe {
-            Vibe::ElectroSoul | Vibe::Synthwave | Vibe::DreamPop | Vibe::ItaloCosmic | Vibe::FutureBass => &[0, 2, 4, 6, 8, 10, 12, 14],
-            Vibe::EuphoricTrance => &[0, 2, 3, 6, 8, 10, 11, 14],
-            Vibe::BigRoomEdm => &[0, 3, 6, 8, 10, 14],
-            Vibe::Trap808 => &[0, 3, 6, 10, 12, 14],
-            Vibe::ElectroFunk | Vibe::UkGarage | Vibe::Disco70s => &[2, 5, 7, 10, 14],
-            Vibe::DeepHouse | Vibe::DetroitTechno | Vibe::Arena80s => &[0, 4, 6, 10, 14],
-            Vibe::IndieRock => &[0, 3, 6, 8, 11, 14],
-            Vibe::LofiChill | Vibe::NeoSoul | Vibe::BoomBap => &[0, 6, 10],
-            Vibe::AcidClub => &[2, 10, 14],
-            Vibe::Dubstep => &[4, 12, 14],
-            Vibe::AmbientDub | Vibe::JungleDnb => &[4, 12],
-        };
-        for (i, &st) in arp_steps.iter().enumerate() {
-            let tone_idx = (i + bar + rng.range(2)) % arp_tones.len().max(1);
+        // Funk Slap & Chromatic Walkup + Mutron Auto-Wah MotionLocks pass across all 4 bars!
+        {
+            let next_slot = prog.slots[(bar + 1) % 4];
+            let next_bass = bass_midi_for(root_note, next_slot.offset);
+            if !matches!(vibe, Vibe::AmbientDub | Vibe::JungleDnb) {
+                let slap_st = if bar % 2 == 0 { 3 } else { 11 };
+                if !bass.steps[base + slap_st].active {
+                    let s = &mut bass.steps[base + slap_st];
+                    s.active = true;
+                    s.note = (bass_root + if slap_st == 3 { 12 } else { 10 }).min(58);
+                    s.velocity = 0.80;
+                    s.gate = 0.45;
+                    s.accent = true;
+                }
+                if !bass.steps[base + 15].active {
+                    let s = &mut bass.steps[base + 15];
+                    s.active = true;
+                    s.note = if (bar + bass_var) % 2 == 0 {
+                        next_bass.saturating_sub(1).max(33)
+                    } else {
+                        (next_bass + 1).min(58)
+                    };
+                    s.velocity = 0.76;
+                    s.gate = 0.90;
+                    s.slide = true;
+                }
+            }
+            for st in 0..16 {
+                let s = &mut bass.steps[base + st];
+                if !s.active {
+                    continue;
+                }
+                let is_pop = st % 2 == 1 || st == 2 || st == 6 || st == 14 || s.note > bass_root + 5;
+                if st == 0 || (st % 4 == 0 && s.note <= bass_root) {
+                    s.motion = MotionLocks {
+                        cutoff: Some(0.44),
+                        resonance: Some(0.36),
+                        drive: Some(0.48),
+                        shape: None,
+                    };
+                } else if is_pop {
+                    let phase = ((st + bar) % 4) as f32 / 3.0;
+                    s.motion = MotionLocks {
+                        cutoff: Some(0.70 + phase * 0.16),
+                        resonance: Some(0.58 + phase * 0.18),
+                        drive: Some(0.56 + phase * 0.18),
+                        shape: Some(0.65),
+                    };
+                } else {
+                    s.motion = MotionLocks {
+                        cutoff: Some(0.56),
+                        resonance: Some(0.42),
+                        drive: Some(0.46),
+                        shape: Some(0.45),
+                    };
+                }
+            }
+        }
+
+        // 3. ARP / MELODY (Monologue) — Coherent per-song motif locked to chord tones & Vibe scale!
+        let chord_ivs = slot.chord.intervals();
+        for st in 0..16 {
+            if !motif_hit[st] {
+                continue;
+            }
             let s = &mut arp.steps[base + st];
             s.active = true;
-            s.note = if matches!(vibe, Vibe::Dubstep) {
-                (bass_root + 12 + (slot.chord.intervals()[i % slot.chord.intervals().len()])).clamp(40, 60)
+            let bar_shift = if bar == 3 { 1 } else if bar == 1 { 0 } else { bar % 2 };
+            let mut note = if matches!(vibe, Vibe::Dubstep) {
+                (bass_root + 12 + chord_ivs[(motif_deg[st] + bar) % chord_ivs.len()]).clamp(40, 60)
+            } else if motif_use_scale[st] && !scale_notes.is_empty() {
+                let anchor = arp_tones.first().copied().unwrap_or(64);
+                let anchor_pos = scale_notes.iter().position(|&n| n >= anchor).unwrap_or(0);
+                let idx = (anchor_pos + motif_deg[st] + bar_shift) % scale_notes.len();
+                scale_notes[idx]
             } else {
-                arp_tones[tone_idx]
+                arp_tones[(motif_deg[st] + bar_shift) % arp_tones.len().max(1)]
             };
-            s.velocity = if i % 2 == 0 { 0.78 } else { 0.60 };
+            if bar == 3 && st >= 10 && note <= 74 && !matches!(vibe, Vibe::Dubstep) {
+                note = (note + 12).min(86);
+            }
+            s.note = note;
+            s.velocity = if st == 0 || st == 10 { 0.82 } else if st % 2 == 0 { 0.72 } else { 0.62 };
             s.gate = if matches!(vibe, Vibe::Dubstep) {
                 1.8
             } else if matches!(vibe, Vibe::ElectroSoul | Vibe::Synthwave | Vibe::Arena80s | Vibe::IndieRock | Vibe::BigRoomEdm) {
-                1.35
+                (motif_gate[st] * 1.15).clamp(0.4, 3.2)
             } else {
-                0.85
+                motif_gate[st]
             };
-            s.accent = i == 0;
+            s.accent = st == 0 || st == 15;
+            s.slide = motif_slide[st] || (bar == 3 && st == 14);
+            let wah_phase = ((st + bar * 3) % 5) as f32 / 4.0;
+            let syncopated = st % 2 == 1;
+            s.motion = MotionLocks {
+                cutoff: Some(if syncopated { 0.68 + wah_phase * 0.20 } else { 0.52 + wah_phase * 0.16 }),
+                resonance: Some(if syncopated { 0.56 + wah_phase * 0.16 } else { 0.44 + wah_phase * 0.12 }),
+                drive: Some(0.32 + wah_phase * 0.32),
+                shape: Some(0.30 + wah_phase * 0.55),
+            };
         }
 
-        // 4. TB-303 ACID / COUNTER-LINE (active on AcidClub & ElectroFunk, subtle accent elsewhere)
-        if matches!(vibe, Vibe::AcidClub | Vibe::ElectroFunk | Vibe::ItaloCosmic) {
-            let chord_ivs = slot.chord.intervals();
-            let hits: &[usize] = if matches!(vibe, Vibe::AcidClub) {
-                &[0, 2, 3, 6, 8, 10, 11, 14, 15]
-            } else {
-                &[0, 3, 6, 10, 12, 15]
+        // 4. TB-303 ACID / COUNTER-LINE — Generated for all 22 vibes so Party DJ can spotlight it anywhere!
+        {
+            let dense_vibe = matches!(
+                vibe,
+                Vibe::AcidClub | Vibe::ElectroFunk | Vibe::ItaloCosmic | Vibe::DetroitTechno | Vibe::BigRoomEdm | Vibe::EuphoricTrance
+            );
+            let hits: &[usize] = match acid_var {
+                0 => {
+                    if dense_vibe {
+                        &[0, 2, 3, 6, 8, 10, 11, 14, 15]
+                    } else {
+                        &[0, 3, 6, 10, 12, 15]
+                    }
+                }
+                1 => &[2, 5, 6, 10, 13, 14],
+                2 => &[0, 6, 10, 14],
+                _ => {
+                    if bar % 2 == 1 {
+                        &[0, 2, 6, 8, 10, 11, 14, 15]
+                    } else {
+                        &[0, 10]
+                    }
+                }
             };
             for (i, &st) in hits.iter().enumerate() {
-                let iv = chord_ivs[(i + bar) % chord_ivs.len()];
-                let oct_bump = if i % 4 == 2 { 12 } else { 0 };
+                let iv = chord_ivs[(i + bar + (acid_var % 3)) % chord_ivs.len()];
+                let oct_bump = if (i + acid_var) % 3 == 2 { 12 } else { 0 };
                 let s = &mut acid.steps[base + st];
                 s.active = true;
-                s.note = (bass_root + iv + oct_bump).clamp(33, 64);
-                s.velocity = if i % 3 == 0 { 0.94 } else { 0.74 };
-                s.gate = 0.95;
+                s.note = (bass_root + iv + oct_bump).clamp(33, 66);
+                s.velocity = if i % 3 == 0 { 0.92 } else { 0.72 };
+                s.gate = if acid_var == 2 { 1.35 } else { 0.90 };
                 s.accent = i % 3 == 0;
-                s.slide = st == 3 || st == 11 || st == 15;
+                s.slide = st == 3 || st == 11 || st == 14 || st == 15;
+                let sq_phase = ((i + bar) % 4) as f32 / 3.0;
+                s.motion = MotionLocks {
+                    cutoff: Some(0.48 + sq_phase * 0.38),
+                    resonance: Some(0.58 + sq_phase * 0.26),
+                    drive: Some(0.34 + sq_phase * 0.34),
+                    shape: Some(0.60 + sq_phase * 0.30),
+                };
             }
         }
 
         // 5. SAMPLER TEXTURE (Rhodes / Brass / Choir / Bell / Strings / Guitar — 100% chord-root locked!)
-        match vibe {
-            Vibe::LofiChill | Vibe::NeoSoul => {
-                // Warm Rhodes hits on bar downbeat
-                let s = &mut sampler.steps[base];
-                s.active = true;
-                s.note = (48 + (root_note + slot.offset) % 12).clamp(48, 63);
-                s.velocity = 0.78;
-                s.gate = 12.0;
-            }
-            Vibe::BoomBap => {
-                // Chopped 90s jazz-hop Rhodes sample stabs!
-                for &(st, gate, vel) in &[(0, 4.0, 0.84), (10, 3.5, 0.72)] {
-                    let s = &mut sampler.steps[base + st];
+        match sampler_var {
+            0 => match vibe {
+                Vibe::LofiChill | Vibe::NeoSoul => {
+                    let s = &mut sampler.steps[base];
                     s.active = true;
                     s.note = (48 + (root_note + slot.offset) % 12).clamp(48, 63);
-                    s.velocity = vel;
-                    s.gate = gate;
+                    s.velocity = 0.78;
+                    s.gate = 12.0;
                 }
-            }
-            Vibe::Trap808 | Vibe::FutureBass => {
-                // Haunting / sparkling FM bell accents on beat 1 & 3
-                for &(st, vel) in &[(0, 0.78), (8, 0.62)] {
-                    let s = &mut sampler.steps[base + st];
+                Vibe::BoomBap => {
+                    for &(st, gate, vel) in &[(0, 4.0, 0.84), (10, 3.5, 0.72)] {
+                        let s = &mut sampler.steps[base + st];
+                        s.active = true;
+                        s.note = (48 + (root_note + slot.offset) % 12).clamp(48, 63);
+                        s.velocity = vel;
+                        s.gate = gate;
+                    }
+                }
+                Vibe::Trap808 | Vibe::FutureBass => {
+                    for &(st, vel) in &[(0, 0.78), (8, 0.62)] {
+                        let s = &mut sampler.steps[base + st];
+                        s.active = true;
+                        s.note = arp_tones.last().copied().unwrap_or(69);
+                        s.velocity = vel;
+                        s.gate = 4.0;
+                    }
+                }
+                Vibe::Dubstep => {
+                    if bar % 2 == 0 {
+                        let s = &mut sampler.steps[base];
+                        s.active = true;
+                        s.note = (48 + (root_note + slot.offset) % 12).clamp(48, 60);
+                        s.velocity = 0.84;
+                        s.gate = 4.0;
+                    }
+                }
+                Vibe::BigRoomEdm | Vibe::EuphoricTrance | Vibe::Disco70s => {
+                    let s = &mut sampler.steps[base];
                     s.active = true;
-                    s.note = arp_tones.last().copied().unwrap_or(69);
-                    s.velocity = vel;
-                    s.gate = 4.0;
+                    s.note = (60 + (root_note + slot.offset) % 12).clamp(55, 72);
+                    s.velocity = 0.72;
+                    s.gate = 14.0;
                 }
-            }
-            Vibe::Dubstep => {
-                // Menacing brass/choir impact hit on bar 1 & 3 downbeats
+                Vibe::ElectroFunk | Vibe::Arena80s => {
+                    for &st in &[0, 10] {
+                        let s = &mut sampler.steps[base + st];
+                        s.active = true;
+                        s.note = (60 + (root_note + slot.offset) % 12).clamp(55, 72);
+                        s.velocity = if st == 0 { 0.82 } else { 0.68 };
+                        s.gate = 2.0;
+                    }
+                }
+                Vibe::IndieRock => {
+                    for &st in &[0, 6, 10, 14] {
+                        let s = &mut sampler.steps[base + st];
+                        s.active = true;
+                        s.note = (52 + (root_note + slot.offset) % 12).clamp(48, 68);
+                        s.velocity = if st == 0 { 0.86 } else { 0.72 };
+                        s.gate = 2.2;
+                    }
+                }
+                _ => {
+                    if bar % 2 == 0 {
+                        let s = &mut sampler.steps[base + 8];
+                        s.active = true;
+                        s.note = arp_tones.last().copied().unwrap_or(69);
+                        s.velocity = 0.64;
+                        s.gate = 4.0;
+                    }
+                }
+            },
+            1 => {
                 if bar % 2 == 0 {
                     let s = &mut sampler.steps[base];
                     s.active = true;
-                    s.note = (48 + (root_note + slot.offset) % 12).clamp(48, 60);
-                    s.velocity = 0.84;
-                    s.gate = 4.0;
+                    s.note = (54 + (root_note + slot.offset) % 12).clamp(48, 70);
+                    s.velocity = 0.76;
+                    s.gate = 12.0;
                 }
             }
-            Vibe::BigRoomEdm | Vibe::EuphoricTrance => {
-                // Soaring festival choir swell on every bar
-                let s = &mut sampler.steps[base];
-                s.active = true;
-                s.note = (60 + (root_note + slot.offset) % 12).clamp(55, 72);
-                s.velocity = 0.72;
-                s.gate = 14.0;
-            }
-            Vibe::ElectroFunk | Vibe::Arena80s => {
-                // Funky brass / OB-X power stabs on beat 1 & 3.5!
-                for &st in &[0, 10] {
-                    let s = &mut sampler.steps[base + st];
-                    s.active = true;
-                    s.note = (60 + (root_note + slot.offset) % 12).clamp(55, 72);
-                    s.velocity = if st == 0 { 0.82 } else { 0.68 };
-                    s.gate = 2.0;
-                }
-            }
-            Vibe::Disco70s => {
-                // 70s Solina string swell on every bar
-                let s = &mut sampler.steps[base];
-                s.active = true;
-                s.note = (60 + (root_note + slot.offset) % 12).clamp(55, 72);
-                s.velocity = 0.74;
-                s.gate = 14.0;
-            }
-            Vibe::IndieRock => {
-                // Plucked Karplus-Strong Electric Guitar riff accents!
-                for &st in &[0, 6, 10, 14] {
+            2 => {
+                let hits: &[usize] = if bar % 2 == 0 { &[0, 10] } else { &[6, 14] };
+                for &st in hits {
                     let s = &mut sampler.steps[base + st];
                     s.active = true;
                     s.note = (52 + (root_note + slot.offset) % 12).clamp(48, 68);
-                    s.velocity = if st == 0 { 0.86 } else { 0.72 };
-                    s.gate = 2.2;
+                    s.velocity = if st == 0 { 0.80 } else { 0.66 };
+                    s.gate = 2.5;
                 }
             }
-            Vibe::ElectroSoul | Vibe::DeepHouse | Vibe::ItaloCosmic => {
-                // Gentle shimmer bell / Rhodes accent on bar 1 & 3
-                if bar % 2 == 0 {
-                    let s = &mut sampler.steps[base + 8];
-                    s.active = true;
-                    s.note = arp_tones.last().copied().unwrap_or(69);
-                    s.velocity = 0.62;
-                    s.gate = 4.0;
+            _ => {
+                if bar % 2 == 1 {
+                    for &st in &[4usize, 12] {
+                        let s = &mut sampler.steps[base + st];
+                        s.active = true;
+                        s.note = arp_tones[(st / 4 + bar) % arp_tones.len().max(1)];
+                        s.velocity = 0.68;
+                        s.gate = 3.0;
+                    }
                 }
             }
-            _ => {}
         }
     }
 
