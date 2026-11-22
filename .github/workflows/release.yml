@@ -3,233 +3,68 @@ name: Release Packages
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag to build and attach packages to'
-        required: true
-        default: 'v1.3.1'
+      - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build-deb-tar:
-    name: Build Debian (.deb) & Linux Tarball
+  linux-deb-rpm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: .ci-packaging
-          sparse-checkout: packaging
-
-      - name: Build .deb and generic Linux .tar.gz in Ubuntu 22.04
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+      - name: Install Linux audio/GUI build deps
         run: |
-          VER="${TAG#v}"
-          VER="${VER#V}"
-          HOST_UID="$(id -u)"
-          HOST_GID="$(id -g)"
-          export VER HOST_UID HOST_GID
-          docker run --rm \
-            -e TAG="$TAG" -e VER="$VER" -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" \
-            -v "$PWD:/work" -w /work \
-            ubuntu:22.04 bash -euxo pipefail -c '
-              DEBIAN_FRONTEND=noninteractive apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                build-essential ca-certificates curl dpkg-dev libasound2-dev pkg-config tar
-              curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-              export PATH="/root/.cargo/bin:$PATH"
-              export CARGO_TARGET_DIR=/tmp/cargo-target
-              cargo build --release --locked
-              mkdir -p /work/dist
-              bash .ci-packaging/packaging/deb/build-deb.sh "$VER" /tmp/cargo-target/release/fun-key-synth /work/dist
-              TAR_DIR="/tmp/fun-key-synth-${TAG}-linux-x86_64"
-              mkdir -p "$TAR_DIR"
-              install -Dm755 /tmp/cargo-target/release/fun-key-synth "$TAR_DIR/fun-key-synth"
-              strip --strip-unneeded "$TAR_DIR/fun-key-synth"
-              cp /work/README.md "$TAR_DIR/README.md"
-              if [ -f /work/LICENSE ]; then
-                cp /work/LICENSE "$TAR_DIR/LICENSE"
-              fi
-              tar -C /tmp -czf "/work/dist/fun-key-synth-${TAG}-linux-x86_64.tar.gz" "fun-key-synth-${TAG}-linux-x86_64"
-              readelf -V /tmp/cargo-target/release/fun-key-synth | grep -oE "GLIBC_[0-9.]+" | sort -Vu | tail -n 10 || true
-              chown -R "$HOST_UID:$HOST_GID" /work/dist
-            '
-
-      - uses: actions/upload-artifact@v4
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libgtk-3-dev libxkbcommon-dev libwayland-dev rpm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deb and cargo-generate-rpm
+        run: cargo install cargo-deb cargo-generate-rpm
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Build .deb
+        run: cargo deb --no-build
+      - name: Build .rpm
+        run: cargo generate-rpm
+      - name: Upload .deb and .rpm to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: linux-deb-tar
-          path: dist/*
-          if-no-files-found: error
+          files: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
 
-  build-rpm:
-    name: Build RPM (.rpm)
+  arch-pkg:
     runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: .ci-packaging
-          sparse-checkout: packaging
-
-      - name: Build .rpm in AlmaLinux 9
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm rust cargo alsa-lib git
+      - name: Build release binary and Arch package
         run: |
-          VER="${TAG#v}"
-          VER="${VER#V}"
-          HOST_UID="$(id -u)"
-          HOST_GID="$(id -g)"
-          export VER HOST_UID HOST_GID
-          docker run --rm \
-            -e VER="$VER" -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" \
-            -v "$PWD:/work" -w /work \
-            almalinux:9 bash -euxo pipefail -c '
-              dnf install -y gcc gcc-c++ pkgconf-pkg-config alsa-lib-devel rpm-build binutils tar
-              curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-              export PATH="/root/.cargo/bin:$PATH"
-              export CARGO_TARGET_DIR=/tmp/cargo-target
-              cargo build --release --locked
-              mkdir -p /work/dist
-              rpmbuild -bb \
-                --define "_topdir /tmp/rpmbuild" \
-                --define "_version ${VER}" \
-                --define "_source_dir /work" \
-                --define "_binary_path /tmp/cargo-target/release/fun-key-synth" \
-                .ci-packaging/packaging/rpm/fun-key-synth.spec
-              cp /tmp/rpmbuild/RPMS/x86_64/fun-key-synth-${VER}-*.x86_64.rpm /work/dist/
-              rpm -qip /work/dist/fun-key-synth-${VER}-*.x86_64.rpm
-              rpm -qlp /work/dist/fun-key-synth-${VER}-*.x86_64.rpm
-              rpm -qpR /work/dist/fun-key-synth-${VER}-*.x86_64.rpm
-              chown -R "$HOST_UID:$HOST_GID" /work/dist
-            '
-
-      - uses: actions/upload-artifact@v4
+          cargo build --release --locked
+          useradd -m builder
+          chown -R builder:builder .
+          su builder -c "makepkg -f"
+      - name: Upload .pkg.tar.zst to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: linux-rpm
-          path: dist/*
-          if-no-files-found: error
+          files: "*.pkg.tar.zst"
 
-  build-arch:
-    name: Build Arch Package (.pkg.tar.zst)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: .ci-packaging
-          sparse-checkout: packaging
-
-      - name: Build .pkg.tar.zst in Arch Linux
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          VER="${TAG#v}"
-          VER="${VER#V}"
-          HOST_UID="$(id -u)"
-          HOST_GID="$(id -g)"
-          export VER HOST_UID HOST_GID
-          docker run --rm \
-            -e VER="$VER" -e HOST_UID="$HOST_UID" -e HOST_GID="$HOST_GID" \
-            -v "$PWD:/work" -w /work \
-            archlinux:latest bash -euxo pipefail -c '
-              pacman -Syu --noconfirm --needed base-devel rust alsa-lib libxkbcommon wayland libglvnd
-              useradd -m builder
-              mkdir -p /tmp/build
-              tar --exclude=./.git --exclude=./target --exclude=./.ci-packaging --exclude=./dist -C /work -cf - . | tar -C /tmp/build -xf -
-              mkdir -p /tmp/build/packaging/arch
-              cp .ci-packaging/packaging/arch/PKGBUILD /tmp/build/packaging/arch/PKGBUILD
-              sed -i "s/^pkgver=.*/pkgver=${VER}/" /tmp/build/packaging/arch/PKGBUILD
-              chown -R builder:builder /tmp/build
-              su - builder -c "cd /tmp/build/packaging/arch && makepkg -f --noconfirm"
-              mkdir -p /work/dist
-              cp /tmp/build/packaging/arch/fun-key-synth-${VER}-*.pkg.tar.zst /work/dist/
-              ls -lh /work/dist/
-              tar --zstd -tf /work/dist/fun-key-synth-${VER}-*.pkg.tar.zst
-              chown -R "$HOST_UID:$HOST_GID" /work/dist
-            '
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: linux-arch
-          path: dist/*
-          if-no-files-found: error
-
-  build-windows:
-    name: Build Windows x86_64 (.zip)
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build release binary
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Windows release
         run: cargo build --release --locked
-
-      - name: Package Windows ZIP
+      - name: Package Windows zip
         shell: pwsh
-        run: |
-          $tag = "${{ inputs.tag || github.ref_name }}"
-          $dir = "fun-key-synth-$tag-windows-x86_64"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item "target/release/fun-key-synth.exe" "$dir/fun-key-synth.exe"
-          Copy-Item "README.md" "$dir/README.md"
-          if (Test-Path "LICENSE") {
-            Copy-Item "LICENSE" "$dir/LICENSE"
-          }
-          Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
-
-      - uses: actions/upload-artifact@v4
+        run: Compress-Archive -Path target/release/fun-key-synth.exe -DestinationPath fun-key-synth-windows-x86_64.zip
+      - name: Upload Windows binary and zip to Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: windows-zip
-          path: fun-key-synth-*.zip
-          if-no-files-found: error
-
-  publish-release:
-    name: Publish Release Assets
-    needs: [build-deb-tar, build-rpm, build-arch, build-windows]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Verify collected artifacts
-        run: ls -lh dist/
-
-      - name: Create or update GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release create "$TAG" \
-              --repo "${{ github.repository }}" \
-              --title "Fun Key Synth $TAG" \
-              --generate-notes
-          fi
-          gh release upload "$TAG" dist/* \
-            --repo "${{ github.repository }}" \
-            --clobber
+          files: |
+            target/release/fun-key-synth.exe
+            fun-key-synth-windows-x86_64.zip
