@@ -101,6 +101,19 @@ impl StudioTheme {
         }
     }
 
+    pub const fn control_bg(self) -> Color32 {
+        match self {
+            StudioTheme::Midnight => Color32::from_rgb(34, 42, 60),
+            StudioTheme::NeonSynthwave => Color32::from_rgb(46, 28, 72),
+            StudioTheme::AmberAnalog => Color32::from_rgb(50, 36, 26),
+            StudioTheme::AcidTerminal => Color32::from_rgb(24, 40, 30),
+            StudioTheme::NordicFrost => Color32::from_rgb(56, 68, 86),
+            StudioTheme::Oberheim80s => Color32::from_rgb(34, 46, 72),
+            StudioTheme::Solina70s => Color32::from_rgb(62, 44, 30),
+            StudioTheme::Daylight => Color32::from_rgb(214, 222, 234),
+        }
+    }
+
     pub const fn default_accent(self) -> [u8; 3] {
         match self {
             StudioTheme::Midnight => [64, 196, 255],
@@ -178,9 +191,11 @@ impl AppSettings {
         };
         visuals.window_fill = self.theme.bar_bg();
         visuals.panel_fill = self.theme.panel_bg();
+        visuals.slider_trailing_fill = true;
+        visuals.widgets.inactive.bg_fill = self.theme.control_bg();
         if !self.theme.is_light() {
             visuals.widgets.noninteractive.bg_fill = self.theme.card_bg();
-            visuals.widgets.inactive.bg_fill = self.theme.bar_bg();
+            visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, self.theme.border());
             visuals.widgets.hovered.bg_fill = self.theme.border();
             visuals.widgets.active.bg_fill = self.theme.border();
         }

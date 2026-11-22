@@ -2367,6 +2367,30 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    #[cfg(test)]
+    pub fn start_silent(project: Project) -> Self {
+        Self {
+            _stream: None,
+            project: Arc::new(Mutex::new(project)),
+            playing: Arc::new(AtomicBool::new(false)),
+            current_step: Arc::new(AtomicUsize::new(0)),
+            scope: Arc::new(OutputScope::new(256)),
+            status: "Stereo Audio Live @ 44100 Hz".into(),
+            drum_cut: Arc::new(AtomicBool::new(false)),
+            snare_build: Arc::new(AtomicBool::new(false)),
+            selected_sample_part: Arc::new(AtomicUsize::new(0)),
+            live_queue: Arc::new(Mutex::new(VecDeque::new())),
+            telemetry: Arc::new(Mutex::new(EngineTelemetry::default())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_telemetry_for_test(&self, t: EngineTelemetry) {
+        if let Ok(mut guard) = self.telemetry.lock() {
+            *guard = t;
+        }
+    }
+
     pub fn start(project: Project) -> Self {
         let project = Arc::new(Mutex::new(project));
         let playing = Arc::new(AtomicBool::new(false));

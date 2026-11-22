@@ -6,6 +6,7 @@ use crate::{
     engine::{render_resample_mono, AudioEngine, EngineTelemetry, LiveEvent},
     mic::MicRecorder,
     model::{GlobalFilterMode, LoopMode, Project, SamplerMode, SavedSample, TrackId},
+    settings::StudioTheme,
 };
 use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use std::sync::atomic::Ordering;
@@ -159,6 +160,7 @@ pub fn render_volca_sampler(
     test_repeat_on: &mut bool,
     test_repeat_next_t: &mut f64,
     accent: Color32,
+    theme: StudioTheme,
 ) -> Option<String> {
     let mut toast_msg: Option<String> = None;
     let sel = state.selected_part.min(proj.sample_parts.len().saturating_sub(1));
@@ -169,7 +171,7 @@ pub fn render_volca_sampler(
     let samp_color = Color32::from_rgb(255, 198, 72);
 
     // 1. TOP VOLCA PERFORMANCE BAR + ANALOG ISOLATOR
-    card(ui, |ui| {
+    card(ui, theme, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new("VOLCA 8-PART PERFORMANCE SAMPLER")
@@ -294,23 +296,25 @@ pub fn render_volca_sampler(
                 }
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ch = &mut proj.mixer.channels[TrackId::Sampler.index()];
+            ui.separator();
+            let ch = &mut proj.mixer.channels[TrackId::Sampler.index()];
+            let m_btn = egui::Button::new(
+                RichText::new(if ch.mute { "MUTED" } else { "ACTIVE" })
+                    .strong()
+                    .size(11.0)
+                    .color(Color32::WHITE),
+            )
+            .fill(if ch.mute {
+                Color32::from_rgb(200, 62, 74)
+            } else {
+                Color32::from_rgb(46, 132, 92)
+            });
+            if ui.add(m_btn).clicked() {
+                ch.mute = !ch.mute;
+            }
+            ui.scope(|ui| {
+                ui.spacing_mut().slider_width = 96.0;
                 ui.add(egui::Slider::new(&mut ch.volume, 0.0..=1.15).text("Bus Vol").max_decimals(2));
-                let m_btn = egui::Button::new(
-                    RichText::new(if ch.mute { "MUTED" } else { "ACTIVE" })
-                        .strong()
-                        .size(11.0)
-                        .color(Color32::WHITE),
-                )
-                .fill(if ch.mute {
-                    Color32::from_rgb(200, 62, 74)
-                } else {
-                    Color32::from_rgb(46, 132, 92)
-                });
-                if ui.add(m_btn).clicked() {
-                    ch.mute = !ch.mute;
-                }
             });
         });
 
@@ -382,10 +386,10 @@ pub fn render_volca_sampler(
     ui.add_space(8.0);
 
     // 2. 8 LARGE PERFORMANCE PADS (Click/Hold to Trigger & Select, Right-Click for Pad Menu!)
-    card(ui, |ui| {
+    card(ui, theme, |ui| {
         ui.horizontal(|ui| {
             let avail = ui.available_width();
-            let pad_w = ((avail - 7.0 * 6.0) / 8.0).clamp(72.0, 160.0);
+            let pad_w = ((avail - 7.0 * 6.0) / 8.0).clamp(52.0, 220.0);
             let pad_h = 66.0;
             ui.spacing_mut().item_spacing.x = 6.0;
 
@@ -551,7 +555,7 @@ pub fn render_volca_sampler(
     ui.columns(2, |cols| {
         // LEFT: 8-Lane Performance Step Sequencer
         cols[0].vertical(|ui| {
-            card(ui, |ui| {
+            card(ui, theme, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("8-PART SAMPLE SEQUENCER").strong().size(12.5).color(samp_color));
                     ui.separator();
@@ -573,7 +577,7 @@ pub fn render_volca_sampler(
                 let page_start = (*bar_page) * 16;
                 let play_step = if playing { Some(cur_step % 64) } else { None };
                 let active_pat = proj.active_pattern;
-                let cell_w = ((ui.available_width() - 68.0 - 15.0 * 3.0) / 16.0).clamp(16.0, 34.0);
+                let cell_w = ((ui.available_width() - 68.0 - 15.0 * 3.0) / 16.0).clamp(16.0, 44.0);
                 let cell_h = 22.0;
 
                 for part_idx in 0..8 {
@@ -836,7 +840,7 @@ pub fn render_volca_sampler(
         // RIGHT: SELECTED PAD WAVEFORM + VOLCA TUNING CONTROLS
         cols[1].vertical(|ui| {
             let pc = PAD_COLORS[sel];
-            card(ui, |ui| {
+            card(ui, theme, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("PAD {} — {}", sel + 1, proj.sample_parts[sel].name))
@@ -981,7 +985,7 @@ pub fn render_volca_sampler(
 
                 // Volca Pad Parameters
                 ui.add(egui::Slider::new(&mut part.speed, 0.25..=2.0).suffix("x").max_decimals(2).text("Speed"));
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for &(spd, lbl) in &[(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
                         if ui.selectable_label((part.speed - spd).abs() < 0.01, lbl).clicked() {
                             part.speed = spd;
@@ -994,7 +998,7 @@ pub fn render_volca_sampler(
                     ui.selectable_value(&mut part.loop_mode, LoopMode::PingPong, "Ping");
                 });
                 ui.add(egui::Slider::new(&mut part.transpose, -24..=24).suffix(" st").text("Pitch"));
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Choke:");
                     ui.selectable_value(&mut part.choke_group, 0, "Off");
                     ui.selectable_value(&mut part.choke_group, 1, "Grp 1");
@@ -1004,7 +1008,7 @@ pub fn render_volca_sampler(
                     ui.selectable_value(&mut part.mode, SamplerMode::Vintage12Bit, "12-Bit");
                     ui.selectable_value(&mut part.mode, SamplerMode::Sk1LoFi, "8-Bit");
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Filter:");
                     ui.selectable_value(&mut part.filter_mode, GlobalFilterMode::LowPass, "LP");
                     ui.selectable_value(&mut part.filter_mode, GlobalFilterMode::BandPass, "BP");
@@ -1025,13 +1029,16 @@ pub fn render_volca_sampler(
     toast_msg
 }
 
-fn card(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+fn card(ui: &mut egui::Ui, theme: StudioTheme, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
-        .fill(Color32::from_rgb(18, 22, 32))
+        .fill(theme.card_bg())
         .rounding(Rounding::same(10.0))
         .inner_margin(egui::Margin::same(12.0))
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(34, 41, 58)))
-        .show(ui, add_contents);
+        .stroke(Stroke::new(1.0_f32, theme.border()))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
 }
 
 fn compute_peaks(pcm: &[f32], bins: usize) -> Vec<(f32, f32)> {
