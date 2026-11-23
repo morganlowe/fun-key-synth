@@ -68,3 +68,23 @@ jobs:
           files: |
             target/release/fun-key-synth.exe
             fun-key-synth-windows-x86_64.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build macOS Apple Silicon (arm64) and Intel (x86_64) releases
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          tar -czf fun-key-synth-macos-arm64.tar.gz -C target/aarch64-apple-darwin/release fun-key-synth
+          tar -czf fun-key-synth-macos-x86_64.tar.gz -C target/x86_64-apple-darwin/release fun-key-synth
+      - name: Upload macOS archives to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fun-key-synth-macos-arm64.tar.gz
+            fun-key-synth-macos-x86_64.tar.gz
