@@ -1,16 +1,17 @@
 use crate::{
     dsp::sampler::{load_audio_to_mono_f32, BUILTIN_SAMPLE_NAMES},
-    engine::{export_stems, export_wav, AudioEngine, LiveEvent},
+    engine::{export_stems, export_wav, AudioEngine, EngineTelemetry, LiveEvent},
     mic::MicRecorder,
     midi::{MidiManager, MidiMsg},
     model::{
         apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads,
         generate_auto_beat, generate_extra_track_seq, generate_melodic_tracks, load_pattern,
         load_project, note_name, root_name, save_pattern, save_project, voice_preset_names,
-        AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
+        AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack,
+        FilterEnvTrigger, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
         MonologueOscWave, MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project, SamplerMode,
-        SavedSample, Scale, SongSection, Tb303Wave, TrackId, Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES,
-        PROGRESSIONS,
+        SavedSample, Scale, SongSection, Tb303Wave, TrackFilterParams, TrackId, Vibe,
+        MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
         restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
@@ -60,6 +61,7 @@ pub struct FunKeySynthApp {
     rec_motion: bool,
     settings: AppSettings,
     show_settings: bool,
+    show_drop_setup: bool,
     update_status: Arc<Mutex<UpdateStatus>>,
     // Sound Lab / Sampler Auto-Repeat Test Note
     test_repeat_on: bool,
@@ -124,6 +126,7 @@ impl FunKeySynthApp {
             rec_motion: false,
             settings,
             show_settings: false,
+            show_drop_setup: false,
             update_status,
             test_repeat_on: false,
             test_repeat_mode: TestRepeatMode::Quarter,
@@ -1191,7 +1194,7 @@ impl FunKeySynthApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
                     StudioTab::Studio => {
-                        self.ui_studio(ui, ctx, &mut proj, playing, cur_step, accent, theme)
+                        self.ui_studio(ui, ctx, &mut proj, &telemetry, playing, cur_step, accent, theme)
                     }
                     StudioTab::Sampler => {
                         if let Some(msg) = crate::volca_ui::render_volca_sampler(
@@ -1399,6 +1402,7 @@ impl FunKeySynthApp {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         proj: &mut Project,
+        tel: &EngineTelemetry,
         playing: bool,
         cur_step: usize,
         accent: Color32,
@@ -1524,7 +1528,7 @@ impl FunKeySynthApp {
         ui.add_space(8.0);
 
         // 3. VIBE MACROS & LIVE DJ PERFORMANCE STRIP
-        self.ui_vibe_macros_and_dj_card(ui, proj, playing, cur_step, accent, theme);
+        self.ui_vibe_macros_and_dj_card(ui, proj, tel, playing, cur_step, accent, theme);
     }
 
     fn ui_studio_tracks_card(
@@ -2310,6 +2314,10 @@ impl FunKeySynthApp {
                 }
             });
 
+            ui.add_space(4.0);
+            let f_params = track_filter_mut(proj, self.selected_track, self.selected_extra);
+            ui_instrument_filter_bar(ui, f_params, tc, theme);
+
             ui.add_space(6.0);
 
             let page_start = self.bar_page * 16;
@@ -2777,6 +2785,7 @@ impl FunKeySynthApp {
         &mut self,
         ui: &mut egui::Ui,
         proj: &mut Project,
+        tel: &EngineTelemetry,
         playing: bool,
         cur_step: usize,
         accent: Color32,
@@ -2907,17 +2916,182 @@ impl FunKeySynthApp {
 
             ui.add_space(6.0);
 
+            // GLOBAL FILTER & ENVELOPE STRIP (directly beneath Vibe Macros!)
+            egui::Frame::none()
+                .fill(theme.control_bg())
+                .rounding(Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                .stroke(Stroke::new(1.0_f32, theme.border()))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(RichText::new("GLOBAL FILTER").strong().size(11.5).color(accent));
+                        toggle_pill(
+                            ui,
+                            if proj.fx.global_filter_enabled { "ON" } else { "OFF" },
+                            &mut proj.fx.global_filter_enabled,
+                            accent,
+                            "Enable/bypass global DJ filter",
+                        );
+                        ui.selectable_value(&mut proj.fx.global_filter_mode, GlobalFilterMode::LowPass, "LP");
+                        ui.selectable_value(&mut proj.fx.global_filter_mode, GlobalFilterMode::HighPass, "HP");
+                        ui.selectable_value(&mut proj.fx.global_filter_mode, GlobalFilterMode::BandPass, "BP");
+                        ui.label(RichText::new("Cut").size(11.0).weak());
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = 108.0;
+                            if ui
+                                .add(
+                                    egui::Slider::new(&mut proj.fx.global_filter_cutoff, 45.0..=18_000.0)
+                                        .logarithmic(true)
+                                        .show_value(false)
+                                        .trailing_fill(true),
+                                )
+                                .changed()
+                                && self.rec_motion
+                                && playing
+                            {
+                                let norm = ((proj.fx.global_filter_cutoff.clamp(120.0, 18_000.0) / 120.0).ln()
+                                    / (18_000.0_f32 / 120.0).ln())
+                                .clamp(0.0, 1.0);
+                                proj.current_pattern_mut().motion.filter[cur_step % 64] = Some(norm);
+                            }
+                        });
+                        ui.label(RichText::new(format_hz(proj.fx.global_filter_cutoff)).size(11.0).color(accent));
+                        ui.label(RichText::new("Res").size(11.0).weak());
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = 72.0;
+                            ui.add(
+                                egui::Slider::new(&mut proj.fx.global_filter_resonance, 0.0..=0.88)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            );
+                        });
+                        ui.label(RichText::new(format!("{:.0}%", proj.fx.global_filter_resonance * 100.0)).size(11.0).weak());
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let env_col = Color32::from_rgb(138, 198, 255);
+                        ui.label(RichText::new("FILTER ENV").strong().size(11.5).color(env_col));
+                        ui.label(RichText::new("Trig").size(11.0).weak());
+                        egui::ComboBox::from_id_salt("gfilt_env_trig")
+                            .width(76.0)
+                            .selected_text(proj.fx.global_filter_env_trigger.name())
+                            .show_ui(ui, |ui| {
+                                for &t in &FilterEnvTrigger::ALL {
+                                    ui.selectable_value(&mut proj.fx.global_filter_env_trigger, t, t.name());
+                                }
+                            });
+                        ui.label(RichText::new("Amt").size(11.0).weak());
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = 80.0;
+                            ui.add(
+                                egui::Slider::new(&mut proj.fx.global_filter_env_amount, -1.0..=1.0)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            );
+                        });
+                        ui.label(RichText::new(format!("{:+.0}%", proj.fx.global_filter_env_amount * 100.0)).size(11.0).color(env_col));
+                        ui.label(RichText::new("Atk").size(11.0).weak());
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = 64.0;
+                            ui.add(
+                                egui::Slider::new(&mut proj.fx.global_filter_env_attack, 0.002..=1.5)
+                                    .logarithmic(true)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            );
+                        });
+                        ui.label(RichText::new(format!("{:.0}ms", proj.fx.global_filter_env_attack * 1000.0)).size(10.5).weak());
+                        ui.label(RichText::new("Dec").size(11.0).weak());
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = 64.0;
+                            ui.add(
+                                egui::Slider::new(&mut proj.fx.global_filter_env_decay, 0.04..=3.0)
+                                    .logarithmic(true)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            );
+                        });
+                        ui.label(RichText::new(format!("{:.0}ms", proj.fx.global_filter_env_decay * 1000.0)).size(10.5).weak());
+                        if ui
+                            .small_button("Fire Env")
+                            .on_hover_text("Trigger the global filter envelope right now")
+                            .clicked()
+                        {
+                            self.engine.send_live(LiveEvent::TriggerGlobalFilterEnv);
+                        }
+                        let meter_r = ui.allocate_exact_size(Vec2::new(34.0, 12.0), Sense::hover()).0;
+                        ui.painter().rect_filled(meter_r, Rounding::same(3.0), Color32::from_rgb(12, 15, 22));
+                        let fill_w = (meter_r.width() * tel.global_filter_env_level.clamp(0.0, 1.0)).max(0.0);
+                        if fill_w > 1.0 {
+                            let fill_r = egui::Rect::from_min_size(meter_r.min, Vec2::new(fill_w, meter_r.height()));
+                            ui.painter().rect_filled(fill_r, Rounding::same(3.0), env_col);
+                        }
+                    });
+                });
+
+            ui.add_space(6.0);
+
             // Live DJ Performance Buttons
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("DJ LIVE:").strong().size(12.0).color(Color32::from_rgb(255, 168, 52)));
                 ui.separator();
 
-                let drop_btn = egui::Button::new(RichText::new("BASS DROP").strong().color(Color32::WHITE))
-                    .fill(Color32::from_rgb(208, 66, 98))
-                    .min_size(Vec2::new(104.0, 28.0));
-                if ui.add(drop_btn).on_hover_text("Fires a key-locked sub bass dive!").clicked() {
+                let (drop_label, drop_fill, drop_tip) = match tel.drop_phase.as_str() {
+                    "BUILD" => (
+                        format!("BUILD {:.0}%", tel.drop_progress * 100.0),
+                        Color32::from_rgb(245, 148, 36),
+                        "Drop macro building! Click again to cancel build.",
+                    ),
+                    "HOLD..." => (
+                        "HOLD...".to_string(),
+                        Color32::from_rgb(42, 198, 232),
+                        "Pre-drop tension cut! Massive impact incoming...",
+                    ),
+                    "DROP!" => (
+                        "DROP!".to_string(),
+                        Color32::from_rgb(235, 58, 138),
+                        "Drop impact active! Click to queue another drop.",
+                    ),
+                    _ => (
+                        "BASS DROP".to_string(),
+                        Color32::from_rgb(208, 66, 98),
+                        "Launches configurable multi-stage Bass Drop Macro: cuts instruments, accelerates drums, sweeps riser -> massive layered impact!",
+                    ),
+                };
+                let drop_btn = egui::Button::new(RichText::new(drop_label).strong().color(Color32::WHITE))
+                    .fill(drop_fill)
+                    .min_size(Vec2::new(112.0, 28.0));
+                if ui.add(drop_btn).on_hover_text(drop_tip).clicked() {
                     self.engine.send_live(LiveEvent::TriggerBassDrop);
                 }
+
+                let auto_lbl = match proj.drop_macro.auto_drop_bars {
+                    0 => "Off",
+                    8 => "8 Bars",
+                    16 => "16 Bars",
+                    _ => "32 Bars",
+                };
+                ui.label(RichText::new("Auto:").size(11.0).weak());
+                egui::ComboBox::from_id_salt("auto_drop_combo")
+                    .width(68.0)
+                    .selected_text(auto_lbl)
+                    .show_ui(ui, |ui| {
+                        for &(bars, lbl) in &[(0u16, "Off"), (8, "8 Bars"), (16, "16 Bars"), (32, "32 Bars")] {
+                            ui.selectable_value(&mut proj.drop_macro.auto_drop_bars, bars, lbl);
+                        }
+                    });
+
+                toggle_pill(
+                    ui,
+                    "Drop Setup",
+                    &mut self.show_drop_setup,
+                    Color32::from_rgb(235, 118, 86),
+                    "Configure Drop Macro build length, instrument cuts, accelerating drums, riser sweep, pre-drop gap & auto-drop",
+                );
 
                 let mut drum_cut = self.engine.drum_cut.load(Ordering::Relaxed);
                 let cut_btn = egui::Button::new(
@@ -2975,6 +3149,57 @@ impl FunKeySynthApp {
                     self.engine.send_live(LiveEvent::TriggerFill);
                 }
             });
+
+            if self.show_drop_setup {
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(theme.control_bg())
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(235, 118, 86)))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        let dm = &mut proj.drop_macro;
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                RichText::new("DROP SETUP:")
+                                    .strong()
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(255, 168, 52)),
+                            );
+                            ui.label(RichText::new("Build:").size(11.0).weak());
+                            for &(b, lbl) in &[(1u8, "1B"), (2, "2B"), (4, "4B")] {
+                                ui.selectable_value(&mut dm.build_bars, b, lbl);
+                            }
+                            ui.separator();
+                            ui.label(RichText::new("Cut:").size(11.0).weak());
+                            ui.checkbox(&mut dm.cut_drums, "Drums");
+                            ui.checkbox(&mut dm.cut_bass, "Bass");
+                            ui.checkbox(&mut dm.cut_chords, "Chords");
+                            ui.checkbox(&mut dm.cut_lead, "Lead/303");
+                            ui.separator();
+                            ui.checkbox(&mut dm.drum_accel, "Drum Accel");
+                            ui.checkbox(&mut dm.riser_sweep, "Riser Sweep");
+                            ui.separator();
+                            ui.label(RichText::new("Gap:").size(11.0).weak());
+                            for &(g, lbl) in &[(0u8, "0"), (2, "1/2B"), (4, "1B")] {
+                                ui.selectable_value(&mut dm.pre_drop_gap_steps, g, lbl);
+                            }
+                            ui.separator();
+                            ui.label(RichText::new("Impact").size(11.0).weak());
+                            ui.scope(|ui| {
+                                ui.spacing_mut().slider_width = 74.0;
+                                ui.add(
+                                    egui::Slider::new(&mut dm.impact_intensity, 0.2..=1.0)
+                                        .show_value(false)
+                                        .trailing_fill(true),
+                                );
+                            });
+                            ui.label(RichText::new(format!("{:.0}%", dm.impact_intensity * 100.0)).size(11.0).weak());
+                        });
+                    });
+            }
         });
     }
 
@@ -3321,7 +3546,13 @@ impl FunKeySynthApp {
                                     if active { tc } else { Color32::from_rgb(48, 56, 78) },
                                 ));
                                 if ui.add(pbtn).clicked() {
-                                    if let Some(ei) = active_extra {
+                                    {
+                        let f_params = track_filter_mut(proj, self.selected_track, active_extra);
+                        ui_instrument_filter_bar(ui, f_params, tc, theme);
+                        ui.add_space(6.0);
+                    }
+
+                    if let Some(ei) = active_extra {
                                         apply_extra_track_preset(&mut proj.extra_tracks[ei], pi);
                                         proj.extra_tracks[ei].name = pname.to_string();
                                     } else {
@@ -3332,6 +3563,12 @@ impl FunKeySynthApp {
                         });
                         ui.add_space(6.0);
                         ui.separator();
+                    }
+
+                    {
+                        let f_params = track_filter_mut(proj, self.selected_track, active_extra);
+                        ui_instrument_filter_bar(ui, f_params, tc, theme);
+                        ui.add_space(6.0);
                     }
 
                     if let Some(ei) = active_extra {
@@ -3511,8 +3748,17 @@ impl FunKeySynthApp {
                         ui.selectable_value(&mut fx.global_filter_mode, GlobalFilterMode::HighPass, "HP");
                         ui.selectable_value(&mut fx.global_filter_mode, GlobalFilterMode::BandPass, "BP");
                     });
-                    ui.add(egui::Slider::new(&mut fx.global_filter_cutoff, 80.0..=18_000.0).logarithmic(true).text("Cutoff Hz"));
-                    ui.add(egui::Slider::new(&mut fx.global_filter_resonance, 0.0..=0.85).text("Resonance"));
+                    ui.add(egui::Slider::new(&mut fx.global_filter_cutoff, 45.0..=18_000.0).logarithmic(true).text("Cutoff Hz"));
+                    ui.add(egui::Slider::new(&mut fx.global_filter_resonance, 0.0..=0.88).text("Resonance"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Env Trig:");
+                        for &t in &FilterEnvTrigger::ALL {
+                            ui.selectable_value(&mut fx.global_filter_env_trigger, t, t.name());
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut fx.global_filter_env_amount, -1.0..=1.0).text("Env Amount"));
+                    ui.add(egui::Slider::new(&mut fx.global_filter_env_attack, 0.002..=1.5).logarithmic(true).text("Env Attack"));
+                    ui.add(egui::Slider::new(&mut fx.global_filter_env_decay, 0.04..=3.0).logarithmic(true).text("Env Decay"));
                     ui.add(egui::Slider::new(&mut fx.analog_warmth, 0.0..=1.0).text("Tape Warmth"));
                 });
 
@@ -3692,6 +3938,87 @@ fn monologue_controls(ui: &mut egui::Ui, m: &mut crate::model::MonologueParams, 
     });
     ui.add(egui::Slider::new(&mut m.lfo_rate, 0.0..=1.0).text("LFO Rate"));
     ui.add(egui::Slider::new(&mut m.lfo_int, -1.0..=1.0).text("LFO Intensity"));
+}
+
+fn format_hz(hz: f32) -> String {
+    if hz >= 1000.0 {
+        format!("{:.1}k", hz / 1000.0)
+    } else {
+        format!("{:.0}Hz", hz)
+    }
+}
+
+fn track_filter_mut(
+    proj: &mut Project,
+    track: TrackId,
+    extra: Option<usize>,
+) -> &mut TrackFilterParams {
+    if let Some(ei) = extra.filter(|&i| i < proj.extra_tracks.len()) {
+        return &mut proj.extra_tracks[ei].filter;
+    }
+    if track == TrackId::MoogPad {
+        &mut proj.mixer.moog_pad_filter
+    } else {
+        &mut proj.mixer.channels[track.index()].filter
+    }
+}
+
+fn ui_instrument_filter_bar(
+    ui: &mut egui::Ui,
+    f: &mut TrackFilterParams,
+    tc: Color32,
+    theme: StudioTheme,
+) {
+    egui::Frame::none()
+        .fill(theme.control_bg())
+        .rounding(Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .stroke(Stroke::new(1.0_f32, theme.border()))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                toggle_pill(
+                    ui,
+                    if f.enabled { "FILTER" } else { "BYP" },
+                    &mut f.enabled,
+                    tc,
+                    "Enable or bypass this instrument's channel filter",
+                );
+                ui.selectable_value(&mut f.mode, GlobalFilterMode::LowPass, "LP");
+                ui.selectable_value(&mut f.mode, GlobalFilterMode::BandPass, "BP");
+                ui.selectable_value(&mut f.mode, GlobalFilterMode::HighPass, "HP");
+                ui.label(RichText::new("Cut").size(11.0).weak());
+                ui.scope(|ui| {
+                    ui.spacing_mut().slider_width = 96.0;
+                    ui.add(
+                        egui::Slider::new(&mut f.cutoff, 40.0..=18_000.0)
+                            .logarithmic(true)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                });
+                ui.label(RichText::new(format_hz(f.cutoff)).size(11.0).color(tc));
+                ui.label(RichText::new("Res").size(11.0).weak());
+                ui.scope(|ui| {
+                    ui.spacing_mut().slider_width = 62.0;
+                    ui.add(
+                        egui::Slider::new(&mut f.resonance, 0.0..=0.88)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                });
+                ui.label(RichText::new(format!("{:.0}%", f.resonance * 100.0)).size(11.0).weak());
+                if (!f.enabled || f.is_active())
+                    && ui
+                        .small_button("Reset")
+                        .on_hover_text("Reset instrument filter to open bypass")
+                        .clicked()
+                {
+                    *f = TrackFilterParams::default();
+                }
+            });
+        });
 }
 
 fn track_mixer_mut(p: &mut Project, track: TrackId) -> (&mut f32, &mut bool, &mut bool) {
@@ -4102,7 +4429,43 @@ mod ui_layout_tests {
             }
             assert_no_overlap_or_overflow(&ctx, &mut app, "Tab-ArrangeParty", w, h);
 
-            // 7. Sound Lab tab across all track types
+            // 7. Studio / Drop Setup Open + Active Build + Active Filter
+            app.tab = StudioTab::Studio;
+            app.selected_track = TrackId::Drums;
+            app.selected_extra = None;
+            app.show_drop_setup = true;
+            {
+                let mut g = app.engine.project.lock().unwrap();
+                g.party_mode = false;
+                g.mixer.channels[TrackId::Drums.index()].filter.cutoff = 1200.0;
+                g.fx.global_filter_env_amount = 0.75;
+            }
+            app.engine.set_telemetry_for_test(EngineTelemetry {
+                drop_phase: "BUILD".into(),
+                drop_progress: 0.65,
+                global_filter_env_level: 0.72,
+                ..Default::default()
+            });
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-DropSetup-Open", w, h);
+
+            // 8. Studio / Extra Dynamic Track selected (checks ExtraTrack per-instrument filter)
+            app.show_drop_setup = false;
+            {
+                let mut g = app.engine.project.lock().unwrap();
+                g.extra_tracks.push(ExtraTrack::default());
+                let seq = crate::model::MelodicTrackSeq::with_default_note(
+                    60,
+                    crate::model::StepCount::Steps64,
+                );
+                for pat in &mut g.patterns {
+                    pat.extra_seqs.push(seq.clone());
+                }
+            }
+            app.selected_extra = Some(0);
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-ExtraTrack-Filter", w, h);
+            app.selected_extra = None;
+
+            // 9. Sound Lab tab across all track types
             app.tab = StudioTab::SoundLab;
             {
                 let mut g = app.engine.project.lock().unwrap();

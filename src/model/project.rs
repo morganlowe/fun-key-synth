@@ -16,6 +16,8 @@ pub struct ExtraTrack {
     pub name: String,
     pub preset_idx: usize,
     pub synth: MoogParams,
+    #[serde(default)]
+    pub filter: TrackFilterParams,
     pub volume: f32,
     pub pan: f32,
     pub delay_send: f32,
@@ -33,6 +35,7 @@ impl Default for ExtraTrack {
             name: "Synth Layer".to_string(),
             preset_idx: 4, // 70s String Synth
             synth,
+            filter: TrackFilterParams::default(),
             volume: 0.52,
             pan: 0.0,
             delay_send: 0.24,
@@ -487,10 +490,10 @@ impl Default for DrumKitParams {
         voices[3] = DrumVoiceParams {
             model: DrumModel::Tr808,
             tune: 0.0,
-            decay: 0.42,
+            decay: 0.24,
             tone: 0.55,
             snappy: 0.5,
-            level: 0.72,
+            level: 0.36,
             pan: -0.25,
             mute: false,
         }; // Cowbell
@@ -831,6 +834,8 @@ pub struct TrackMixerChannel {
     pub reverb_enabled: bool,
     pub mute: bool,
     pub solo: bool,
+    #[serde(default)]
+    pub filter: TrackFilterParams,
 }
 
 impl Default for TrackMixerChannel {
@@ -844,6 +849,7 @@ impl Default for TrackMixerChannel {
             reverb_enabled: true,
             mute: false,
             solo: false,
+            filter: TrackFilterParams::default(),
         }
     }
 }
@@ -860,6 +866,8 @@ pub struct MixerParams {
     pub moog_pad_reverb_enabled: bool,
     pub moog_pad_mute: bool,
     pub moog_pad_solo: bool,
+    #[serde(default)]
+    pub moog_pad_filter: TrackFilterParams,
 }
 
 impl Default for MixerParams {
@@ -874,6 +882,7 @@ impl Default for MixerParams {
             reverb_enabled: true,
             mute: false,
             solo: false,
+            filter: TrackFilterParams::default(),
         }; // Moog
         channels[1] = TrackMixerChannel {
             volume: 0.75,
@@ -884,6 +893,7 @@ impl Default for MixerParams {
             reverb_enabled: true,
             mute: false,
             solo: false,
+            filter: TrackFilterParams::default(),
         }; // Monologue
         channels[2] = TrackMixerChannel {
             volume: 0.82,
@@ -894,6 +904,7 @@ impl Default for MixerParams {
             reverb_enabled: true,
             mute: false,
             solo: false,
+            filter: TrackFilterParams::default(),
         }; // 303
         channels[3] = TrackMixerChannel {
             volume: 0.56,
@@ -904,6 +915,7 @@ impl Default for MixerParams {
             reverb_enabled: true,
             mute: false,
             solo: false,
+            filter: TrackFilterParams::default(),
         }; // Drums
         channels[4] = TrackMixerChannel {
             volume: 0.80,
@@ -914,6 +926,7 @@ impl Default for MixerParams {
             reverb_enabled: true,
             mute: false,
             solo: false,
+            filter: TrackFilterParams::default(),
         }; // SK-1
         channels[5] = TrackMixerChannel {
             volume: 0.80,
@@ -924,6 +937,7 @@ impl Default for MixerParams {
             reverb_enabled: false,
             mute: false,
             solo: false,
+            filter: TrackFilterParams::default(),
         }; // MIDI
         Self {
             channels,
@@ -935,6 +949,7 @@ impl Default for MixerParams {
             moog_pad_reverb_enabled: true,
             moog_pad_mute: false,
             moog_pad_solo: false,
+            moog_pad_filter: TrackFilterParams::default(),
         }
     }
 }
@@ -954,6 +969,116 @@ pub enum GlobalFilterMode {
     LowPass,
     HighPass,
     BandPass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackFilterParams {
+    pub enabled: bool,
+    pub mode: GlobalFilterMode,
+    pub cutoff: f32,    // 40.0..=18_000.0 Hz
+    pub resonance: f32, // 0.0..=0.88
+}
+
+impl Default for TrackFilterParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: GlobalFilterMode::LowPass,
+            cutoff: 18_000.0,
+            resonance: 0.02,
+        }
+    }
+}
+
+impl TrackFilterParams {
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.enabled
+            && (self.cutoff < 17_400.0 || !matches!(self.mode, GlobalFilterMode::LowPass))
+    }
+
+    pub fn normalize(&mut self) {
+        self.cutoff = self.cutoff.clamp(40.0, 18_000.0);
+        self.resonance = self.resonance.clamp(0.0, 0.88);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum FilterEnvTrigger {
+    Off,
+    #[default]
+    Beat,
+    HalfBar,
+    Bar,
+    Kick,
+    Manual,
+}
+
+impl FilterEnvTrigger {
+    pub const ALL: [FilterEnvTrigger; 6] = [
+        FilterEnvTrigger::Off,
+        FilterEnvTrigger::Beat,
+        FilterEnvTrigger::HalfBar,
+        FilterEnvTrigger::Bar,
+        FilterEnvTrigger::Kick,
+        FilterEnvTrigger::Manual,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            FilterEnvTrigger::Off => "Off",
+            FilterEnvTrigger::Beat => "1/4 Beat",
+            FilterEnvTrigger::HalfBar => "1/2 Bar",
+            FilterEnvTrigger::Bar => "1 Bar",
+            FilterEnvTrigger::Kick => "Kick",
+            FilterEnvTrigger::Manual => "Manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DropMacroConfig {
+    pub build_bars: u8,         // 1, 2, or 4 (default 2)
+    pub cut_drums: bool,        // default true (replaces normal groove with accelerating roll)
+    pub cut_bass: bool,         // default true
+    pub cut_chords: bool,       // default false
+    pub cut_lead: bool,         // default false (cuts Arp + 303)
+    pub drum_accel: bool,       // default true (1/4 -> 1/8 -> 1/16 -> 1/32 pitch-climbing roll)
+    pub riser_sweep: bool,      // default true (HP filter sweep + dual-osc siren + noise riser + reverb bloom)
+    pub pre_drop_gap_steps: u8, // 0, 2, or 4 16th steps of dead-air cut before impact (default 2)
+    pub impact_intensity: f32,  // 0.2..=1.0 (default 0.90)
+    pub auto_drop_bars: u16,    // 0 = Manual, or 8 / 16 / 32 bars (default 0)
+}
+
+impl Default for DropMacroConfig {
+    fn default() -> Self {
+        Self {
+            build_bars: 2,
+            cut_drums: true,
+            cut_bass: true,
+            cut_chords: false,
+            cut_lead: false,
+            drum_accel: true,
+            riser_sweep: true,
+            pre_drop_gap_steps: 2,
+            impact_intensity: 0.90,
+            auto_drop_bars: 0,
+        }
+    }
+}
+
+impl DropMacroConfig {
+    pub fn normalize(&mut self) {
+        self.build_bars = match self.build_bars {
+            0..=1 => 1,
+            2..=3 => 2,
+            _ => 4,
+        };
+        self.pre_drop_gap_steps = self.pre_drop_gap_steps.min(8);
+        self.impact_intensity = self.impact_intensity.clamp(0.0, 1.0);
+    }
 }
 
 impl DelayDivision {
@@ -998,6 +1123,14 @@ pub struct FxParams {
     pub global_filter_mode: GlobalFilterMode,
     pub global_filter_cutoff: f32,
     pub global_filter_resonance: f32,
+    #[serde(default)]
+    pub global_filter_env_amount: f32, // -1.0..=1.0
+    #[serde(default)]
+    pub global_filter_env_attack: f32, // 0.002..=1.5 s
+    #[serde(default)]
+    pub global_filter_env_decay: f32, // 0.04..=3.0 s
+    #[serde(default)]
+    pub global_filter_env_trigger: FilterEnvTrigger,
     pub chop: f32,
     pub repeat: f32,
     pub glitch: f32,
@@ -1021,6 +1154,10 @@ impl Default for FxParams {
             global_filter_mode: GlobalFilterMode::LowPass,
             global_filter_cutoff: 18000.0,
             global_filter_resonance: 0.08,
+            global_filter_env_amount: 0.0,
+            global_filter_env_attack: 0.015,
+            global_filter_env_decay: 0.38,
+            global_filter_env_trigger: FilterEnvTrigger::Beat,
             chop: 0.0,
             repeat: 0.0,
             glitch: 0.0,
@@ -1142,6 +1279,8 @@ pub struct Project {
     pub sampler_iso_treble: f32,
     pub mixer: MixerParams,
     pub fx: FxParams,
+    #[serde(default)]
+    pub drop_macro: DropMacroConfig,
     pub midi: MidiSettings,
     pub patterns: Vec<Pattern>,
     pub active_pattern: usize,
@@ -1308,6 +1447,17 @@ impl Project {
             section.pattern = section.pattern.min(NUM_PATTERNS - 1);
             section.bars = section.bars.clamp(1, 16);
         }
+        for ch in &mut self.mixer.channels {
+            ch.filter.normalize();
+        }
+        self.mixer.moog_pad_filter.normalize();
+        for tr in &mut self.extra_tracks {
+            tr.filter.normalize();
+        }
+        self.fx.global_filter_env_amount = self.fx.global_filter_env_amount.clamp(-1.0, 1.0);
+        self.fx.global_filter_env_attack = self.fx.global_filter_env_attack.clamp(0.002, 1.5);
+        self.fx.global_filter_env_decay = self.fx.global_filter_env_decay.clamp(0.04, 3.0);
+        self.drop_macro.normalize();
     }
 
     pub fn current_pattern(&self) -> &Pattern {
@@ -1467,6 +1617,7 @@ impl Project {
             sampler_iso_treble: 1.0,
             mixer: MixerParams::default(),
             fx: FxParams::default(),
+            drop_macro: DropMacroConfig::default(),
             midi: MidiSettings::default(),
             patterns: Vec::new(),
             active_pattern: 0,

@@ -5,12 +5,13 @@ pub mod vibe;
 use serde::{Deserialize, Serialize};
 
 pub use project::{
-    load_pattern, load_project, save_pattern, save_project, DelayDivision, DrumKitParams,
-    DrumModel, DrumVoiceParams, EgTarget, ExtraTrack, FactoryPreset, FxParams, GlobalFilterMode,
-    LfoMode, LfoTarget, LfoWave, LoopMode, MidiSettings, MixerParams, MonologueOscWave,
-    MonologueParams, MoogParams, MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project,
-    SamplePart, SamplerMode, SamplerParams, SavedSample, SongSection, Tb303Params, Tb303Wave,
-    TrackMixerChannel, MAX_EXTRA_TRACKS,
+    load_pattern, load_project, save_pattern, save_project, DelayDivision, DropMacroConfig,
+    DrumKitParams, DrumModel, DrumVoiceParams, EgTarget, ExtraTrack, FactoryPreset,
+    FilterEnvTrigger, FxParams, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
+    MidiSettings, MixerParams, MonologueOscWave, MonologueParams, MoogParams, MoogWave,
+    Osc2ModMode, PartyMixMode, PartyPace, Project, SamplePart, SamplerMode, SamplerParams,
+    SavedSample, SongSection, Tb303Params, Tb303Wave, TrackFilterParams, TrackMixerChannel,
+    MAX_EXTRA_TRACKS,
 };
 pub use sequencer::{
     euclidean_rhythm, ChordType, DrumLane, DrumStep, DrumTrackSeq, DrumVoiceId, MelodicStep,

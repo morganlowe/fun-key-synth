@@ -1,5 +1,5 @@
 pkgname=fun-key-synth
-pkgver=1.3.2
+pkgver=1.3.3
 pkgrel=1
 pkgdesc="Groovebox and Party DJ Synthesizer"
 arch=("x86_64")

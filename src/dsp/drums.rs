@@ -473,13 +473,13 @@ impl DrumMachine {
                 self.cb_p2 = (self.cb_p2 + (800.0 * tune_mult) / sr).fract();
                 let sq = (if self.cb_p1 < 0.5 { 1.0 } else { -1.0 })
                     + (if self.cb_p2 < 0.5 { 1.0 } else { -1.0 });
-                let bp = self.cb_filter.process_bp(sq * 0.5, 720.0 + vp.tone * 380.0, 0.52);
+                let bp = self.cb_filter.process_bp(sq * 0.5, 720.0 + vp.tone * 380.0, 0.38);
                 self.cb_fast_env *= (-1.0 / (0.025 * sr)).exp();
-                self.cb_env *= (-1.0 / ((0.08 + vp.decay * 0.42) * sr)).exp();
+                self.cb_env *= (-1.0 / ((0.045 + vp.decay * 0.20) * sr)).exp();
                 if self.cb_env < 0.0005 {
                     self.cb_active = false;
                 }
-                soft_tanh(bp * (self.cb_fast_env * 0.7 + self.cb_env * 0.45) * 1.4)
+                soft_tanh(bp * (self.cb_fast_env * 0.7 + self.cb_env * 0.45) * 0.58)
             }
             DrumModel::Tr909 => {
                 // TR-909 crisp wooden rimshot
@@ -491,7 +491,7 @@ impl DrumMachine {
                 if self.cb_env < 0.0005 {
                     self.cb_active = false;
                 }
-                soft_tanh(bp * self.cb_env * 2.1)
+                soft_tanh(bp * self.cb_env * 1.25)
             }
         }
     }

@@ -281,7 +281,7 @@ impl MoogSynth {
             let cutoff_hz = self.slew_cutoff * 2.0_f32.powf(key_oct + env_oct + filt_lfo_oct);
             let filtered = v.filter.process(mixer_sum, cutoff_hz, self.slew_res);
 
-            let voice_gain = if params.poly_mode { 0.36 } else { 0.72 };
+            let voice_gain = if params.poly_mode { 0.46 } else { 0.70 };
             mix += filtered * a_env * (v.velocity + v.accent * 0.25) * voice_gain;
         }
 
