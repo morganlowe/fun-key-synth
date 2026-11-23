@@ -57,27 +57,3 @@ assets = [
     { source = "README.md", dest = "/usr/share/doc/fun-key-synth/README.md", mode = "644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/fun-key-synth/LICENSE", mode = "644", doc = true },
 ]
-
-[package.metadata.deb]
-maintainer = "Morgan Lowe <morninglowe@gmail.com>"
-copyright = "2026, Morgan Lowe"
-license-file = ["LICENSE", "0"]
-extended-description = """\nFun Key Synth is a standalone desktop music studio built in Rust featuring a Vibe Studio, Auto-Chord / Auto-Beat groovebox, local Party Mode song generator, Sound Lab hardware synth rack, and Volca-style 8-part performance sampler."""
-depends = "$auto"
-section = "sound"
-priority = "optional"
-assets = [
-    ["target/release/fun-key-synth", "usr/bin/", "755"],
-    ["packaging/fun-key-synth.desktop", "usr/share/applications/", "644"],
-    ["packaging/fun-key-synth.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
-    ["README.md", "usr/share/doc/fun-key-synth/README.md", "644"],
-]
-
-[package.metadata.generate-rpm]
-assets = [
-    { source = "target/release/fun-key-synth", dest = "/usr/bin/fun-key-synth", mode = "755" },
-    { source = "packaging/fun-key-synth.desktop", dest = "/usr/share/applications/fun-key-synth.desktop", mode = "644" },
-    { source = "packaging/fun-key-synth.png", dest = "/usr/share/icons/hicolor/256x256/apps/fun-key-synth.png", mode = "644" },
-    { source = "README.md", dest = "/usr/share/doc/fun-key-synth/README.md", mode = "644", doc = true },
-    { source = "LICENSE", dest = "/usr/share/licenses/fun-key-synth/LICENSE", mode = "644", doc = true },
-]
