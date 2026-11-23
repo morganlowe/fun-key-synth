@@ -1339,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "fun-key-synth"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "cpal",
  "eframe",

@@ -20,11 +20,11 @@ pub use sequencer::{
 };
 pub use vibe::{
     apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, arp_tones_for,
-    bass_midi_for, build_auto_chord_pads, build_party_song_rig, chord_symbol,
-    default_vibe_sections, generate_auto_beat, generate_extra_track_seq, generate_melodic_tracks,
-    party_song_title, pick_party_vibe, progression_at, vibe_neighbors, vibe_progressions,
-    voice_led_chord, voice_preset_names, AutoChordPad, ChordProgression, ChordSlot, PartySongRig,
-    Vibe, PROGRESSIONS,
+    bass_midi_for, build_auto_chord_pads, build_party_song_rig, build_party_song_rig_with_reroll,
+    chord_symbol, default_vibe_sections, generate_auto_beat, generate_extra_track_seq,
+    generate_melodic_tracks, party_palette_label, party_song_title, pick_party_vibe,
+    progression_at, vibe_neighbors, vibe_progressions, voice_led_chord, voice_preset_names,
+    AutoChordPad, ChordProgression, ChordSlot, PartySongRig, Vibe, PROGRESSIONS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

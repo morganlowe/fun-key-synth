@@ -1851,6 +1851,13 @@ impl FunKeySynthApp {
                             self.engine.send_live(LiveEvent::NextPartySong);
                             self.engine.playing.store(true, Ordering::Relaxed);
                         }
+                        if ui
+                            .button("Reload Rig")
+                            .on_hover_text("Load a fresh set of genre-matched instruments for the current DJ song")
+                            .clicked()
+                        {
+                            self.engine.send_live(LiveEvent::ReloadPartyRig);
+                        }
                     }
 
                     // Live Chord Readout Badge
@@ -2454,7 +2461,9 @@ impl FunKeySynthApp {
                     StudioTab::ArrangeParty => {
                         self.ui_arrange_party(ui, &mut proj, &telemetry, playing, accent, theme)
                     }
-                    StudioTab::SoundLab => self.ui_sound_lab(ui, ctx, &mut proj, accent, theme),
+                    StudioTab::SoundLab => {
+                        self.ui_sound_lab(ui, ctx, &mut proj, &telemetry, accent, theme)
+                    }
                 });
             });
 
@@ -2737,7 +2746,7 @@ impl FunKeySynthApp {
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
             left_ui.set_width(left_w);
-            self.ui_studio_tracks_card(&mut left_ui, ctx, proj, accent, theme);
+            self.ui_studio_tracks_card(&mut left_ui, ctx, proj, tel, accent, theme);
 
             let right_pos = egui::pos2(top_left.x + left_w + gap, top_left.y);
             let right_rect = egui::Rect::from_min_max(right_pos, egui::pos2(right_pos.x + right_w, max_y));
@@ -2752,7 +2761,7 @@ impl FunKeySynthApp {
             let max_h = left_ui.min_rect().height().max(right_ui.min_rect().height());
             ui.advance_cursor_after_rect(egui::Rect::from_min_size(top_left, Vec2::new(total_w, max_h)));
         } else {
-            self.ui_studio_tracks_card(ui, ctx, proj, accent, theme);
+            self.ui_studio_tracks_card(ui, ctx, proj, tel, accent, theme);
             ui.add_space(8.0);
             self.ui_studio_sequencer_card(ui, ctx, proj, playing, cur_step, accent, theme);
         }
@@ -2768,6 +2777,7 @@ impl FunKeySynthApp {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         proj: &mut Project,
+        tel: &EngineTelemetry,
         accent: Color32,
         theme: StudioTheme,
     ) {
@@ -3108,7 +3118,12 @@ impl FunKeySynthApp {
                                 }
                             } else {
                                 let presets = voice_preset_names(track);
-                                let cur_preset = proj.voice_presets[row_idx] % presets.len().max(1);
+                                let raw_idx = if proj.party_mode && !tel.party_palette.is_empty() {
+                                    tel.party_voice_presets[row_idx]
+                                } else {
+                                    proj.voice_presets[row_idx]
+                                };
+                                let cur_preset = raw_idx % presets.len().max(1);
                                 egui::ComboBox::from_id_salt(("vp", row_idx))
                                     .width(104.0)
                                     .selected_text(presets[cur_preset])
@@ -3116,6 +3131,12 @@ impl FunKeySynthApp {
                                         for (pi, &pname) in presets.iter().enumerate() {
                                             if ui.selectable_label(cur_preset == pi, pname).clicked() {
                                                 apply_voice_preset(proj, track, pi);
+                                                if proj.party_mode {
+                                                    self.engine.send_live(LiveEvent::SetPartyInstrument {
+                                                        track,
+                                                        preset_idx: pi,
+                                                    });
+                                                }
                                             }
                                         }
                                     });
@@ -4338,7 +4359,7 @@ impl FunKeySynthApp {
             let gap = 6.0;
             let cell_w = ((ui.available_width() - gap * (cols - 1) as f32) / cols as f32)
                 .floor()
-                .max(100.0);
+                .max(80.0);
 
             let mut filt_norm = ((proj.fx.global_filter_cutoff.clamp(120.0, 18_000.0) / 120.0).ln()
                 / (18_000.0_f32 / 120.0).ln())
@@ -4796,6 +4817,14 @@ impl FunKeySynthApp {
                     self.engine.send_live(LiveEvent::NextPartySong);
                     self.engine.playing.store(true, Ordering::Relaxed);
                 }
+                if ui
+                    .button("Reload Instruments")
+                    .on_hover_text("Pick a fresh set of genre-matched instruments for the current DJ song without skipping the track")
+                    .clicked()
+                {
+                    proj.party_mode = true;
+                    self.engine.send_live(LiveEvent::ReloadPartyRig);
+                }
             });
 
             ui.add_space(6.0);
@@ -4850,13 +4879,107 @@ impl FunKeySynthApp {
                     .strong()
                     .color(accent),
                 );
-                if !tel.party_palette.is_empty() {
-                    ui.label(
-                        RichText::new(format!("Live Rig: {}", tel.party_palette))
-                            .size(12.0)
-                            .color(Color32::from_rgb(176, 186, 206)),
-                    );
-                }
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(theme.control_bg())
+                    .rounding(Rounding::same(6.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .stroke(Stroke::new(1.0_f32, theme.border()))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                RichText::new("DJ INSTRUMENTS")
+                                    .strong()
+                                    .size(11.5)
+                                    .color(accent),
+                            );
+                            if ui
+                                .small_button("Reload All")
+                                .on_hover_text("Swap all DJ voices to a fresh genre-matched palette")
+                                .clicked()
+                            {
+                                self.engine.send_live(LiveEvent::ReloadPartyRig);
+                            }
+                            if !tel.party_palette.is_empty() {
+                                ui.separator();
+                                ui.label(
+                                    RichText::new(&tel.party_palette)
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(176, 186, 206)),
+                                );
+                            }
+                        });
+                        ui.add_space(4.0);
+                        const DJ_RIG_ITEMS: [(&str, TrackId, usize); 6] = [
+                            ("Bass", TrackId::Moog, 1),
+                            ("Chords", TrackId::MoogPad, 2),
+                            ("Lead", TrackId::Monologue, 3),
+                            ("Drums", TrackId::Drums, 0),
+                            ("303", TrackId::Tb303, 4),
+                            ("Sampler", TrackId::Sampler, 5),
+                        ];
+                        let avail_w = ui.available_width();
+                        let cols = if avail_w >= 1260.0 {
+                            6
+                        } else if avail_w >= 580.0 {
+                            3
+                        } else {
+                            2
+                        };
+                        let col_gap = 8.0;
+                        let cell_w = ((avail_w - col_gap * (cols - 1) as f32) / cols as f32)
+                            .floor()
+                            .max(130.0);
+                        let combo_w = (cell_w - 58.0).clamp(88.0, 160.0);
+                        for (row_i, chunk) in DJ_RIG_ITEMS.chunks(cols).enumerate() {
+                            if row_i > 0 {
+                                ui.add_space(4.0);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = col_gap;
+                                for &(role_lbl, track, slot) in chunk {
+                                    let presets = voice_preset_names(track);
+                                    let raw_idx = if !tel.party_palette.is_empty() {
+                                        tel.party_voice_presets[slot]
+                                    } else {
+                                        proj.voice_presets[slot]
+                                    };
+                                    let cur = raw_idx % presets.len().max(1);
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(cell_w, 22.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            ui.label(
+                                                RichText::new(role_lbl)
+                                                    .strong()
+                                                    .size(11.0)
+                                                    .color(track_color(track)),
+                                            );
+                                            egui::ComboBox::from_id_salt(("dj_rig_vp", slot))
+                                                .width(combo_w)
+                                                .selected_text(presets[cur])
+                                                .show_ui(ui, |ui| {
+                                                    for (pi, &pname) in presets.iter().enumerate() {
+                                                        if ui.selectable_label(cur == pi, pname).clicked() {
+                                                            apply_voice_preset(proj, track, pi);
+                                                            self.engine.send_live(
+                                                                LiveEvent::SetPartyInstrument {
+                                                                    track,
+                                                                    preset_idx: pi,
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                        },
+                                    );
+                                }
+                            });
+                        }
+                    });
             }
         });
 
@@ -4943,6 +5066,7 @@ impl FunKeySynthApp {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         proj: &mut Project,
+        tel: &EngineTelemetry,
         accent: Color32,
         theme: StudioTheme,
     ) {
@@ -5035,7 +5159,12 @@ impl FunKeySynthApp {
                                 .iter()
                                 .position(|&t| t == self.selected_track)
                                 .unwrap_or(0);
-                            proj.voice_presets[slot_idx] % lab_presets.len()
+                            let raw_idx = if proj.party_mode && !tel.party_palette.is_empty() {
+                                tel.party_voice_presets[slot_idx]
+                            } else {
+                                proj.voice_presets[slot_idx]
+                            };
+                            raw_idx % lab_presets.len()
                         };
                         ui.horizontal_wrapped(|ui| {
                             ui.label(
@@ -5066,17 +5195,17 @@ impl FunKeySynthApp {
                                     if active { tc } else { Color32::from_rgb(48, 56, 78) },
                                 ));
                                 if ui.add(pbtn).clicked() {
-                                    {
-                        let f_params = track_filter_mut(proj, self.selected_track, active_extra);
-                        ui_instrument_filter_bar(ui, f_params, tc, theme);
-                        ui.add_space(6.0);
-                    }
-
-                    if let Some(ei) = active_extra {
+                                    if let Some(ei) = active_extra {
                                         apply_extra_track_preset(&mut proj.extra_tracks[ei], pi);
                                         proj.extra_tracks[ei].name = pname.to_string();
                                     } else {
                                         apply_voice_preset(proj, self.selected_track, pi);
+                                        if proj.party_mode {
+                                            self.engine.send_live(LiveEvent::SetPartyInstrument {
+                                                track: self.selected_track,
+                                                preset_idx: pi,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -5653,26 +5782,29 @@ fn macro_cell(
         .inner_margin(egui::Margin::symmetric(8.0, 5.0))
         .stroke(Stroke::new(1.0_f32, theme.border()))
         .show(ui, |ui| {
-            let inner_w = (cell_w - 16.0).max(80.0);
-            ui.set_width(inner_w);
-            egui::Sides::new().height(16.0).show(
-                ui,
-                |ui| {
-                    ui.label(RichText::new(label).strong().size(11.0));
-                },
-                |ui| {
-                    ui.label(RichText::new(value_text).size(11.0).color(accent));
-                },
-            );
-            ui.add_space(2.0);
-            ui.spacing_mut().slider_width = (inner_w - 4.0).max(60.0);
-            changed = ui
-                .add(
-                    egui::Slider::new(value, range)
-                        .show_value(false)
-                        .trailing_fill(true),
-                )
-                .changed();
+            let inner_w = (cell_w - 16.0).max(64.0);
+            ui.vertical(|ui| {
+                ui.set_min_width(inner_w);
+                ui.set_max_width(inner_w);
+                egui::Sides::new().height(16.0).show(
+                    ui,
+                    |ui| {
+                        ui.label(RichText::new(label).strong().size(11.0));
+                    },
+                    |ui| {
+                        ui.label(RichText::new(value_text).size(11.0).color(accent));
+                    },
+                );
+                ui.add_space(2.0);
+                ui.spacing_mut().slider_width = (inner_w - 4.0).max(48.0);
+                changed = ui
+                    .add(
+                        egui::Slider::new(value, range)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    )
+                    .changed();
+            });
         });
     changed
 }
@@ -5836,7 +5968,7 @@ mod ui_layout_tests {
         scenario: &str,
         w: f32,
         h: f32,
-    ) {
+    ) -> Vec<(String, egui::Rect)> {
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(w, h));
         let mut final_output = None;
         for frame_i in 0..2 {
@@ -5854,6 +5986,7 @@ mod ui_layout_tests {
 
         type ClipKey = (u32, u32, u32, u32);
         let mut by_clip: BTreeMap<ClipKey, Vec<(String, egui::Rect, egui::Rect)>> = BTreeMap::new();
+        let mut all_boxes: Vec<(String, egui::Rect)> = Vec::new();
         for clipped in &out.shapes {
             let c = clipped.clip_rect;
             let key = (
@@ -5868,17 +6001,15 @@ mod ui_layout_tests {
 
         for items in by_clip.values() {
             for (txt, r, clip) in items {
-                // Only check items that are vertically visible inside their clip region
-                if r.max.y > clip.min.y && r.min.y < clip.max.y {
-                    assert!(
-                        r.max.x <= screen.max.x + 2.0,
-                        "[{scenario} @ {w}x{h}] Horizontal overflow off right edge for '{txt}': rect={r:?}, clip={clip:?}, screen={screen:?}"
-                    );
-                    assert!(
-                        r.min.x >= -2.0,
-                        "[{scenario} @ {w}x{h}] Horizontal overflow off left edge for '{txt}': rect={r:?}"
-                    );
-                }
+                all_boxes.push((txt.clone(), *r));
+                assert!(
+                    r.max.x <= screen.max.x + 2.0,
+                    "[{scenario} @ {w}x{h}] Horizontal overflow off right edge for '{txt}': rect={r:?}, clip={clip:?}, screen={screen:?}"
+                );
+                assert!(
+                    r.min.x >= -2.0,
+                    "[{scenario} @ {w}x{h}] Horizontal overflow off left edge for '{txt}': rect={r:?}"
+                );
             }
 
             for i in 0..items.len() {
@@ -5900,6 +6031,7 @@ mod ui_layout_tests {
                 }
             }
         }
+        all_boxes
     }
 
     #[test]
@@ -5937,7 +6069,8 @@ mod ui_layout_tests {
                 party_bar: 2,
                 party_section_bars: 4,
                 party_song_title: "Neon Velvet Bounce".into(),
-                party_palette: "Slap Bass • Neon Brass • Funk Clav • Electro Kit".into(),
+                party_palette: "Eurobeat Octave • Festival Supersaw • Eurobeat Brass • 909 Club".into(),
+                party_voice_presets: [1, 12, 8, 10, 5, 1],
                 party_bpm: 124.0,
                 party_vibe_name: "Electro Funk".into(),
                 ..Default::default()
@@ -6061,6 +6194,68 @@ mod ui_layout_tests {
                     h,
                 );
             }
+        }
+
+        // Tall viewport regression check: verify below-the-fold Vibe Macros ("Warmth", "Glitch", "Master")
+        // and ArrangeParty DJ instrument picker stay strictly inside screen bounds at both 1440px and 920px widths.
+        for &(w, h) in &[(1440.0_f32, 1600.0_f32), (920.0_f32, 1600.0_f32)] {
+            let ctx = egui::Context::default();
+            let mut app = FunKeySynthApp::new_for_test(&ctx);
+            app.tab = StudioTab::Studio;
+            app.selected_track = TrackId::Drums;
+            app.selected_extra = None;
+            {
+                let mut g = app.engine.project.lock().unwrap();
+                g.party_mode = false;
+            }
+            app.engine.set_telemetry_for_test(EngineTelemetry::default());
+            let boxes_ready =
+                assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-Drums-Ready-Tall", w, h);
+            for macro_lbl in ["Warmth", "Glitch", "Master"] {
+                let found = boxes_ready.iter().find(|(t, _)| t == macro_lbl);
+                assert!(
+                    found.is_some(),
+                    "Expected '{macro_lbl}' macro label to be rendered at {w}x{h}"
+                );
+                let (_, r) = found.unwrap();
+                assert!(
+                    r.max.x <= w + 2.0,
+                    "Expected '{macro_lbl}' inside screen width {w}, got {r:?}"
+                );
+            }
+
+            {
+                let mut g = app.engine.project.lock().unwrap();
+                g.party_mode = true;
+            }
+            app.engine.set_telemetry_for_test(EngineTelemetry {
+                active_chord: "Dm".into(),
+                party_section: "DROP 1".into(),
+                party_bar: 1,
+                party_section_bars: 4,
+                party_song_title: "Initial Drift".into(),
+                party_palette: "Eurobeat Octave • Festival Supersaw • Eurobeat Brass • 909 Club".into(),
+                party_voice_presets: [1, 12, 8, 10, 5, 1],
+                party_bpm: 158.0,
+                party_vibe_name: "Eurobeat".into(),
+                ..Default::default()
+            });
+            let boxes_dj =
+                assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-Drums-PartyDJ-Tall", w, h);
+            for macro_lbl in ["Warmth", "Glitch", "Master"] {
+                assert!(
+                    boxes_dj.iter().any(|(t, r)| t == macro_lbl && r.max.x <= w + 2.0),
+                    "Expected '{macro_lbl}' macro inside {w}x{h} in Party DJ mode"
+                );
+            }
+
+            app.tab = StudioTab::ArrangeParty;
+            let boxes_arr =
+                assert_no_overlap_or_overflow(&ctx, &mut app, "Tab-ArrangeParty-Tall", w, h);
+            assert!(
+                boxes_arr.iter().any(|(t, _)| t == "DJ INSTRUMENTS"),
+                "Expected DJ INSTRUMENTS panel in Arrange & Party at {w}x{h}"
+            );
         }
     }
 

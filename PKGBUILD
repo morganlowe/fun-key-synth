@@ -1,15 +1,20 @@
 pkgname=fun-key-synth
-pkgver=1.4.1
+pkgver=1.4.2
 pkgrel=1
-pkgdesc="Groovebox and Party DJ Synthesizer"
-arch=("x86_64")
+pkgdesc="Fun Key Synth — Vibe Studio, Auto-Chord/Beat Groovebox & 8-Part Performance Sampler"
+arch=('x86_64')
 url="https://github.com/morganlowe/fun-key-synth"
-license=("MIT")
-depends=("alsa-lib" "gcc-libs")
+license=('GPL-3.0-or-later')
+depends=('alsa-lib' 'libxkbcommon' 'wayland' 'libglvnd')
+options=('!debug' '!lto')
 
 package() {
   cd "$startdir"
   install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 "packaging/fun-key-synth.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
   install -Dm644 "packaging/fun-key-synth.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/$pkgname.png"
-  printf "%s\n" "[Desktop Entry]" "Type=Application" "Name=Fun Key Synth" "Comment=Groovebox and Party DJ Synthesizer" "Exec=fun-key-synth" "Icon=fun-key-synth" "Terminal=false" "Categories=AudioVideo;Audio;Music;Synthesizer;" | install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/$pkgname.desktop"
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  if [ -f "LICENSE" ]; then
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  fi
 }

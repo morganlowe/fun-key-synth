@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/morganlowe/fun-key-synth/releases/latest"><strong>⬇ Download Latest Release (v1.4.1)</strong></a>
+  <a href="https://github.com/morganlowe/fun-key-synth/releases/latest"><strong>⬇ Download Latest Release (v1.4.2)</strong></a>
   &nbsp;·&nbsp;
   <a href="#visual-tour">Screenshots</a>
   &nbsp;·&nbsp;
@@ -42,11 +42,11 @@ Most DAWs and grooveboxes bury beginners under empty timelines, raw MIDI numbers
 Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora / RHEL / openSUSE (`.rpm`)**, **Arch Linux / CachyOS (`.pkg.tar.zst`)**, **Windows (`.zip`)**, and **Generic Linux (`.tar.gz`)** are available on the **[GitHub Releases](https://github.com/morganlowe/fun-key-synth/releases/latest)** page.
 
 - **Download & full release notes:** [github.com/morganlowe/fun-key-synth/releases](https://github.com/morganlowe/fun-key-synth/releases/latest)
-- **Debian / Ubuntu:** `sudo apt install ./fun-key-synth_1.4.1_amd64.deb`
-- **Fedora / RHEL / openSUSE:** `sudo dnf install ./fun-key-synth-1.4.1-1.x86_64.rpm` (or `sudo zypper install ./fun-key-synth-1.4.1-1.x86_64.rpm`)
-- **Arch / CachyOS:** `sudo pacman -U fun-key-synth-1.4.1-1-x86_64.pkg.tar.zst`
-- **Windows:** Unzip `fun-key-synth-v1.4.1-windows-x86_64.zip` and run `fun-key-synth.exe`
-- **Generic Linux:** Extract `fun-key-synth-v1.4.1-linux-x86_64.tar.gz` and run `./fun-key-synth`
+- **Debian / Ubuntu:** `sudo apt install ./fun-key-synth_1.4.2-1_amd64.deb`
+- **Fedora / RHEL / openSUSE:** `sudo dnf install ./fun-key-synth-1.4.2-1.x86_64.rpm` (or `sudo zypper install ./fun-key-synth-1.4.2-1.x86_64.rpm`)
+- **Arch / CachyOS:** `sudo pacman -U fun-key-synth-1.4.2-1-x86_64.pkg.tar.zst`
+- **Windows:** Unzip `fun-key-synth-windows-x86_64.zip` and run `fun-key-synth.exe`
+- **Generic Linux:** Extract `fun-key-synth-v1.4.2-linux-x86_64.tar.gz` and run `./fun-key-synth`
 
 <details>
 <summary><strong>Building from source (Rust / Cargo)</strong></summary>

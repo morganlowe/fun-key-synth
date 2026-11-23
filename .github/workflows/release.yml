@@ -22,16 +22,19 @@ jobs:
         run: cargo install cargo-deb cargo-generate-rpm
       - name: Build release binary
         run: cargo build --release --locked
+      - name: Package generic Linux tarball
+        run: tar -czf "fun-key-synth-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" -C target/release fun-key-synth
       - name: Build .deb
         run: cargo deb --no-build
       - name: Build .rpm
         run: cargo generate-rpm
-      - name: Upload .deb and .rpm to Release
+      - name: Upload .deb, .rpm, and Linux tarball to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             target/debian/*.deb
             target/generate-rpm/*.rpm
+            fun-key-synth-*-linux-x86_64.tar.gz
 
   arch-pkg:
     runs-on: ubuntu-latest
@@ -40,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
-        run: pacman -Syu --noconfirm rust cargo alsa-lib git
+        run: pacman -Syu --noconfirm rust cargo alsa-lib libxkbcommon wayland libglvnd git
       - name: Build release binary and Arch package
         run: |
           cargo build --release --locked

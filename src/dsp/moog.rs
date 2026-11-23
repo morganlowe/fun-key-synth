@@ -10,6 +10,7 @@ const MAX_VOICES: usize = 8;
 struct MoogVoice {
     active: bool,
     held: bool,
+    slide_active: bool,
     note: u8,
     current_midi: f32,
     target_midi: f32,
@@ -29,6 +30,7 @@ impl MoogVoice {
         Self {
             active: false,
             held: false,
+            slide_active: false,
             note: 48,
             current_midi: 48.0,
             target_midi: 48.0,
@@ -117,6 +119,7 @@ impl MoogSynth {
             for v in &mut self.voices[1..] {
                 v.active = false;
                 v.held = false;
+                v.slide_active = false;
                 v.amp_env.reset();
                 v.filt_env.reset();
             }
@@ -124,7 +127,8 @@ impl MoogSynth {
             let was_active = v.active && v.amp_env.is_active();
             v.note = note;
             v.target_midi = note as f32;
-            if !was_active && params.glide < 0.01 && !slide {
+            v.slide_active = slide && was_active;
+            if !v.slide_active && params.glide <= 0.005 {
                 v.current_midi = note as f32;
             }
             v.velocity = vel;
@@ -158,7 +162,8 @@ impl MoogSynth {
         let was_active = v.active && v.amp_env.is_active();
         v.note = note;
         v.target_midi = note as f32;
-        if !was_active && !slide {
+        v.slide_active = slide && was_active;
+        if !v.slide_active && !slide {
             v.current_midi = note as f32;
         }
         v.velocity = vel;
@@ -199,6 +204,11 @@ impl MoogSynth {
         self.voices.iter().filter(|v| v.active && v.amp_env.is_active()).count()
     }
 
+    #[cfg(test)]
+    pub fn current_mono_midi(&self) -> f32 {
+        self.voices[0].current_midi
+    }
+
     #[inline]
     pub fn process_sample(&mut self, params: &MoogParams) -> f32 {
         let sr = self.sample_rate;
@@ -219,18 +229,22 @@ impl MoogSynth {
         let pitch_mod_semi = lfo * params.lfo_to_pitch * 1.5;
         let filt_lfo_oct = lfo * params.lfo_to_filter * 2.2;
 
-        let glide_coeff = if params.glide <= 0.005 {
-            1.0
-        } else {
-            1.0 - (-1.0 / (params.glide * 0.35 * sr)).exp()
-        };
-
         let mut mix = 0.0_f32;
         for v in &mut self.voices {
             if !v.active {
                 continue;
             }
-            v.current_midi += glide_coeff * (v.target_midi - v.current_midi);
+            let eff_glide = if v.slide_active {
+                params.glide.max(0.045)
+            } else {
+                params.glide
+            };
+            if eff_glide <= 0.005 {
+                v.current_midi = v.target_midi;
+            } else {
+                let glide_coeff = 1.0 - (-1.0 / (eff_glide * 0.35 * sr)).exp();
+                v.current_midi += glide_coeff * (v.target_midi - v.current_midi);
+            }
             let f_env = v.filt_env.next(
                 params.filt_attack,
                 params.filt_decay,
