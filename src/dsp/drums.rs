@@ -5,7 +5,7 @@ use crate::model::{DrumKitParams, DrumModel, DrumVoiceId, DrumVoiceParams};
 use super::{soft_tanh, Svf12Filter, Xorshift32};
 
 const METAL_FREQS_808: [f32; 6] = [205.3, 304.4, 369.6, 522.7, 540.0, 800.0];
-const METAL_FREQS_909: [f32; 6] = [245.0, 342.0, 468.0, 610.0, 745.0, 980.0];
+const METAL_FREQS_909: [f32; 6] = [263.0, 381.0, 521.0, 683.0, 863.0, 1109.0];
 
 #[derive(Debug, Clone)]
 pub struct DrumMachine {
@@ -18,6 +18,7 @@ pub struct DrumMachine {
     kick_amp: f32,
     kick_pitch_env: f32,
     kick_click_env: f32,
+    kick_click_hp: f32,
     kick_vel: f32,
 
     // Snare
@@ -26,6 +27,7 @@ pub struct DrumMachine {
     snare_p2: f32,
     snare_body_env: f32,
     snare_noise_env: f32,
+    snare_crack_env: f32,
     snare_vel: f32,
     snare_filter: Svf12Filter,
 
@@ -47,10 +49,13 @@ pub struct DrumMachine {
 
     // Metallic bank shared phase for CH / OH / Cymbal
     metal_phases: [f32; 6],
+    metal_phases_909: [f32; 6],
+    air_noise_lp: f32,
 
     // Closed Hat
     ch_active: bool,
     ch_env: f32,
+    ch_tick_env: f32,
     ch_vel: f32,
     ch_bp: Svf12Filter,
     ch_hp: Svf12Filter,
@@ -92,12 +97,14 @@ impl DrumMachine {
             kick_amp: 0.0,
             kick_pitch_env: 0.0,
             kick_click_env: 0.0,
+            kick_click_hp: 0.0,
             kick_vel: 1.0,
             snare_active: false,
             snare_p1: 0.0,
             snare_p2: 0.0,
             snare_body_env: 0.0,
             snare_noise_env: 0.0,
+            snare_crack_env: 0.0,
             snare_vel: 1.0,
             snare_filter: Svf12Filter::new(sr),
             clap_active: false,
@@ -113,8 +120,11 @@ impl DrumMachine {
             cb_vel: 1.0,
             cb_filter: Svf12Filter::new(sr),
             metal_phases: [0.0; 6],
+            metal_phases_909: [0.0; 6],
+            air_noise_lp: 0.0,
             ch_active: false,
             ch_env: 0.0,
+            ch_tick_env: 0.0,
             ch_vel: 1.0,
             ch_bp: Svf12Filter::new(sr),
             ch_hp: Svf12Filter::new(sr),
@@ -177,6 +187,7 @@ impl DrumMachine {
                 self.snare_p2 = 0.0;
                 self.snare_body_env = 1.0;
                 self.snare_noise_env = 1.0;
+                self.snare_crack_env = 1.0;
                 self.snare_vel = vel;
             }
             DrumVoiceId::Clap => {
@@ -196,6 +207,7 @@ impl DrumMachine {
             DrumVoiceId::ClosedHat => {
                 self.ch_active = true;
                 self.ch_env = 1.0;
+                self.ch_tick_env = 1.0;
                 self.ch_vel = vel;
                 // Classic hardware choke: Closed Hat chokes Open Hat!
                 self.oh_env *= 0.08;
@@ -253,6 +265,9 @@ impl DrumMachine {
         }
 
         let noise = self.rng.next_bipolar();
+        let air_alpha = (TAU * 8_500.0 / sr).clamp(0.05, 0.85);
+        self.air_noise_lp += air_alpha * (noise - self.air_noise_lp);
+        let air_noise = noise - self.air_noise_lp;
 
         // Advance metallic oscillator bank only if needed
         let metal_active = self.ch_active || self.oh_active || self.cym_active;
@@ -260,20 +275,16 @@ impl DrumMachine {
         let mut metal_909 = 0.0_f32;
         if metal_active {
             for i in 0..6 {
-                let p = self.metal_phases[i];
-                let sq = if p < 0.5 { 1.0 } else { -1.0 };
-                metal_808 += sq;
-                // Slightly detuned ratio for 909 shimmer
-                let sq2 = if ((p * (METAL_FREQS_909[i] / METAL_FREQS_808[i])).fract()) < 0.5 {
-                    1.0
-                } else {
-                    -1.0
-                };
-                metal_909 += sq2;
-                self.metal_phases[i] = (p + METAL_FREQS_808[i] / sr).fract();
+                let p8 = self.metal_phases[i];
+                metal_808 += if p8 < 0.5 { 1.0 } else { -1.0 };
+                self.metal_phases[i] = (p8 + METAL_FREQS_808[i] / sr).fract();
+
+                let p9 = self.metal_phases_909[i];
+                metal_909 += if p9 < 0.5 { 1.0 } else { -1.0 };
+                self.metal_phases_909[i] = (p9 + METAL_FREQS_909[i] / sr).fract();
             }
             metal_808 *= 0.25;
-            metal_909 = metal_909 * 0.22 + noise * 0.22;
+            metal_909 = metal_909 * 0.20 + noise * 0.22;
         }
 
         let mut out_l = 0.0_f32;
@@ -290,7 +301,7 @@ impl DrumMachine {
         // 1: Snare
         if self.snare_active {
             let vp = &kit.voices[1];
-            let s = self.process_snare(vp, noise);
+            let s = self.process_snare(vp, noise, air_noise);
             if !vp.mute {
                 add_panned(&mut out_l, &mut out_r, s * vp.level * self.snare_vel, vp.pan);
             }
@@ -298,7 +309,7 @@ impl DrumMachine {
         // 2: Clap
         if self.clap_active {
             let vp = &kit.voices[2];
-            let s = self.process_clap(vp, noise);
+            let s = self.process_clap(vp, noise, air_noise);
             if !vp.mute {
                 add_panned(&mut out_l, &mut out_r, s * vp.level * self.clap_vel, vp.pan);
             }
@@ -315,7 +326,7 @@ impl DrumMachine {
         if self.ch_active {
             let vp = &kit.voices[4];
             let raw = if vp.model == DrumModel::Tr808 { metal_808 } else { metal_909 };
-            let s = self.process_ch(vp, raw);
+            let s = self.process_ch(vp, raw, air_noise);
             if !vp.mute {
                 add_panned(&mut out_l, &mut out_r, s * vp.level * self.ch_vel, vp.pan);
             }
@@ -324,7 +335,7 @@ impl DrumMachine {
         if self.oh_active {
             let vp = &kit.voices[5];
             let raw = if vp.model == DrumModel::Tr808 { metal_808 } else { metal_909 };
-            let s = self.process_oh(vp, raw);
+            let s = self.process_oh(vp, raw, air_noise);
             if !vp.mute {
                 add_panned(&mut out_l, &mut out_r, s * vp.level * self.oh_vel, vp.pan);
             }
@@ -341,7 +352,7 @@ impl DrumMachine {
         if self.cym_active {
             let vp = &kit.voices[7];
             let raw = if vp.model == DrumModel::Tr808 { metal_808 } else { metal_909 };
-            let s = self.process_cymbal(vp, raw);
+            let s = self.process_cymbal(vp, raw, air_noise);
             if !vp.mute {
                 add_panned(&mut out_l, &mut out_r, s * vp.level * self.cym_vel, vp.pan);
             }
@@ -364,32 +375,37 @@ impl DrumMachine {
             ),
             DrumModel::Tr909 => (
                 52.0 * tune_mult,
-                220.0 * tune_mult,
+                285.0 * tune_mult,
                 0.09 + vp.decay * 0.55,
-                0.036 + vp.tone * 0.02,
-                1.5 + vp.tone * 1.3,
+                0.025 + vp.tone * 0.016,
+                1.45 + vp.tone * 1.15,
             ),
         };
 
         let freq = base_hz + sweep_hz * self.kick_pitch_env;
         self.kick_phase = (self.kick_phase + freq / sr).fract();
         let body = (self.kick_phase * TAU).sin();
-        let click = (noise * 0.35 + (self.kick_phase * 4.0 * TAU).sin() * 0.65)
+        let click_alpha = (TAU * 2_800.0 / sr).clamp(0.04, 0.75);
+        self.kick_click_hp += click_alpha * (noise - self.kick_click_hp);
+        let click_noise = noise - self.kick_click_hp;
+        let click_decay = if vp.model == DrumModel::Tr909 { 0.0024 } else { 0.0032 };
+        let click = (click_noise * 0.48 + (self.kick_phase * 5.0 * TAU).sin() * 0.52)
             * self.kick_click_env
-            * (0.15 + vp.snappy * 0.55);
+            * (0.14 + vp.snappy * 0.52);
 
+        let body_sat = soft_tanh(body * self.kick_amp * drive);
         self.kick_amp *= (-1.0 / (decay_s * sr)).exp();
         self.kick_pitch_env *= (-1.0 / (pitch_decay_s * sr)).exp();
-        self.kick_click_env *= (-1.0 / (0.0032 * sr)).exp();
+        self.kick_click_env *= (-1.0 / (click_decay * sr)).exp();
 
         if self.kick_amp < 0.0005 {
             self.kick_active = false;
         }
-        soft_tanh((body * self.kick_amp * drive) + click) * 0.92
+        soft_tanh((body_sat + click) * 0.94)
     }
 
     #[inline]
-    fn process_snare(&mut self, vp: &DrumVoiceParams, noise: f32) -> f32 {
+    fn process_snare(&mut self, vp: &DrumVoiceParams, noise: f32, air_noise: f32) -> f32 {
         let sr = self.sample_rate;
         let tune_mult = 2.0_f32.powf(vp.tune * 0.65);
         let (f1, f2, body_dec, noise_dec, hp_freq) = match vp.model {
@@ -419,17 +435,23 @@ impl DrumMachine {
             self.snare_filter.process_bp(noise, hp_freq, 0.32) * 1.45
         };
         let snappy = filtered_noise * self.snare_noise_env * (0.25 + vp.snappy * 0.95);
+        let air = if vp.model == DrumModel::Tr909 {
+            air_noise * (self.snare_noise_env * 0.34 + self.snare_crack_env * 0.42) * (0.30 + vp.snappy * 0.70)
+        } else {
+            air_noise * self.snare_crack_env * 0.16 * vp.snappy
+        };
 
         self.snare_body_env *= (-1.0 / (body_dec * sr)).exp();
         self.snare_noise_env *= (-1.0 / (noise_dec * sr)).exp();
+        self.snare_crack_env *= (-1.0 / (0.0022 * sr)).exp();
         if self.snare_body_env < 0.0005 && self.snare_noise_env < 0.0005 {
             self.snare_active = false;
         }
-        soft_tanh((body * 0.65 + snappy) * 1.1)
+        soft_tanh((body * 0.62 + snappy * 0.92 + air) * 1.06)
     }
 
     #[inline]
-    fn process_clap(&mut self, vp: &DrumVoiceParams, noise: f32) -> f32 {
+    fn process_clap(&mut self, vp: &DrumVoiceParams, noise: f32, air_noise: f32) -> f32 {
         let sr = self.sample_rate;
         let t_ms = (self.clap_samples as f32 / sr) * 1000.0;
         self.clap_samples = self.clap_samples.saturating_add(1);
@@ -455,11 +477,12 @@ impl DrumMachine {
             DrumModel::Tr909 => 1350.0 + vp.tone * 1100.0,
         };
         let filt = self.clap_filter.process_bp(noise, bp_freq, 0.45) * 2.0;
+        let crisp_air = air_noise * burst_env * (0.22 + vp.tone * 0.28) * (0.5 + vp.snappy * 0.5);
 
         if t_ms > 42.0 && self.clap_tail_env < 0.0008 {
             self.clap_active = false;
         }
-        soft_tanh(filt * env * (0.75 + vp.snappy * 0.4))
+        soft_tanh((filt * env * (0.72 + vp.snappy * 0.38)) + crisp_air)
     }
 
     #[inline]
@@ -497,29 +520,51 @@ impl DrumMachine {
     }
 
     #[inline]
-    fn process_ch(&mut self, vp: &DrumVoiceParams, metal_raw: f32) -> f32 {
+    fn process_ch(&mut self, vp: &DrumVoiceParams, metal_raw: f32, air_noise: f32) -> f32 {
         let sr = self.sample_rate;
         let dec = 0.018 + vp.decay * 0.095;
-        let bp = self.ch_bp.process_bp(metal_raw, 6500.0 + vp.tone * 3500.0, 0.30);
-        let hp = self.ch_hp.process_hp(bp, 5200.0 + vp.tone * 2500.0, 0.15);
+        let (bp_hz, hp_hz) = if vp.model == DrumModel::Tr909 {
+            (7200.0 + vp.tone * 3600.0, 5600.0 + vp.tone * 2200.0)
+        } else {
+            (6500.0 + vp.tone * 3500.0, 5200.0 + vp.tone * 2500.0)
+        };
+        let bp = self.ch_bp.process_bp(metal_raw, bp_hz, 0.30);
+        let hp = self.ch_hp.process_hp(bp, hp_hz, 0.15);
+        let sig = if vp.model == DrumModel::Tr909 {
+            hp * self.ch_env * 1.25
+                + air_noise * (self.ch_env * 0.32 + self.ch_tick_env * 0.35) * (0.45 + vp.tone * 0.55)
+        } else {
+            hp * self.ch_env * 1.5
+        };
         self.ch_env *= (-1.0 / (dec * sr)).exp();
+        self.ch_tick_env *= (-1.0 / (0.0014 * sr)).exp();
         if self.ch_env < 0.0005 {
             self.ch_active = false;
         }
-        soft_tanh(hp * self.ch_env * 1.5)
+        soft_tanh(sig)
     }
 
     #[inline]
-    fn process_oh(&mut self, vp: &DrumVoiceParams, metal_raw: f32) -> f32 {
+    fn process_oh(&mut self, vp: &DrumVoiceParams, metal_raw: f32, air_noise: f32) -> f32 {
         let sr = self.sample_rate;
         let dec = 0.10 + vp.decay * 0.75;
-        let bp = self.oh_bp.process_bp(metal_raw, 6200.0 + vp.tone * 3200.0, 0.28);
-        let hp = self.oh_hp.process_hp(bp, 4800.0 + vp.tone * 2200.0, 0.15);
+        let (bp_hz, hp_hz) = if vp.model == DrumModel::Tr909 {
+            (6800.0 + vp.tone * 3200.0, 5200.0 + vp.tone * 2000.0)
+        } else {
+            (6200.0 + vp.tone * 3200.0, 4800.0 + vp.tone * 2200.0)
+        };
+        let bp = self.oh_bp.process_bp(metal_raw, bp_hz, 0.28);
+        let hp = self.oh_hp.process_hp(bp, hp_hz, 0.15);
+        let sig = if vp.model == DrumModel::Tr909 {
+            hp * self.oh_env * 1.18 + air_noise * self.oh_env * 0.28 * (0.45 + vp.tone * 0.55)
+        } else {
+            hp * self.oh_env * 1.35
+        };
         self.oh_env *= (-1.0 / (dec * sr)).exp();
         if self.oh_env < 0.0005 {
             self.oh_active = false;
         }
-        soft_tanh(hp * self.oh_env * 1.35)
+        soft_tanh(sig)
     }
 
     #[inline]
@@ -545,16 +590,26 @@ impl DrumMachine {
     }
 
     #[inline]
-    fn process_cymbal(&mut self, vp: &DrumVoiceParams, metal_raw: f32) -> f32 {
+    fn process_cymbal(&mut self, vp: &DrumVoiceParams, metal_raw: f32, air_noise: f32) -> f32 {
         let sr = self.sample_rate;
         let dec = 0.25 + vp.decay * 1.45;
-        let bp = self.cym_bp.process_bp(metal_raw, 5400.0 + vp.tone * 3800.0, 0.22);
-        let hp = self.cym_hp.process_hp(bp, 3800.0 + vp.tone * 2200.0, 0.15);
+        let (bp_hz, hp_hz) = if vp.model == DrumModel::Tr909 {
+            (5800.0 + vp.tone * 3600.0, 4200.0 + vp.tone * 2000.0)
+        } else {
+            (5400.0 + vp.tone * 3800.0, 3800.0 + vp.tone * 2200.0)
+        };
+        let bp = self.cym_bp.process_bp(metal_raw, bp_hz, 0.22);
+        let hp = self.cym_hp.process_hp(bp, hp_hz, 0.15);
+        let sig = if vp.model == DrumModel::Tr909 {
+            hp * self.cym_env * 1.05 + air_noise * self.cym_env * 0.24 * (0.45 + vp.tone * 0.55)
+        } else {
+            hp * self.cym_env * 1.15
+        };
         self.cym_env *= (-1.0 / (dec * sr)).exp();
         if self.cym_env < 0.0005 {
             self.cym_active = false;
         }
-        soft_tanh(hp * self.cym_env * 1.15)
+        soft_tanh(sig)
     }
 }
 

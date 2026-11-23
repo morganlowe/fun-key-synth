@@ -1120,6 +1120,8 @@ pub struct FxParams {
     pub reverb_damp: f32,
     pub reverb_mix: f32,
     pub analog_warmth: f32,
+    #[serde(default = "default_master_crisp")]
+    pub master_crisp: f32,
     pub global_filter_mode: GlobalFilterMode,
     pub global_filter_cutoff: f32,
     pub global_filter_resonance: f32,
@@ -1151,6 +1153,7 @@ impl Default for FxParams {
             reverb_damp: 0.62,
             reverb_mix: 0.16,
             analog_warmth: 0.05,
+            master_crisp: default_master_crisp(),
             global_filter_mode: GlobalFilterMode::LowPass,
             global_filter_cutoff: 18000.0,
             global_filter_resonance: 0.08,
@@ -1230,6 +1233,10 @@ impl PartyPace {
             PartyPace::Extended => "Extended",
         }
     }
+}
+
+fn default_master_crisp() -> f32 {
+    0.38
 }
 
 fn default_true() -> bool {
@@ -1320,11 +1327,12 @@ pub enum FactoryPreset {
     FutureBassEdm,
     EuphoricTrance,
     EurobeatDrift,
+    ImperialBass,
     BlankInit,
 }
 
 impl FactoryPreset {
-    pub const ALL: [FactoryPreset; 17] = [
+    pub const ALL: [FactoryPreset; 18] = [
         FactoryPreset::AcidWarehouse,
         FactoryPreset::ElectroFunkSk1,
         FactoryPreset::Detroit909Deep,
@@ -1341,6 +1349,7 @@ impl FactoryPreset {
         FactoryPreset::FutureBassEdm,
         FactoryPreset::EuphoricTrance,
         FactoryPreset::EurobeatDrift,
+        FactoryPreset::ImperialBass,
         FactoryPreset::BlankInit,
     ];
 
@@ -1362,6 +1371,7 @@ impl FactoryPreset {
             FactoryPreset::FutureBassEdm => "Future Bass Supersaw EDM",
             FactoryPreset::EuphoricTrance => "Euphoric Uplifting Trance",
             FactoryPreset::EurobeatDrift => "Eurobeat Drift (158 BPM Hi-NRG)",
+            FactoryPreset::ImperialBass => "Imperial Bass (126 BPM Cinematic)",
             FactoryPreset::BlankInit => "Blank Init",
         }
     }
@@ -1384,6 +1394,7 @@ impl FactoryPreset {
             FactoryPreset::FutureBassEdm => "futurebass",
             FactoryPreset::EuphoricTrance => "trance",
             FactoryPreset::EurobeatDrift => "eurobeat",
+            FactoryPreset::ImperialBass => "imperial",
             FactoryPreset::BlankInit => "blank",
         }
     }
@@ -1406,6 +1417,7 @@ impl FactoryPreset {
             "futurebass" | "future" => Some(Self::FutureBassEdm),
             "trance" | "euphoric" => Some(Self::EuphoricTrance),
             "eurobeat" | "initiald" | "hinrg" | "drift" => Some(Self::EurobeatDrift),
+            "imperial" | "cinematic" | "romanian" | "romaniandub" => Some(Self::ImperialBass),
             "blank" | "init" => Some(Self::BlankInit),
             _ => None,
         }
@@ -1462,6 +1474,7 @@ impl Project {
         self.fx.global_filter_env_amount = self.fx.global_filter_env_amount.clamp(-1.0, 1.0);
         self.fx.global_filter_env_attack = self.fx.global_filter_env_attack.clamp(0.002, 1.5);
         self.fx.global_filter_env_decay = self.fx.global_filter_env_decay.clamp(0.04, 3.0);
+        self.fx.master_crisp = self.fx.master_crisp.clamp(0.0, 1.0);
         self.drop_macro.normalize();
     }
 
@@ -1569,6 +1582,12 @@ impl Project {
             FactoryPreset::EurobeatDrift => {
                 let mut p = Self::factory(FactoryPreset::BlankInit);
                 super::apply_vibe_to_project(&mut p, super::Vibe::Eurobeat, None, 0xE0A0_8EA7);
+                p.name = preset.name().into();
+                return p;
+            }
+            FactoryPreset::ImperialBass => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::ImperialBass, None, 0xA9A5_4E12);
                 p.name = preset.name().into();
                 return p;
             }
@@ -2008,7 +2027,8 @@ impl Project {
             | FactoryPreset::BigRoomFestival
             | FactoryPreset::FutureBassEdm
             | FactoryPreset::EuphoricTrance
-            | FactoryPreset::EurobeatDrift => unreachable!(),
+            | FactoryPreset::EurobeatDrift
+            | FactoryPreset::ImperialBass => unreachable!(),
         }
 
         p.patterns = patterns;

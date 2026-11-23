@@ -2580,6 +2580,7 @@ impl Runtime {
         self.sidechain_env *= self.sidechain_decay;
         let sc_amt = self.auto_sidechain.unwrap_or(sc_base).clamp(0.0, 1.0);
         let duck = (1.0 - self.sidechain_env * sc_amt * 0.56).clamp(0.36, 1.0);
+        let duck_bass = (1.0 - self.sidechain_env * sc_amt * 0.72).clamp(0.24, 1.0);
         telemetry.sidechain_duck = 1.0 - duck;
 
         // Global Filter Envelope advancement
@@ -2674,8 +2675,8 @@ impl Runtime {
         let mut rev_l = riser_sig * 0.45 + whoosh_sig * 0.35;
         let mut rev_r = riser_sig * 0.45 + whoosh_sig * 0.35;
 
-        // 0: Bass (Moog) — center punch + sidechain + per-instrument filter
-        let moog_s = self.moog.process_sample(&moog_p) * duck;
+        // 0: Bass (Moog) — center punch + deep sidechain pocket + per-instrument filter
+        let moog_s = self.moog.process_sample(&moog_p) * duck_bass;
         if audible(ch[0].mute, ch[0].solo) {
             let (gl, gr) = pan_gains(ch[0].pan);
             let sl = moog_s * vol_bass * gl * 0.54;
@@ -2872,6 +2873,7 @@ impl Runtime {
                 fx_params.delay_div = rig.delay_div;
                 fx_params.reverb_size = rig.reverb_size;
                 fx_params.analog_warmth = rig.analog_warmth;
+                fx_params.master_crisp = rig.master_crisp;
                 if self.auto_space.is_none() {
                     fx_params.reverb_mix = rig.reverb_mix;
                     fx_params.delay_mix = rig.delay_mix;
@@ -3426,7 +3428,7 @@ mod tests {
             let sym = chord_symbol(0, ChordSlot { offset: 0, chord: ct });
             assert!(!sym.is_empty());
         }
-        assert_eq!(PROGRESSIONS.len(), 21);
+        assert_eq!(PROGRESSIONS.len(), 23);
 
         // 4. Every FactoryPreset builds cleanly, and drum voice names adapt to 808/909 models
         for &fp in &FactoryPreset::ALL {
@@ -4025,5 +4027,110 @@ mod tests {
         rt.step = 32;
         rt.trigger_step(&p, false, false, &mut tel);
         assert_eq!(rt.last_mono_note, Some(60), "32-step pattern should wrap step 32 to step 0");
+    }
+
+    #[test]
+    fn modern_crisp_enhances_highs_and_imperial_bass_renders_clean_punch() {
+        use crate::dsp::MasterFx;
+        use crate::model::{apply_vibe_to_project, FactoryPreset};
+
+        assert_eq!(
+            FactoryPreset::from_slug("imperial"),
+            Some(FactoryPreset::ImperialBass)
+        );
+        let imp_proj = Project::factory(FactoryPreset::ImperialBass);
+        assert!((imp_proj.bpm - 126.0).abs() < 0.01);
+        assert_eq!(imp_proj.root_note, 4);
+
+        let mut base = Project::default();
+        apply_vibe_to_project(&mut base, Vibe::ImperialBass, None, 0xA9A5_4E12);
+        base.party_mode = false;
+        base.fx.analog_warmth = 0.0;
+
+        let render_hf = |crisp: f32| -> (f32, f32, f32, f32) {
+            let mut p = base.clone();
+            p.fx.master_crisp = crisp;
+            let sr = 44_100.0_f32;
+            let mut rt = Runtime::new(sr);
+            let mut tel = EngineTelemetry::default();
+            let total_secs = 2.0 * 4.0 * (60.0 / p.bpm);
+            let n = (total_secs * sr).round() as usize;
+            let mut sum_sq = 0.0_f64;
+            let mut hf_sq = 0.0_f64;
+            let mut peak = 0.0_f32;
+            let mut stereo_diff = 0.0_f32;
+            let mut prev_m = 0.0_f32;
+            for _ in 0..n {
+                let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+                assert!(l.is_finite() && r.is_finite(), "Non-finite sample in ImperialBass");
+                assert!(l.abs() <= 1.0 && r.abs() <= 1.0, "Clipping in ImperialBass");
+                peak = peak.max(l.abs()).max(r.abs());
+                stereo_diff = stereo_diff.max((l - r).abs());
+                let m = 0.5 * (l + r);
+                let dm = m - prev_m;
+                prev_m = m;
+                sum_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+                hf_sq += (dm as f64) * (dm as f64);
+            }
+            let rms = (sum_sq / (n.max(1) as f64 * 2.0)).sqrt() as f32;
+            let hf_rms = (hf_sq / n.max(1) as f64).sqrt() as f32;
+            (rms, peak, stereo_diff, hf_rms)
+        };
+
+        let (_, _, _, hf_flat) = render_hf(0.0);
+        let (rms_crisp, peak_crisp, stereo_crisp, hf_crisp) = render_hf(0.90);
+        assert!(rms_crisp > 0.08, "Expected strong audible RMS for ImperialBass, got {rms_crisp}");
+        assert!(peak_crisp <= 1.0, "ImperialBass clipped at peak={peak_crisp}");
+        assert!(stereo_crisp > 0.01, "Expected stereo width for ImperialBass, got {stereo_crisp}");
+        assert!(
+            hf_crisp > hf_flat * 1.15,
+            "Expected master_crisp=0.90 to boost high-frequency crispness: flat={hf_flat}, crisp={hf_crisp}"
+        );
+
+        // Verify < 125 Hz sub-bass side energy is mono-tightened by master_crisp
+        let measure_side_sub = |crisp: f32| -> f32 {
+            let sr = 44_100.0_f32;
+            let mut fx = MasterFx::new(sr);
+            let mut params = base.fx.clone();
+            params.delay_enabled = false;
+            params.reverb_enabled = false;
+            params.global_filter_enabled = false;
+            params.analog_warmth = 0.0;
+            params.master_crisp = crisp;
+            let n = 22_050usize;
+            let sub_a = (std::f32::consts::TAU * 125.0 / sr).clamp(0.001, 0.25);
+            let mut side_lp = 0.0_f32;
+            let mut sq_sum = 0.0_f64;
+            let mut count = 0usize;
+            for i in 0..n {
+                let t = i as f32 / sr;
+                let sub = (t * 60.0 * std::f32::consts::TAU).sin() * 0.45;
+                let (ol, or) = fx.process_stereo(sub, 0.0, 0.0, 0.0, 0.0, 0.0, &params, 126.0);
+                let side = 0.5 * (ol - or);
+                side_lp += sub_a * (side - side_lp);
+                if i >= n / 2 {
+                    sq_sum += (side_lp as f64) * (side_lp as f64);
+                    count += 1;
+                }
+            }
+            (sq_sum / count.max(1) as f64).sqrt() as f32
+        };
+        let side_sub_flat = measure_side_sub(0.0);
+        let side_sub_crisp = measure_side_sub(0.90);
+        assert!(
+            side_sub_crisp < side_sub_flat * 0.35,
+            "Expected master_crisp=0.90 to mono-tighten <125 Hz sub: flat={side_sub_flat}, crisp={side_sub_crisp}"
+        );
+
+        // Soloed Imperial 909 drum beat renders cleanly and audibly
+        let mut drums_only = base;
+        for ch in &mut drums_only.mixer.channels {
+            ch.solo = false;
+        }
+        drums_only.mixer.moog_pad_solo = false;
+        drums_only.mixer.channels[3].solo = true;
+        let (drums_rms, drums_peak) = render_rms_and_peak(&drums_only, 2);
+        assert!(drums_rms > 0.02, "Expected audible Imperial 909 drums, got {drums_rms}");
+        assert!(drums_peak <= 1.0, "Imperial 909 drums clipped at {drums_peak}");
     }
 }

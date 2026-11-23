@@ -9,7 +9,7 @@ use super::{soft_tanh, AdsrEnv, Svf12Filter};
 const MAX_SAMPLER_VOICES: usize = 4;
 const MAX_SAMPLE_SECONDS: f32 = 30.0;
 
-pub const BUILTIN_SAMPLE_NAMES: [&str; 8] = [
+pub const BUILTIN_SAMPLE_NAMES: [&str; 9] = [
     "SK-1 Choir Ahh",
     "SK-1 Brass Stab",
     "SK-1 Toy Piano",
@@ -18,6 +18,7 @@ pub const BUILTIN_SAMPLE_NAMES: [&str; 8] = [
     "70s Solina String",
     "OB-X Power Chord",
     "Electric Guitar",
+    "Cinematic Brass",
 ];
 
 #[derive(Debug, Clone)]
@@ -481,7 +482,7 @@ pub fn generate_builtin_sample(id: u8, sample_rate: u32) -> Vec<f32> {
             }
             out
         }
-        _ => {
+        7 => {
             // Warm Double-Tracked Humbucker Electric Guitar (Karplus-Strong + 4x12 amp cab!)
             let len = (1.8 * sr) as usize;
             let make_string = |freq: f32, seed_init: u32| -> Vec<f32> {
@@ -538,6 +539,48 @@ pub fn generate_builtin_sample(id: u8, sample_rate: u32) -> Vec<f32> {
                 out.push(soft_tanh((cab + body) * 1.15 * attack * tail).clamp(-1.0, 1.0));
             }
             out
+        }
+        _ => {
+            // Cinematic Orchestral Low Brass Horn Ensemble (stacked horn blast!)
+            let len = (1.8 * sr) as usize;
+            let mut out = Vec::with_capacity(len);
+            let mut lp_svf = Svf12Filter::new(sr);
+            let mut bp_svf = Svf12Filter::new(sr);
+            let detunes = [0.5_f32, 0.9945, 0.9985, 1.0018, 1.0060];
+            let weights = [0.48_f32, 0.34, 0.38, 0.38, 0.32];
+            for i in 0..len {
+                let t = i as f32 / sr;
+                let mut sum = 0.0_f32;
+                for (v, &d) in detunes.iter().enumerate() {
+                    let f = base_hz * d;
+                    let mut saw = 0.0_f32;
+                    for h in 1..=12 {
+                        let hf = f * h as f32;
+                        if hf < sr * 0.42 {
+                            saw += (t * hf * TAU).sin() / (h as f32);
+                        }
+                    }
+                    sum += saw * 0.56 * weights[v];
+                }
+                // Subtle octave brilliance during initial horn blare transient
+                let br_env = (t / 0.022).min(1.0) * (-t * 5.2).exp();
+                for h in 1..=6 {
+                    let hf = (base_hz * 2.0) * h as f32;
+                    if hf < sr * 0.42 {
+                        sum += ((t * hf * TAU).sin() / (h as f32)) * 0.14 * br_env;
+                    }
+                }
+                let swell_env = (t / 0.028).min(1.0) * (0.38 + 0.62 * (-t * 2.4).exp());
+                let cutoff = (520.0 + 3800.0 * swell_env).clamp(120.0, sr * 0.40);
+                let lp = lp_svf.process_lp(sum, cutoff, 0.24);
+                let formant = bp_svf.process_bp(sum, 920.0, 0.22) * 0.28;
+                let driven = soft_tanh((lp + formant) * 1.65);
+                let attack = (t / 0.018).min(1.0);
+                let decay = (-t * 0.95).exp();
+                let tail = if t > 1.55 { (1.0 - (t - 1.55) / 0.25).max(0.0) } else { 1.0 };
+                out.push((driven * attack * decay * tail).clamp(-1.0, 1.0));
+            }
+            normalize_peak(&out)
         }
     }
 }

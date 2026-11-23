@@ -4476,6 +4476,18 @@ impl FunKeySynthApp {
                             );
                         });
                         ui.label(RichText::new(format!("{:.0}%", proj.fx.global_filter_resonance * 100.0)).size(11.0).weak());
+                        ui.separator();
+                        ui.label(RichText::new("Crisp").size(11.0).color(accent))
+                            .on_hover_text("Modern mastering crispness: mono-locked sub, mud carve, silky air highs & punchy transient limiter");
+                        ui.scope(|ui| {
+                            ui.spacing_mut().slider_width = 68.0;
+                            ui.add(
+                                egui::Slider::new(&mut proj.fx.master_crisp, 0.0..=1.0)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            );
+                        });
+                        ui.label(RichText::new(format!("{:.0}%", proj.fx.master_crisp * 100.0)).size(11.0).weak());
                     });
 
                     ui.add_space(4.0);
@@ -5268,6 +5280,7 @@ impl FunKeySynthApp {
                     ui.add(egui::Slider::new(&mut fx.global_filter_env_attack, 0.002..=1.5).logarithmic(true).text("Env Attack"));
                     ui.add(egui::Slider::new(&mut fx.global_filter_env_decay, 0.04..=3.0).logarithmic(true).text("Env Decay"));
                     ui.add(egui::Slider::new(&mut fx.analog_warmth, 0.0..=1.0).text("Tape Warmth"));
+                    ui.add(egui::Slider::new(&mut fx.master_crisp, 0.0..=1.0).text("Modern Crisp"));
                 });
 
                 ui.add_space(8.0);
