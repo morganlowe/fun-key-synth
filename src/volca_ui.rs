@@ -5,7 +5,7 @@ use crate::{
     },
     engine::{render_resample_mono, AudioEngine, EngineTelemetry, LiveEvent},
     mic::MicRecorder,
-    model::{GlobalFilterMode, LoopMode, Project, SamplerMode, SavedSample, TrackId},
+    model::{GlobalFilterMode, LoopMode, Project, SamplerMode, SavedSample, StepCount, TrackId},
     settings::StudioTheme,
 };
 use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
@@ -155,7 +155,11 @@ pub fn render_volca_sampler(
     cur_step: usize,
     bar_page: &mut usize,
     follow_playhead: &mut bool,
-    record_live: bool,
+    sampler_armed: &mut bool,
+    step_rec_cursor: &mut usize,
+    rec_replace: bool,
+    rec_take_cleared: &mut bool,
+    step_phase: f32,
     rec_motion: &mut bool,
     test_repeat_on: &mut bool,
     test_repeat_next_t: &mut f64,
@@ -419,11 +423,40 @@ pub fn render_volca_sampler(
                         part: i,
                         velocity: 0.92,
                     });
-                    if record_live && playing {
+                    if *sampler_armed {
+                        if rec_replace && !*rec_take_cleared {
+                            proj.patterns[active_pat].sampler.clear();
+                            for l in &mut proj.patterns[active_pat].sample_lanes {
+                                l.clear();
+                            }
+                            *rec_take_cleared = true;
+                        }
                         let lane = &mut proj.patterns[active_pat].sample_lanes[i];
-                        let s_idx = cur_step % lane.step_count.as_usize();
-                        lane.steps[s_idx].active = true;
-                        lane.steps[s_idx].velocity = 0.90;
+                        let lane_len = lane.step_count.as_usize();
+                        if playing {
+                            let q_global = if step_phase >= 0.65 {
+                                cur_step + 1
+                            } else {
+                                cur_step
+                            };
+                            let s_idx = q_global % lane_len;
+                            lane.steps[s_idx].active = true;
+                            lane.steps[s_idx].velocity = 0.90;
+                            if q_global > cur_step {
+                                engine.send_live(LiveEvent::SuppressTrackStep {
+                                    track: Some(TrackId::Sampler),
+                                    extra_idx: None,
+                                    lane: Some(i),
+                                    global_step: q_global,
+                                });
+                            }
+                        } else {
+                            let s_idx = *step_rec_cursor % lane_len;
+                            lane.steps[s_idx].active = true;
+                            lane.steps[s_idx].velocity = 0.90;
+                            *step_rec_cursor = (s_idx + 1) % lane_len;
+                            *bar_page = *step_rec_cursor / 16;
+                        }
                     }
                 } else if !resp.is_pointer_button_down_on() && state.held_pad == Some(i) {
                     if proj.sample_parts[i].loop_mode != LoopMode::OneShot {
@@ -556,16 +589,115 @@ pub fn render_volca_sampler(
         // LEFT: 8-Lane Performance Step Sequencer
         cols[0].vertical(|ui| {
             card(ui, theme, |ui| {
+                let active_pat = proj.active_pattern;
+                let samp_sc = proj.patterns[active_pat]
+                    .sample_lanes
+                    .first()
+                    .map(|l| l.step_count)
+                    .unwrap_or(StepCount::Steps16);
+                let samp_len = samp_sc.as_usize();
+                let samp_pages = samp_sc.pages();
+                *bar_page = (*bar_page).min(samp_pages.saturating_sub(1));
+                *step_rec_cursor = (*step_rec_cursor) % samp_len;
+
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("8-PART SAMPLE SEQUENCER").strong().size(12.5).color(samp_color));
                     ui.separator();
-                    for b in 0..4 {
+                    ui.label(RichText::new("Len:").size(11.0).weak());
+                    for &sc in &StepCount::ALL {
+                        if ui.selectable_label(samp_sc == sc, sc.label()).clicked() {
+                            proj.patterns[active_pat].set_sampler_step_counts(sc);
+                            *bar_page = (*bar_page).min(sc.pages().saturating_sub(1));
+                            *step_rec_cursor = (*step_rec_cursor) % sc.as_usize();
+                        }
+                    }
+                    ui.separator();
+                    for b in 0..samp_pages {
                         if ui.selectable_label(*bar_page == b, format!("Bar {}", b + 1)).clicked() {
                             *bar_page = b;
                             *follow_playhead = false;
                         }
                     }
                     ui.checkbox(follow_playhead, "Follow");
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .small_button("Copy->Rest")
+                        .on_hover_text("Copy this 16-step Bar across the remaining bars (expands 16 -> 64 steps automatically)")
+                        .clicked()
+                    {
+                        let new_sc = proj.patterns[active_pat].copy_sampler_page_to_rest(*bar_page);
+                        toast_msg = Some(format!(
+                            "Copied Bar {} -> rest ({} steps)",
+                            *bar_page + 1,
+                            new_sc.as_usize()
+                        ));
+                    }
+                    if ui
+                        .small_button("->Next")
+                        .on_hover_text("Copy this 16-step Bar to the next Bar (expands 16 -> 32 steps) and jump there")
+                        .clicked()
+                    {
+                        let dst = proj.patterns[active_pat].copy_sampler_page_to_next(*bar_page);
+                        *bar_page = dst;
+                        *follow_playhead = false;
+                        toast_msg = Some(format!("Copied Bar -> Bar {}", dst + 1));
+                    }
+                    ui.separator();
+                    let rec_btn = egui::Button::new(
+                        RichText::new(if *sampler_armed { "● REC" } else { "● REC" })
+                            .strong()
+                            .size(11.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(if *sampler_armed {
+                        Color32::from_rgb(228, 54, 70)
+                    } else {
+                        Color32::from_rgb(44, 34, 40)
+                    });
+                    if ui
+                        .add(rec_btn)
+                        .on_hover_text("Arm Sampler for live or step recording into the active Bank")
+                        .clicked()
+                    {
+                        *sampler_armed = !*sampler_armed;
+                        if *sampler_armed {
+                            *rec_take_cleared = false;
+                            *step_rec_cursor = ((*bar_page) * 16).min(samp_len.saturating_sub(1));
+                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                            proj.party_mode = false;
+                            toast_msg = Some("Armed Sampler REC".into());
+                        } else {
+                            toast_msg = Some("Saved Sampler pattern".into());
+                        }
+                    }
+                    if *sampler_armed && !playing {
+                        ui.label(
+                            RichText::new(format!("STEP {}/{}", *step_rec_cursor + 1, samp_len))
+                                .strong()
+                                .size(11.0)
+                                .color(Color32::from_rgb(255, 110, 120)),
+                        );
+                        if ui.small_button("Rest").clicked() {
+                            *step_rec_cursor = (*step_rec_cursor + 1) % samp_len;
+                            *bar_page = *step_rec_cursor / 16;
+                        }
+                        if ui.small_button("←").clicked() {
+                            *step_rec_cursor = (*step_rec_cursor + samp_len - 1) % samp_len;
+                            *bar_page = *step_rec_cursor / 16;
+                        }
+                        if ui.small_button("→").clicked() {
+                            *step_rec_cursor = (*step_rec_cursor + 1) % samp_len;
+                            *bar_page = *step_rec_cursor / 16;
+                        }
+                    } else if *sampler_armed && playing {
+                        ui.label(
+                            RichText::new("LIVE REC")
+                                .strong()
+                                .size(11.0)
+                                .color(Color32::from_rgb(255, 110, 120)),
+                        );
+                    }
                 });
                 ui.label(
                     RichText::new("Click P1-P8 = Mute  |  Click step = Toggle & Select  |  Right-click step = Reverse / Pitch / Speed / Filter / Ratchet")
@@ -575,8 +707,6 @@ pub fn render_volca_sampler(
                 ui.add_space(4.0);
 
                 let page_start = (*bar_page) * 16;
-                let play_step = if playing { Some(cur_step % 64) } else { None };
-                let active_pat = proj.active_pattern;
                 let cell_w = ((ui.available_width() - 68.0 - 15.0 * 3.0) / 16.0).clamp(16.0, 44.0);
                 let cell_h = 22.0;
 
@@ -647,10 +777,12 @@ pub fn render_volca_sampler(
                         });
 
                         let lane = &mut proj.patterns[active_pat].sample_lanes[part_idx];
+                        let lane_len = lane.step_count.as_usize();
                         for col in 0..16 {
-                            let idx = (page_start + col) % lane.step_count.as_usize();
+                            let idx = (page_start + col) % lane_len;
                             let st = &mut lane.steps[idx];
-                            let is_play = play_step == Some(page_start + col);
+                            let is_play = playing && (cur_step % lane_len) == (page_start + col);
+                            let is_rec_col = *sampler_armed && !playing && (*step_rec_cursor % lane_len) == (page_start + col);
                             let beat_tint = if (col / 4) % 2 == 0 {
                                 Color32::from_rgb(26, 31, 44)
                             } else {
@@ -679,6 +811,9 @@ pub fn render_volca_sampler(
                             if resp.clicked() {
                                 st.active = !st.active;
                                 state.selected_step = (part_idx, idx);
+                                if *sampler_armed && !playing {
+                                    *step_rec_cursor = idx;
+                                }
                                 if st.active {
                                     st.velocity = 0.88;
                                     proj.mixer.channels[TrackId::Sampler.index()].mute = false;
@@ -741,7 +876,13 @@ pub fn render_volca_sampler(
                             });
                             let painter = ui.painter();
                             painter.rect_filled(rect, Rounding::same(4.0), fill);
-                            if is_sel_step {
+                            if is_rec_col {
+                                painter.rect_stroke(
+                                    rect,
+                                    Rounding::same(4.0),
+                                    Stroke::new(2.0_f32, Color32::from_rgb(245, 72, 86)),
+                                );
+                            } else if is_sel_step {
                                 painter.rect_stroke(rect, Rounding::same(4.0), Stroke::new(1.5_f32, Color32::WHITE));
                             }
                             if st.active {

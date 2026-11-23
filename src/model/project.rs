@@ -1319,11 +1319,12 @@ pub enum FactoryPreset {
     BigRoomFestival,
     FutureBassEdm,
     EuphoricTrance,
+    EurobeatDrift,
     BlankInit,
 }
 
 impl FactoryPreset {
-    pub const ALL: [FactoryPreset; 16] = [
+    pub const ALL: [FactoryPreset; 17] = [
         FactoryPreset::AcidWarehouse,
         FactoryPreset::ElectroFunkSk1,
         FactoryPreset::Detroit909Deep,
@@ -1339,6 +1340,7 @@ impl FactoryPreset {
         FactoryPreset::BigRoomFestival,
         FactoryPreset::FutureBassEdm,
         FactoryPreset::EuphoricTrance,
+        FactoryPreset::EurobeatDrift,
         FactoryPreset::BlankInit,
     ];
 
@@ -1359,6 +1361,7 @@ impl FactoryPreset {
             FactoryPreset::BigRoomFestival => "Big Room Mainstage EDM",
             FactoryPreset::FutureBassEdm => "Future Bass Supersaw EDM",
             FactoryPreset::EuphoricTrance => "Euphoric Uplifting Trance",
+            FactoryPreset::EurobeatDrift => "Eurobeat Drift (158 BPM Hi-NRG)",
             FactoryPreset::BlankInit => "Blank Init",
         }
     }
@@ -1380,6 +1383,7 @@ impl FactoryPreset {
             FactoryPreset::BigRoomFestival => "bigroom",
             FactoryPreset::FutureBassEdm => "futurebass",
             FactoryPreset::EuphoricTrance => "trance",
+            FactoryPreset::EurobeatDrift => "eurobeat",
             FactoryPreset::BlankInit => "blank",
         }
     }
@@ -1401,6 +1405,7 @@ impl FactoryPreset {
             "bigroom" | "edm" | "festival" => Some(Self::BigRoomFestival),
             "futurebass" | "future" => Some(Self::FutureBassEdm),
             "trance" | "euphoric" => Some(Self::EuphoricTrance),
+            "eurobeat" | "initiald" | "hinrg" | "drift" => Some(Self::EurobeatDrift),
             "blank" | "init" => Some(Self::BlankInit),
             _ => None,
         }
@@ -1561,6 +1566,12 @@ impl Project {
                 p.name = preset.name().into();
                 return p;
             }
+            FactoryPreset::EurobeatDrift => {
+                let mut p = Self::factory(FactoryPreset::BlankInit);
+                super::apply_vibe_to_project(&mut p, super::Vibe::Eurobeat, None, 0xE0A0_8EA7);
+                p.name = preset.name().into();
+                return p;
+            }
             _ => {}
         }
         let mut patterns: Vec<Pattern> = (0..NUM_PATTERNS)
@@ -1591,7 +1602,7 @@ impl Project {
             vibe: super::Vibe::ElectroFunk,
             progression_idx: 0,
             bars_per_chord: 1,
-            auto_chord_mode: true,
+            auto_chord_mode: false,
             auto_chord_follow: true,
             auto_beat_mode: false,
             beat_energy: 0.65,
@@ -1996,7 +2007,8 @@ impl Project {
             | FactoryPreset::DubstepWobble
             | FactoryPreset::BigRoomFestival
             | FactoryPreset::FutureBassEdm
-            | FactoryPreset::EuphoricTrance => unreachable!(),
+            | FactoryPreset::EuphoricTrance
+            | FactoryPreset::EurobeatDrift => unreachable!(),
         }
 
         p.patterns = patterns;

@@ -225,7 +225,7 @@ impl MelodicTrackSeq {
         for st in &mut self.steps {
             st.note = st.note.clamp(12, 108);
             st.velocity = st.velocity.clamp(0.05, 1.0);
-            st.gate = st.gate.clamp(0.05, 1.0);
+            st.gate = st.gate.clamp(0.05, 16.0);
         }
     }
 
@@ -242,6 +242,33 @@ impl MelodicTrackSeq {
 
     pub fn copy_page(&mut self, src_page: usize, dst_page: usize) {
         copy_page_slice(&mut self.steps, src_page, dst_page);
+    }
+
+    pub fn copy_page_to_rest(&mut self, src_page: usize) -> StepCount {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.step_count = StepCount::Steps64;
+        }
+        let pages = self.step_count.pages();
+        for dst in 0..pages {
+            if dst != src {
+                self.copy_page(src, dst);
+            }
+        }
+        self.step_count
+    }
+
+    pub fn copy_page_to_next(&mut self, src_page: usize) -> usize {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.step_count = StepCount::Steps32;
+        }
+        let pages = self.step_count.pages().max(1);
+        let dst = (src + 1) % pages;
+        if dst != src {
+            self.copy_page(src, dst);
+        }
+        dst
     }
 
     pub fn shift(&mut self, delta: isize) {
@@ -527,6 +554,37 @@ impl DrumLane {
         self.step_count = target;
     }
 
+    pub fn copy_page(&mut self, src_page: usize, dst_page: usize) {
+        copy_page_slice(&mut self.steps, src_page, dst_page);
+    }
+
+    pub fn copy_page_to_rest(&mut self, src_page: usize) -> StepCount {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.step_count = StepCount::Steps64;
+        }
+        let pages = self.step_count.pages();
+        for dst in 0..pages {
+            if dst != src {
+                self.copy_page(src, dst);
+            }
+        }
+        self.step_count
+    }
+
+    pub fn copy_page_to_next(&mut self, src_page: usize) -> usize {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.step_count = StepCount::Steps32;
+        }
+        let pages = self.step_count.pages().max(1);
+        let dst = (src + 1) % pages;
+        if dst != src {
+            self.copy_page(src, dst);
+        }
+        dst
+    }
+
     pub fn fill_euclidean(&mut self, pulses: usize, rotation: usize) {
         let len = self.step_count.as_usize();
         let pattern = euclidean_rhythm(len, pulses, rotation);
@@ -582,6 +640,33 @@ impl DrumTrackSeq {
         for lane in &mut self.lanes {
             copy_page_slice(&mut lane.steps, src_page, dst_page);
         }
+    }
+
+    pub fn copy_page_to_rest(&mut self, src_page: usize) -> StepCount {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.set_all_step_counts(StepCount::Steps64, false);
+        }
+        let pages = self.step_count.pages();
+        for dst in 0..pages {
+            if dst != src {
+                self.copy_page(src, dst);
+            }
+        }
+        self.step_count
+    }
+
+    pub fn copy_page_to_next(&mut self, src_page: usize) -> usize {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.set_all_step_counts(StepCount::Steps32, false);
+        }
+        let pages = self.step_count.pages().max(1);
+        let dst = (src + 1) % pages;
+        if dst != src {
+            self.copy_page(src, dst);
+        }
+        dst
     }
 
     pub fn shift(&mut self, delta: isize) {
@@ -716,6 +801,33 @@ impl MidiTrackSeq {
         copy_page_slice(&mut self.steps, src_page, dst_page);
     }
 
+    pub fn copy_page_to_rest(&mut self, src_page: usize) -> StepCount {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.step_count = StepCount::Steps64;
+        }
+        let pages = self.step_count.pages();
+        for dst in 0..pages {
+            if dst != src {
+                self.copy_page(src, dst);
+            }
+        }
+        self.step_count
+    }
+
+    pub fn copy_page_to_next(&mut self, src_page: usize) -> usize {
+        let src = src_page.min(3);
+        if self.step_count == StepCount::Steps16 {
+            self.step_count = StepCount::Steps32;
+        }
+        let pages = self.step_count.pages().max(1);
+        let dst = (src + 1) % pages;
+        if dst != src {
+            self.copy_page(src, dst);
+        }
+        dst
+    }
+
     pub fn shift(&mut self, delta: isize) {
         rotate_slice(&mut self.steps[..self.step_count.as_usize()], delta);
     }
@@ -833,6 +945,17 @@ impl Pattern {
         }
     }
 
+    pub fn melodic(&self, track: super::TrackId) -> Option<&MelodicTrackSeq> {
+        match track {
+            super::TrackId::Moog => Some(&self.moog),
+            super::TrackId::MoogPad => Some(&self.moog_pad),
+            super::TrackId::Monologue => Some(&self.monologue),
+            super::TrackId::Tb303 => Some(&self.tb303),
+            super::TrackId::Sampler => Some(&self.sampler),
+            _ => None,
+        }
+    }
+
     pub fn melodic_mut(&mut self, track: super::TrackId) -> Option<&mut MelodicTrackSeq> {
         match track {
             super::TrackId::Moog => Some(&mut self.moog),
@@ -841,6 +964,88 @@ impl Pattern {
             super::TrackId::Tb303 => Some(&mut self.tb303),
             super::TrackId::Sampler => Some(&mut self.sampler),
             _ => None,
+        }
+    }
+
+    pub fn set_all_step_counts(&mut self, target: StepCount) {
+        self.moog.step_count = target;
+        self.moog_pad.step_count = target;
+        self.monologue.step_count = target;
+        self.tb303.step_count = target;
+        self.drums.set_all_step_counts(target, false);
+        self.set_sampler_step_counts(target);
+        self.midi_out.step_count = target;
+        for seq in &mut self.extra_seqs {
+            seq.step_count = target;
+        }
+    }
+
+    pub fn set_sampler_step_counts(&mut self, target: StepCount) {
+        self.sampler.step_count = target;
+        for l in &mut self.sample_lanes {
+            l.step_count = target;
+        }
+    }
+
+    pub fn copy_sampler_page_to_rest(&mut self, src_page: usize) -> StepCount {
+        let src = src_page.min(3);
+        let cur = self
+            .sample_lanes
+            .first()
+            .map(|l| l.step_count)
+            .unwrap_or(self.sampler.step_count);
+        let target = if cur == StepCount::Steps16 {
+            StepCount::Steps64
+        } else {
+            cur
+        };
+        self.set_sampler_step_counts(target);
+        let pages = target.pages();
+        for dst in 0..pages {
+            if dst != src {
+                self.sampler.copy_page(src, dst);
+                for l in &mut self.sample_lanes {
+                    l.copy_page(src, dst);
+                }
+            }
+        }
+        target
+    }
+
+    pub fn copy_sampler_page_to_next(&mut self, src_page: usize) -> usize {
+        let src = src_page.min(3);
+        let cur = self
+            .sample_lanes
+            .first()
+            .map(|l| l.step_count)
+            .unwrap_or(self.sampler.step_count);
+        let target = if cur == StepCount::Steps16 {
+            StepCount::Steps32
+        } else {
+            cur
+        };
+        self.set_sampler_step_counts(target);
+        let pages = target.pages().max(1);
+        let dst = (src + 1) % pages;
+        if dst != src {
+            self.sampler.copy_page(src, dst);
+            for l in &mut self.sample_lanes {
+                l.copy_page(src, dst);
+            }
+        }
+        dst
+    }
+
+    pub fn copy_all_tracks_page_to_rest(&mut self, src_page: usize) {
+        let src = src_page.min(3);
+        self.moog.copy_page_to_rest(src);
+        self.moog_pad.copy_page_to_rest(src);
+        self.monologue.copy_page_to_rest(src);
+        self.tb303.copy_page_to_rest(src);
+        self.drums.copy_page_to_rest(src);
+        self.copy_sampler_page_to_rest(src);
+        for seq in &mut self.extra_seqs {
+            seq.copy_page_to_rest(src);
         }
     }
 
@@ -863,6 +1068,68 @@ impl Pattern {
         self.motion.normalize();
         self.midi_out.normalize();
     }
+}
+
+pub fn detect_chord_from_notes(notes: &[u8]) -> (u8, ChordType) {
+    let mut sorted: Vec<u8> = notes.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.is_empty() {
+        return (60, ChordType::Single);
+    }
+    if sorted.len() == 1 {
+        return (sorted[0], ChordType::Single);
+    }
+
+    let root = sorted[0];
+    let exact_intervals: Vec<u8> = sorted.iter().map(|&n| n - root).collect();
+    for &ct in &ChordType::ALL {
+        if ct == ChordType::Single {
+            continue;
+        }
+        if ct.intervals() == exact_intervals.as_slice() {
+            return (root, ct);
+        }
+    }
+
+    let pcs_for_root = |r: u8| -> Vec<u8> {
+        let rpc = r % 12;
+        let mut pcs: Vec<u8> = sorted.iter().map(|&n| (n + 12 - rpc) % 12).collect();
+        pcs.sort_unstable();
+        pcs.dedup();
+        pcs
+    };
+    let chord_pcs = |ct: ChordType| -> Vec<u8> {
+        let mut pcs: Vec<u8> = ct.intervals().iter().map(|&i| i % 12).collect();
+        pcs.sort_unstable();
+        pcs.dedup();
+        pcs
+    };
+
+    let root_pcs = pcs_for_root(root);
+    for &ct in &ChordType::ALL {
+        if ct == ChordType::Single {
+            continue;
+        }
+        if root_pcs == chord_pcs(ct) {
+            return (root, ct);
+        }
+    }
+
+    // Check chord inversions
+    for &cand_root in &sorted[1..] {
+        let inv_pcs = pcs_for_root(cand_root);
+        for &ct in &ChordType::ALL {
+            if ct == ChordType::Single {
+                continue;
+            }
+            if inv_pcs == chord_pcs(ct) {
+                return (cand_root, ct);
+            }
+        }
+    }
+
+    (root, ChordType::Single)
 }
 
 pub fn euclidean_rhythm(steps: usize, pulses: usize, rotation: usize) -> Vec<bool> {
@@ -931,5 +1198,101 @@ impl SeqRng {
 
     pub fn next_f32(&mut self) -> f32 {
         (self.next_u32() & 0x00FF_FFFF) as f32 / 16_777_216.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{generate_auto_beat, TrackId, Vibe};
+
+    #[test]
+    fn copy_page_to_rest_and_next_work_for_melodic_drums_and_pattern() {
+        let mut seq = MelodicTrackSeq::new(StepCount::Steps16);
+        seq.steps[0] = MelodicStep {
+            active: true,
+            note: 52,
+            gate: 4.5,
+            accent: true,
+            ..Default::default()
+        };
+        seq.steps[7].active = true;
+        seq.steps[7].note = 55;
+
+        // Normalize preserves extended gate length up to 16.0
+        seq.normalize();
+        assert!((seq.steps[0].gate - 4.5).abs() < 1e-5);
+
+        // Copy->Next on 16 steps expands to 32 and copies page 0 -> page 1
+        let dst = seq.copy_page_to_next(0);
+        assert_eq!(dst, 1);
+        assert_eq!(seq.step_count, StepCount::Steps32);
+        assert!(seq.steps[16].active);
+        assert_eq!(seq.steps[16].note, 52);
+        assert!(seq.steps[23].active);
+        assert_eq!(seq.steps[23].note, 55);
+
+        // Copy->Rest from 16 steps expands to 64 and fills all 4 bars
+        let mut seq16 = MelodicTrackSeq::new(StepCount::Steps16);
+        seq16.steps[3].active = true;
+        seq16.steps[3].note = 64;
+        assert_eq!(seq16.copy_page_to_rest(0), StepCount::Steps64);
+        assert_eq!(seq16.step_count, StepCount::Steps64);
+        for bar in 0..4 {
+            assert!(seq16.steps[bar * 16 + 3].active);
+            assert_eq!(seq16.steps[bar * 16 + 3].note, 64);
+        }
+
+        // Copy->Rest on 48 steps preserves 48 and copies src bar to bars 0..3
+        let mut drums = DrumTrackSeq::default();
+        drums.set_all_step_counts(StepCount::Steps48, false);
+        drums.lanes[0].steps[16].active = true; // Bar 2 step 1
+        assert_eq!(drums.copy_page_to_rest(1), StepCount::Steps48);
+        assert!(drums.lanes[0].steps[0].active);
+        assert!(drums.lanes[0].steps[16].active);
+        assert!(drums.lanes[0].steps[32].active);
+        assert!(!drums.lanes[0].steps[48].active);
+
+        // Pattern::set_all_step_counts + copy_all_tracks_page_to_rest
+        let mut pat = Pattern::default();
+        pat.extra_seqs.push(MelodicTrackSeq::new(StepCount::Steps16));
+        pat.set_all_step_counts(StepCount::Steps32);
+        assert_eq!(pat.monologue.step_count, StepCount::Steps32);
+        assert_eq!(pat.drums.step_count, StepCount::Steps32);
+        assert_eq!(pat.sample_lanes[0].step_count, StepCount::Steps32);
+        assert_eq!(pat.extra_seqs[0].step_count, StepCount::Steps32);
+
+        pat.monologue.steps[2].active = true;
+        pat.monologue.steps[2].note = 67;
+        pat.drums.lanes[1].steps[4].active = true;
+        pat.sample_lanes[2].steps[8].active = true;
+        pat.extra_seqs[0].steps[12].active = true;
+        pat.copy_all_tracks_page_to_rest(0);
+        assert!(pat.melodic(TrackId::Monologue).unwrap().steps[18].active);
+        assert_eq!(pat.melodic(TrackId::Monologue).unwrap().steps[18].note, 67);
+        assert!(pat.drums.lanes[1].steps[20].active);
+        assert!(pat.sample_lanes[2].steps[24].active);
+        assert!(pat.extra_seqs[0].steps[28].active);
+
+        // generate_auto_beat keeps DrumTrackSeq::step_count == Steps64
+        let gen_drums = generate_auto_beat(Vibe::ElectroFunk, 0.7, 42);
+        assert_eq!(gen_drums.step_count, StepCount::Steps64);
+    }
+
+    #[test]
+    fn detect_chord_recognizes_triads_sevenths_and_inversions() {
+        assert_eq!(detect_chord_from_notes(&[60]), (60, ChordType::Single));
+        assert_eq!(detect_chord_from_notes(&[48, 55, 60]), (48, ChordType::Power5));
+        assert_eq!(detect_chord_from_notes(&[60, 64, 67]), (60, ChordType::Major));
+        assert_eq!(detect_chord_from_notes(&[60, 63, 67]), (60, ChordType::Minor));
+        assert_eq!(detect_chord_from_notes(&[60, 62, 67]), (60, ChordType::Sus2));
+        assert_eq!(detect_chord_from_notes(&[60, 65, 67]), (60, ChordType::Sus4));
+        assert_eq!(detect_chord_from_notes(&[60, 64, 67, 71]), (60, ChordType::Major7));
+        assert_eq!(detect_chord_from_notes(&[60, 63, 67, 70]), (60, ChordType::Minor7));
+        assert_eq!(detect_chord_from_notes(&[60, 64, 67, 70]), (60, ChordType::Dom7));
+        // Inversion: E4 G4 C5 -> C Major with root C5
+        let (inv_root, inv_ct) = detect_chord_from_notes(&[64, 67, 72]);
+        assert_eq!(inv_root % 12, 0);
+        assert_eq!(inv_ct, ChordType::Major);
     }
 }

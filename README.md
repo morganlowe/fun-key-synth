@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/morganlowe/fun-key-synth/releases/latest"><strong>⬇ Download Latest Release (v1.3.3)</strong></a>
+  <a href="https://github.com/morganlowe/fun-key-synth/releases/latest"><strong>⬇ Download Latest Release (v1.4.0)</strong></a>
   &nbsp;·&nbsp;
   <a href="#visual-tour">Screenshots</a>
   &nbsp;·&nbsp;
@@ -30,7 +30,7 @@
 
 Most DAWs and grooveboxes bury beginners under empty timelines, raw MIDI numbers, and 50 unlabeled knobs. Fun Key Synth flips that around:
 
-- **Start in a Vibe, Not a Blank Screen:** Pick one of **7 curated musical vibes** (*Deep House, Heavy Electro Funk, Lo-Fi Chill, Electro-Soul, Night Drive, Acid Club, Ambient Dub*) and press **`Space`**. You immediately have a balanced, true-stereo, sidechained groove playing in real time.
+- **Start in a Vibe, Not a Blank Screen:** Pick one of **23 curated musical vibes** (*Deep House, Heavy Electro Funk, Lo-Fi Chill, Electro-Soul, Night Drive, Acid Club, Ambient Dub, Eurobeat, Euphoric Trance, Future Bass*, and more) and press **`Space`**. You immediately have a balanced, true-stereo, sidechained groove playing in real time.
 - **Impossible to Hit a Wrong Note:** Turn on **Auto-Chord** and press any key from **`A` to `K`** to play lush, voice-led 7th/9th/11th chords in key — and with **Band Follow**, the Bass and Arp automatically lock to the chords you play live.
 - **100% Local & Real-Time:** Every synth voice, drum hit, reverb tail, sample chop, and **Party Mode** song arrangement is synthesized locally on your CPU with zero cloud APIs, zero subscriptions, and zero latency bloat.
 - **Beginner-Friendly on Top, Deep Hardware Under the Hood:** Stay on the main **Studio** screen for 1-click presets and Vibe Macros, or dive into the **8-Part Volca Sampler** and **Sound Lab** whenever you want to sculpt 3-oscillator Moog patches, sync/ring-mod Monologue leads, 303 acid lines, or individual 808/909 drum voices.
@@ -42,11 +42,11 @@ Most DAWs and grooveboxes bury beginners under empty timelines, raw MIDI numbers
 Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora / RHEL / openSUSE (`.rpm`)**, **Arch Linux / CachyOS (`.pkg.tar.zst`)**, **Windows (`.zip`)**, and **Generic Linux (`.tar.gz`)** are available on the **[GitHub Releases](https://github.com/morganlowe/fun-key-synth/releases/latest)** page.
 
 - **Download & full release notes:** [github.com/morganlowe/fun-key-synth/releases](https://github.com/morganlowe/fun-key-synth/releases/latest)
-- **Debian / Ubuntu:** `sudo apt install ./fun-key-synth_1.3.3_amd64.deb`
-- **Fedora / RHEL / openSUSE:** `sudo dnf install ./fun-key-synth-1.3.3-1.x86_64.rpm` (or `sudo zypper install ./fun-key-synth-1.3.3-1.x86_64.rpm`)
-- **Arch / CachyOS:** `sudo pacman -U fun-key-synth-1.3.3-1-x86_64.pkg.tar.zst`
-- **Windows:** Unzip `fun-key-synth-v1.3.3-windows-x86_64.zip` and run `fun-key-synth.exe`
-- **Generic Linux:** Extract `fun-key-synth-v1.3.3-linux-x86_64.tar.gz` and run `./fun-key-synth`
+- **Debian / Ubuntu:** `sudo apt install ./fun-key-synth_1.4.0_amd64.deb`
+- **Fedora / RHEL / openSUSE:** `sudo dnf install ./fun-key-synth-1.4.0-1.x86_64.rpm` (or `sudo zypper install ./fun-key-synth-1.4.0-1.x86_64.rpm`)
+- **Arch / CachyOS:** `sudo pacman -U fun-key-synth-1.4.0-1-x86_64.pkg.tar.zst`
+- **Windows:** Unzip `fun-key-synth-v1.4.0-windows-x86_64.zip` and run `fun-key-synth.exe`
+- **Generic Linux:** Extract `fun-key-synth-v1.4.0-linux-x86_64.tar.gz` and run `./fun-key-synth`
 
 <details>
 <summary><strong>Building from source (Rust / Cargo)</strong></summary>
@@ -59,7 +59,7 @@ cd fun-key-synth
 cargo run --release
 ```
 
-To run the audio engine unit tests (which render stereo buffers across all 7 vibes and Party Mode and verify zero NaNs or hard clipping):
+To run the audio engine unit tests (which render stereo buffers across all 23 vibes and Party Mode and verify zero NaNs or hard clipping):
 
 ```sh
 cargo test --release
@@ -94,7 +94,7 @@ Dive under the hood for full analog synthesis controls on every instrument (3-os
 ## What It Does
 
 <details open>
-<summary><strong>The 7 Curated Musical Vibes</strong></summary>
+<summary><strong>Curated Musical Vibes (23 Genres Including Eurobeat)</strong></summary>
 
 Each Vibe configures tempo, swing, musical scale, a curated 4-bar chord progression, voice presets across all 6 tracks, stereo panning, sidechain depth, and delay/reverb sweet spots:
 
@@ -235,8 +235,10 @@ Every audio sample is rendered in real time by the lock-minimal stereo engine in
 | Input | Action |
 | :--- | :--- |
 | **`Space`** | Play / Stop transport |
-| **`A S D F G H J K`** | Play 8 in-key **Auto-Chords** (or **Scale-Locked Lead** notes) |
-| **`[` / `]`** | Shift octave down / up in Lead mode |
+| **`A S D F G H J K`** | Play 8 in-key **Auto-Chords**, **Scale-Locked Lead** notes, or white keys in **Chromatic Keys** (`W E T Y U O P` black keys, `A`–`'`) |
+| **`Z` / `X`** or **`[` / `]`** | Shift keyboard octave down / up in Lead, Keys, or Sampler Chromatic mode |
+| **Track `R` / `● REC`** | Arm a specific instrument for Monologue-style **Step Recording** (stopped) or **Live Real-Time Recording** (playing) |
+| **`16 / 32 / 48 / 64` + `Copy->Rest`** | Choose pattern step length by 16s and duplicate the active 16-step bar across remaining bars |
 | **Left-click drum / pad label** | Mute / Unmute individual drum voice (`KICK`..`CYM`) or sampler pad (`P1`..`P8`) |
 | **Right-click drum / pad label** | Open voice menu: Audition, Solo, 808/909 switch, inline tuning, quick bar fills |
 | **Double-click Studio Track name** | Jump directly to that instrument's full editor in **SOUND LAB** (or **SAMPLER**) |

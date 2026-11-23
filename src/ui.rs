@@ -5,13 +5,13 @@ use crate::{
     midi::{MidiManager, MidiMsg},
     model::{
         apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads,
-        generate_auto_beat, generate_extra_track_seq, generate_melodic_tracks, load_pattern,
-        load_project, note_name, root_name, save_pattern, save_project, voice_preset_names,
-        AutoChordPad, ChordType, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack,
-        FilterEnvTrigger, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
-        MonologueOscWave, MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project, SamplerMode,
-        SavedSample, Scale, SongSection, Tb303Wave, TrackFilterParams, TrackId, Vibe,
-        MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
+        detect_chord_from_notes, generate_auto_beat, generate_extra_track_seq,
+        generate_melodic_tracks, load_pattern, load_project, note_name, root_name, save_pattern,
+        save_project, voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel,
+        DrumVoiceId, EgTarget, ExtraTrack, FilterEnvTrigger, GlobalFilterMode, LfoMode, LfoTarget,
+        LfoWave, LoopMode, MonologueOscWave, MoogWave, Osc2ModMode, PartyMixMode, PartyPace,
+        Project, SamplerMode, SavedSample, Scale, SongSection, StepCount, Tb303Wave,
+        TrackFilterParams, TrackId, Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
         restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
@@ -37,6 +37,19 @@ enum TestRepeatMode {
     Drone,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardMode {
+    Chromatic,
+    Scale,
+    Chords,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordTarget {
+    Core(TrackId),
+    Extra(usize),
+}
+
 pub struct FunKeySynthApp {
     engine: AudioEngine,
     tab: StudioTab,
@@ -46,9 +59,22 @@ pub struct FunKeySynthApp {
     bar_page: usize,
     follow_playhead: bool,
     octave_offset: i8,
-    record_live: bool,
-    held_pad_idx: Option<usize>,
+    keyboard_mode: KeyboardMode,
+    armed_record: Option<RecordTarget>,
+    rec_replace: bool,
+    rec_take_cleared: bool,
+    step_rec_cursor: usize,
+    step_rec_last_step: Option<usize>,
+    step_rec_accent: bool,
+    step_rec_slide: bool,
+    step_rec_chord_buf: Vec<u8>,
+    step_rec_chord_start_t: f64,
+    held_keys: Vec<(Key, HeldNote)>,
+    held_midi: Vec<HeldNote>,
+    held_mouse: Option<HeldNote>,
+    held_chord_key: Option<Key>,
     held_mouse_pad: Option<usize>,
+    rec_held_notes: Vec<(RecordTarget, u8, usize, f64)>,
     stutter_held: bool,
     scope_buf: Vec<f32>,
     roll_counter: u32,
@@ -112,9 +138,22 @@ impl FunKeySynthApp {
             bar_page: 0,
             follow_playhead: true,
             octave_offset: 0,
-            record_live: false,
-            held_pad_idx: None,
+            keyboard_mode: KeyboardMode::Chromatic,
+            armed_record: None,
+            rec_replace: true,
+            rec_take_cleared: false,
+            step_rec_cursor: 0,
+            step_rec_last_step: None,
+            step_rec_accent: false,
+            step_rec_slide: false,
+            step_rec_chord_buf: Vec::new(),
+            step_rec_chord_start_t: 0.0,
+            held_keys: Vec::new(),
+            held_midi: Vec::new(),
+            held_mouse: None,
+            held_chord_key: None,
             held_mouse_pad: None,
+            rec_held_notes: Vec::new(),
             stutter_held: false,
             scope_buf: Vec::with_capacity(256),
             roll_counter: 1,
@@ -290,8 +329,723 @@ impl FunKeySynthApp {
         0x51A7_1337u32.wrapping_mul(self.roll_counter).wrapping_add(0x9E37_79B9)
     }
 
+    fn active_target(&self, p: &Project) -> RecordTarget {
+        if let Some(ei) = self.selected_extra.filter(|&i| i < p.extra_tracks.len()) {
+            RecordTarget::Extra(ei)
+        } else {
+            RecordTarget::Core(self.selected_track)
+        }
+    }
+
+    fn effective_play_target(&self, p: &Project) -> RecordTarget {
+        if self.tab == StudioTab::Sampler {
+            RecordTarget::Core(TrackId::Sampler)
+        } else {
+            self.active_target(p)
+        }
+    }
+
+    fn target_step_count(&self, p: &Project, target: RecordTarget) -> StepCount {
+        let pat = p.current_pattern();
+        match target {
+            RecordTarget::Core(TrackId::Drums) => pat.drums.step_count,
+            RecordTarget::Core(TrackId::Sampler) => pat
+                .sample_lanes
+                .first()
+                .map(|l| l.step_count)
+                .unwrap_or(pat.sampler.step_count),
+            RecordTarget::Core(tr) => pat
+                .melodic(tr)
+                .map(|s| s.step_count)
+                .unwrap_or(StepCount::Steps16),
+            RecordTarget::Extra(ei) => pat
+                .extra_seqs
+                .get(ei)
+                .map(|s| s.step_count)
+                .unwrap_or(StepCount::Steps64),
+        }
+    }
+
+    fn set_target_step_count(&self, p: &mut Project, target: RecordTarget, sc: StepCount) {
+        let pat = p.current_pattern_mut();
+        match target {
+            RecordTarget::Core(TrackId::Drums) => pat.drums.set_all_step_counts(sc, false),
+            RecordTarget::Core(TrackId::Sampler) => pat.set_sampler_step_counts(sc),
+            RecordTarget::Core(tr) => {
+                if let Some(seq) = pat.melodic_mut(tr) {
+                    seq.step_count = sc;
+                }
+            }
+            RecordTarget::Extra(ei) => {
+                if let Some(seq) = pat.extra_seqs.get_mut(ei) {
+                    seq.step_count = sc;
+                }
+            }
+        }
+    }
+
+    fn clear_target_pattern(&self, p: &mut Project, target: RecordTarget) {
+        let pat = p.current_pattern_mut();
+        match target {
+            RecordTarget::Core(TrackId::Drums) => pat.drums.clear(),
+            RecordTarget::Core(TrackId::Sampler) => {
+                pat.sampler.clear();
+                for l in &mut pat.sample_lanes {
+                    l.clear();
+                }
+            }
+            RecordTarget::Core(tr) => {
+                if let Some(seq) = pat.melodic_mut(tr) {
+                    seq.clear();
+                }
+            }
+            RecordTarget::Extra(ei) => {
+                if let Some(seq) = pat.extra_seqs.get_mut(ei) {
+                    seq.clear();
+                }
+            }
+        }
+    }
+
+    fn target_name(p: &Project, target: RecordTarget) -> String {
+        match target {
+            RecordTarget::Core(tr) => tr.role_name().to_string(),
+            RecordTarget::Extra(ei) => p
+                .extra_tracks
+                .get(ei)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("Extra #{}", ei + 7)),
+        }
+    }
+
+    fn target_color(p: &Project, target: RecordTarget) -> Color32 {
+        match target {
+            RecordTarget::Core(tr) => track_color(tr),
+            RecordTarget::Extra(ei) => p
+                .extra_tracks
+                .get(ei)
+                .map(|t| Color32::from_rgb(t.color[0], t.color[1], t.color[2]))
+                .unwrap_or(Color32::WHITE),
+        }
+    }
+
+    fn unmute_target(&self, p: &mut Project, target: RecordTarget) {
+        match target {
+            RecordTarget::Core(tr) => {
+                let (_, mute, _) = track_mixer_mut(p, tr);
+                *mute = false;
+            }
+            RecordTarget::Extra(ei) => {
+                if let Some(tr) = p.extra_tracks.get_mut(ei) {
+                    tr.mute = false;
+                }
+            }
+        }
+    }
+
+    fn target_is_poly_step_rec(&self, p: &Project, target: RecordTarget) -> bool {
+        match target {
+            RecordTarget::Core(TrackId::Drums) => true,
+            RecordTarget::Core(TrackId::MoogPad) => true,
+            RecordTarget::Extra(_) => true,
+            RecordTarget::Core(TrackId::Moog) => p.moog.poly_mode,
+            RecordTarget::Core(TrackId::Sampler) => self.keyboard_mode == KeyboardMode::Scale,
+            _ => false,
+        }
+    }
+
+    fn chromatic_base_midi(&self) -> u8 {
+        (48 + self.octave_offset as i32 * 12).clamp(24, 72) as u8
+    }
+
+    fn advance_step_rec_cursor(&mut self, len: usize) {
+        let len = len.max(1);
+        self.step_rec_cursor = (self.step_rec_cursor + 1) % len;
+        self.selected_step = self.step_rec_cursor;
+        self.bar_page = self.step_rec_cursor / 16;
+    }
+
+    fn toggle_arm_record(&mut self, ctx: &egui::Context, p: &mut Project, target: RecordTarget) {
+        if self.armed_record == Some(target) {
+            self.armed_record = None;
+            self.step_rec_chord_buf.clear();
+            let name = Self::target_name(p, target);
+            self.set_toast(
+                ctx,
+                format!(
+                    "Saved {name} pattern to Bank {}",
+                    (b'A' + p.active_pattern as u8) as char
+                ),
+            );
+            return;
+        }
+        match target {
+            RecordTarget::Core(tr) => {
+                self.selected_track = tr;
+                self.selected_extra = None;
+            }
+            RecordTarget::Extra(ei) => {
+                self.selected_extra = Some(ei);
+            }
+        }
+        self.armed_record = Some(target);
+        self.rec_take_cleared = false;
+        self.step_rec_last_step = None;
+        self.step_rec_chord_buf.clear();
+        self.unmute_target(p, target);
+        if target == RecordTarget::Core(TrackId::Drums) {
+            p.auto_beat_mode = false;
+        }
+        p.party_mode = false;
+        if target != RecordTarget::Core(TrackId::MoogPad)
+            && self.keyboard_mode == KeyboardMode::Chords
+        {
+            self.keyboard_mode = KeyboardMode::Chromatic;
+            p.auto_chord_mode = false;
+        }
+        let sc = self.target_step_count(p, target);
+        let len = sc.as_usize();
+        self.bar_page = self.bar_page.min(sc.pages().saturating_sub(1));
+        self.step_rec_cursor = (self.bar_page * 16).min(len.saturating_sub(1));
+        self.selected_step = self.step_rec_cursor;
+        let name = Self::target_name(p, target);
+        self.set_toast(
+            ctx,
+            format!(
+                "Armed {name} REC ({}) — play to record!",
+                if self.rec_replace { "Replace" } else { "Overdub" }
+            ),
+        );
+    }
+
+    fn has_held_for_target(&self, target: RecordTarget) -> bool {
+        let matches = |h: HeldNote| match (h, target) {
+            (HeldNote::Melodic(t, _), tgt) => t == tgt,
+            (HeldNote::Drum(_), RecordTarget::Core(TrackId::Drums)) => true,
+            (HeldNote::SamplerPad(_), RecordTarget::Core(TrackId::Sampler)) => true,
+            (HeldNote::SamplerPitched(_, _), RecordTarget::Core(TrackId::Sampler)) => true,
+            _ => false,
+        };
+        self.held_keys.iter().any(|&(_, h)| matches(h))
+            || self.held_midi.iter().any(|&h| matches(h))
+            || self.held_mouse.map(matches).unwrap_or(false)
+    }
+
+    fn step_rec_rest(&mut self, p: &mut Project) {
+        let Some(target) = self.armed_record else {
+            return;
+        };
+        self.maybe_clear_for_replace(p, target);
+        let len = self.target_step_count(p, target).as_usize();
+        let cur = self.step_rec_cursor % len;
+        let pat = p.current_pattern_mut();
+        match target {
+            RecordTarget::Core(TrackId::Drums) => {
+                for l in &mut pat.drums.lanes {
+                    l.steps[cur].active = false;
+                }
+            }
+            RecordTarget::Core(TrackId::Sampler) => {
+                pat.sampler.steps[cur].active = false;
+                for l in &mut pat.sample_lanes {
+                    l.steps[cur].active = false;
+                }
+            }
+            RecordTarget::Core(tr) => {
+                if let Some(seq) = pat.melodic_mut(tr) {
+                    seq.steps[cur].active = false;
+                    seq.steps[cur].accent = false;
+                    seq.steps[cur].slide = false;
+                }
+            }
+            RecordTarget::Extra(ei) => {
+                if let Some(seq) = pat.extra_seqs.get_mut(ei) {
+                    seq.steps[cur].active = false;
+                    seq.steps[cur].accent = false;
+                    seq.steps[cur].slide = false;
+                }
+            }
+        }
+        self.step_rec_chord_buf.clear();
+        self.step_rec_last_step = None;
+        self.advance_step_rec_cursor(len);
+    }
+
+    fn step_rec_tie(&mut self, p: &mut Project) {
+        let Some(target) = self.armed_record else {
+            return;
+        };
+        let len = self.target_step_count(p, target).as_usize();
+        let cur = self.step_rec_cursor % len;
+        let prev = self.step_rec_last_step.unwrap_or((cur + len - 1) % len);
+        let pat = p.current_pattern_mut();
+        let seq_opt = match target {
+            RecordTarget::Core(tr) if tr != TrackId::Drums => pat.melodic_mut(tr),
+            RecordTarget::Extra(ei) => pat.extra_seqs.get_mut(ei),
+            _ => None,
+        };
+        if let Some(seq) = seq_opt {
+            if seq.steps[prev].active {
+                seq.steps[prev].gate = (seq.steps[prev].gate + 1.0).clamp(0.25, 16.0);
+                seq.steps[cur].active = false;
+            }
+        }
+        self.step_rec_chord_buf.clear();
+        self.advance_step_rec_cursor(len);
+    }
+
+    fn step_rec_back(&mut self, p: &Project) {
+        let target = self.armed_record.unwrap_or_else(|| self.effective_play_target(p));
+        let len = self.target_step_count(p, target).as_usize().max(1);
+        self.step_rec_chord_buf.clear();
+        self.step_rec_cursor = (self.step_rec_cursor + len - 1) % len;
+        self.selected_step = self.step_rec_cursor;
+        self.bar_page = self.step_rec_cursor / 16;
+    }
+
+    fn step_rec_forward(&mut self, p: &Project) {
+        let target = self.armed_record.unwrap_or_else(|| self.effective_play_target(p));
+        let len = self.target_step_count(p, target).as_usize().max(1);
+        self.step_rec_chord_buf.clear();
+        self.advance_step_rec_cursor(len);
+    }
+
+    fn maybe_clear_for_replace(&mut self, p: &mut Project, target: RecordTarget) {
+        if self.rec_replace && !self.rec_take_cleared {
+            self.clear_target_pattern(p, target);
+            self.rec_take_cleared = true;
+        }
+    }
+
+    fn play_and_record_note_down(
+        &mut self,
+        ctx: &egui::Context,
+        p: &mut Project,
+        target: RecordTarget,
+        note: u8,
+        velocity: f32,
+        playing: bool,
+        cur_step: usize,
+    ) -> HeldNote {
+        let note = note.clamp(12, 108);
+        self.unmute_target(p, target);
+
+        if target == RecordTarget::Core(TrackId::Drums) {
+            let lane = if (36..44).contains(&note) {
+                (note - 36) as usize
+            } else {
+                (note as usize) % 8
+            };
+            return self.trigger_drum_pad_down(ctx, p, lane, velocity, playing, cur_step);
+        }
+
+        let now = ctx.input(|i| i.time);
+        let shift_acc = ctx.input(|i| i.modifiers.shift);
+        let held_kind = match target {
+            RecordTarget::Core(TrackId::Sampler) => {
+                let part = self.volca_ui.selected_part.min(7);
+                let pitch_offset = (note as i32 - 60).clamp(-24, 24) as i8;
+                self.engine.send_live(LiveEvent::TriggerSamplePartPitched {
+                    part,
+                    velocity,
+                    pitch_offset,
+                });
+                HeldNote::SamplerPitched(part, note)
+            }
+            RecordTarget::Core(tr) => {
+                self.engine.send_live(LiveEvent::PlayNote {
+                    track: tr,
+                    note,
+                    velocity,
+                });
+                HeldNote::Melodic(target, note)
+            }
+            RecordTarget::Extra(ei) => {
+                self.engine.send_live(LiveEvent::PlayExtraNote {
+                    idx: ei,
+                    note,
+                    velocity,
+                });
+                HeldNote::Melodic(target, note)
+            }
+        };
+
+        if self.armed_record != Some(target) {
+            return held_kind;
+        }
+
+        self.maybe_clear_for_replace(p, target);
+        let len = self.target_step_count(p, target).as_usize();
+
+        if let HeldNote::SamplerPitched(part, _) = held_kind {
+            let pitch_offset = (note as i32 - 60).clamp(-24, 24) as i8;
+            if playing {
+                let phase = self.engine.step_phase();
+                let q_global = if phase >= 0.65 { cur_step + 1 } else { cur_step };
+                let s_idx = q_global % len;
+                let st = &mut p.current_pattern_mut().sample_lanes[part].steps[s_idx];
+                st.active = true;
+                st.velocity = velocity;
+                st.pitch_offset = pitch_offset;
+                st.accent = shift_acc || self.step_rec_accent;
+                if q_global > cur_step {
+                    self.engine.send_live(LiveEvent::SuppressTrackStep {
+                        track: Some(TrackId::Sampler),
+                        extra_idx: None,
+                        lane: Some(part),
+                        global_step: q_global,
+                    });
+                }
+            } else {
+                let cur = self.step_rec_cursor % len;
+                let st = &mut p.current_pattern_mut().sample_lanes[part].steps[cur];
+                st.active = true;
+                st.velocity = velocity;
+                st.pitch_offset = pitch_offset;
+                st.accent = shift_acc || self.step_rec_accent;
+                self.step_rec_last_step = Some(cur);
+                self.advance_step_rec_cursor(len);
+            }
+            return held_kind;
+        }
+
+        if playing {
+            let phase = self.engine.step_phase();
+            let q_global = if phase >= 0.65 { cur_step + 1 } else { cur_step };
+            let s_idx = q_global % len;
+            let legato = !self.target_is_poly_step_rec(p, target) && self.has_held_for_target(target);
+            let is_poly = self.target_is_poly_step_rec(p, target);
+            let mut chord_notes = Vec::new();
+            if is_poly {
+                for &(rt, n, si, _) in &self.rec_held_notes {
+                    if rt == target && si == s_idx {
+                        chord_notes.push(n);
+                    }
+                }
+                chord_notes.push(note);
+            }
+            let (write_note, write_chord) = if is_poly && chord_notes.len() > 1 {
+                detect_chord_from_notes(&chord_notes)
+            } else {
+                (note, ChordType::Single)
+            };
+
+            let pat = p.current_pattern_mut();
+            let seq_opt = match target {
+                RecordTarget::Core(tr) => pat.melodic_mut(tr),
+                RecordTarget::Extra(ei) => pat.extra_seqs.get_mut(ei),
+            };
+            if let Some(seq) = seq_opt {
+                let st = &mut seq.steps[s_idx];
+                st.active = true;
+                st.note = write_note;
+                st.chord = write_chord;
+                st.velocity = velocity;
+                st.gate = 1.0;
+                st.accent = shift_acc || self.step_rec_accent;
+                st.slide = legato || self.step_rec_slide;
+            }
+            self.selected_step = s_idx;
+            self.rec_held_notes.push((target, note, s_idx, now));
+            if q_global > cur_step {
+                let (tr_opt, ex_opt) = match target {
+                    RecordTarget::Core(tr) => (Some(tr), None),
+                    RecordTarget::Extra(ei) => (None, Some(ei)),
+                };
+                self.engine.send_live(LiveEvent::SuppressTrackStep {
+                    track: tr_opt,
+                    extra_idx: ex_opt,
+                    lane: None,
+                    global_step: q_global,
+                });
+            }
+        } else {
+            let is_poly = self.target_is_poly_step_rec(p, target);
+            if is_poly {
+                if !self.has_held_for_target(target)
+                    && !self.step_rec_chord_buf.is_empty()
+                    && (now - self.step_rec_chord_start_t) > 0.16
+                {
+                    self.step_rec_chord_buf.clear();
+                    self.advance_step_rec_cursor(len);
+                }
+                if self.step_rec_chord_buf.is_empty() {
+                    self.step_rec_chord_start_t = now;
+                }
+                if !self.step_rec_chord_buf.contains(&note) {
+                    self.step_rec_chord_buf.push(note);
+                }
+                let (write_note, write_chord) = detect_chord_from_notes(&self.step_rec_chord_buf);
+                let cur = self.step_rec_cursor % len;
+                let pat = p.current_pattern_mut();
+                let seq_opt = match target {
+                    RecordTarget::Core(tr) => pat.melodic_mut(tr),
+                    RecordTarget::Extra(ei) => pat.extra_seqs.get_mut(ei),
+                };
+                if let Some(seq) = seq_opt {
+                    let st = &mut seq.steps[cur];
+                    st.active = true;
+                    st.note = write_note;
+                    st.chord = write_chord;
+                    st.velocity = velocity;
+                    st.gate = if target == RecordTarget::Core(TrackId::MoogPad) {
+                        4.0
+                    } else {
+                        1.5
+                    };
+                    st.accent = shift_acc || self.step_rec_accent;
+                    st.slide = false;
+                }
+                self.selected_step = cur;
+            } else {
+                let cur = self.step_rec_cursor % len;
+                let legato = self.has_held_for_target(target);
+                let pat = p.current_pattern_mut();
+                let seq_opt = match target {
+                    RecordTarget::Core(tr) => pat.melodic_mut(tr),
+                    RecordTarget::Extra(ei) => pat.extra_seqs.get_mut(ei),
+                };
+                if let Some(seq) = seq_opt {
+                    let st = &mut seq.steps[cur];
+                    st.active = true;
+                    st.note = note;
+                    st.chord = ChordType::Single;
+                    st.velocity = velocity;
+                    st.gate = 0.85;
+                    st.accent = shift_acc || self.step_rec_accent;
+                    st.slide = legato || self.step_rec_slide;
+                }
+                self.step_rec_last_step = Some(cur);
+                self.advance_step_rec_cursor(len);
+            }
+        }
+        held_kind
+    }
+
+    fn trigger_drum_pad_down(
+        &mut self,
+        ctx: &egui::Context,
+        p: &mut Project,
+        lane: usize,
+        velocity: f32,
+        playing: bool,
+        cur_step: usize,
+    ) -> HeldNote {
+        let lane = lane % 8;
+        self.unmute_target(p, RecordTarget::Core(TrackId::Drums));
+        p.drums.voices[lane].mute = false;
+        self.engine.send_live(LiveEvent::PlayNote {
+            track: TrackId::Drums,
+            note: lane as u8,
+            velocity,
+        });
+        let target = RecordTarget::Core(TrackId::Drums);
+        if self.armed_record == Some(target) {
+            p.auto_beat_mode = false;
+            self.maybe_clear_for_replace(p, target);
+            let now = ctx.input(|i| i.time);
+            let shift_acc = ctx.input(|i| i.modifiers.shift);
+            let len = self.target_step_count(p, target).as_usize();
+            if playing {
+                let phase = self.engine.step_phase();
+                let q_global = if phase >= 0.65 { cur_step + 1 } else { cur_step };
+                let s_idx = q_global % len;
+                let st = &mut p.current_pattern_mut().drums.lanes[lane].steps[s_idx];
+                st.active = true;
+                st.velocity = velocity;
+                st.accent = shift_acc || self.step_rec_accent;
+                if q_global > cur_step {
+                    self.engine.send_live(LiveEvent::SuppressTrackStep {
+                        track: Some(TrackId::Drums),
+                        extra_idx: None,
+                        lane: Some(lane),
+                        global_step: q_global,
+                    });
+                }
+            } else {
+                if !self.has_held_for_target(target)
+                    && !self.step_rec_chord_buf.is_empty()
+                    && (now - self.step_rec_chord_start_t) > 0.16
+                {
+                    self.step_rec_chord_buf.clear();
+                    self.advance_step_rec_cursor(len);
+                }
+                if self.step_rec_chord_buf.is_empty() {
+                    self.step_rec_chord_start_t = now;
+                }
+                if !self.step_rec_chord_buf.contains(&(lane as u8)) {
+                    self.step_rec_chord_buf.push(lane as u8);
+                }
+                let cur = self.step_rec_cursor % len;
+                let st = &mut p.current_pattern_mut().drums.lanes[lane].steps[cur];
+                st.active = true;
+                st.velocity = velocity;
+                st.accent = shift_acc || self.step_rec_accent;
+                self.selected_step = cur;
+            }
+        }
+        HeldNote::Drum(lane)
+    }
+
+    fn trigger_sampler_pad_down(
+        &mut self,
+        ctx: &egui::Context,
+        p: &mut Project,
+        part: usize,
+        velocity: f32,
+        playing: bool,
+        cur_step: usize,
+    ) -> HeldNote {
+        let part = part % 8;
+        self.volca_ui.selected_part = part;
+        self.unmute_target(p, RecordTarget::Core(TrackId::Sampler));
+        p.sample_parts[part].mute = false;
+        self.engine
+            .send_live(LiveEvent::TriggerSamplePart { part, velocity });
+        let target = RecordTarget::Core(TrackId::Sampler);
+        if self.armed_record == Some(target) {
+            self.maybe_clear_for_replace(p, target);
+            let now = ctx.input(|i| i.time);
+            let shift_acc = ctx.input(|i| i.modifiers.shift);
+            let len = self.target_step_count(p, target).as_usize();
+            if playing {
+                let phase = self.engine.step_phase();
+                let q_global = if phase >= 0.65 { cur_step + 1 } else { cur_step };
+                let s_idx = q_global % len;
+                let st = &mut p.current_pattern_mut().sample_lanes[part].steps[s_idx];
+                st.active = true;
+                st.velocity = velocity;
+                st.accent = shift_acc || self.step_rec_accent;
+                if q_global > cur_step {
+                    self.engine.send_live(LiveEvent::SuppressTrackStep {
+                        track: Some(TrackId::Sampler),
+                        extra_idx: None,
+                        lane: Some(part),
+                        global_step: q_global,
+                    });
+                }
+            } else {
+                if !self.has_held_for_target(target)
+                    && !self.step_rec_chord_buf.is_empty()
+                    && (now - self.step_rec_chord_start_t) > 0.16
+                {
+                    self.step_rec_chord_buf.clear();
+                    self.advance_step_rec_cursor(len);
+                }
+                if self.step_rec_chord_buf.is_empty() {
+                    self.step_rec_chord_start_t = now;
+                }
+                if !self.step_rec_chord_buf.contains(&(part as u8)) {
+                    self.step_rec_chord_buf.push(part as u8);
+                }
+                let cur = self.step_rec_cursor % len;
+                let st = &mut p.current_pattern_mut().sample_lanes[part].steps[cur];
+                st.active = true;
+                st.velocity = velocity;
+                st.accent = shift_acc || self.step_rec_accent;
+                self.selected_step = cur;
+            }
+        }
+        HeldNote::SamplerPad(part)
+    }
+
+    fn release_held_note(
+        &mut self,
+        ctx: &egui::Context,
+        p: &mut Project,
+        held: HeldNote,
+        playing: bool,
+    ) {
+        let now = ctx.input(|i| i.time);
+        match held {
+            HeldNote::AutoChord => {
+                self.engine.send_live(LiveEvent::ReleaseChord);
+            }
+            HeldNote::Drum(_) => {
+                let target = RecordTarget::Core(TrackId::Drums);
+                if !playing
+                    && self.armed_record == Some(target)
+                    && !self.has_held_for_target(target)
+                    && !self.step_rec_chord_buf.is_empty()
+                {
+                    let len = self.target_step_count(p, target).as_usize();
+                    self.step_rec_last_step = Some(self.step_rec_cursor % len);
+                    self.step_rec_chord_buf.clear();
+                    self.advance_step_rec_cursor(len);
+                }
+            }
+            HeldNote::SamplerPad(part) => {
+                if p.sample_parts.get(part).map(|s| s.loop_mode) != Some(LoopMode::OneShot) {
+                    self.engine.send_live(LiveEvent::ReleaseSamplePart { part });
+                }
+                let target = RecordTarget::Core(TrackId::Sampler);
+                if !playing
+                    && self.armed_record == Some(target)
+                    && !self.has_held_for_target(target)
+                    && !self.step_rec_chord_buf.is_empty()
+                {
+                    let len = self.target_step_count(p, target).as_usize();
+                    self.step_rec_last_step = Some(self.step_rec_cursor % len);
+                    self.step_rec_chord_buf.clear();
+                    self.advance_step_rec_cursor(len);
+                }
+            }
+            HeldNote::SamplerPitched(part, _) => {
+                if p.sample_parts.get(part).map(|s| s.loop_mode) != Some(LoopMode::OneShot) {
+                    self.engine.send_live(LiveEvent::ReleaseSamplePart { part });
+                }
+            }
+            HeldNote::Melodic(target, note) => {
+                match target {
+                    RecordTarget::Core(tr) => {
+                        self.engine.send_live(LiveEvent::ReleaseNote { track: tr, note });
+                    }
+                    RecordTarget::Extra(ei) => {
+                        self.engine
+                            .send_live(LiveEvent::ReleaseExtraNote { idx: ei, note });
+                    }
+                }
+                if playing && self.armed_record == Some(target) {
+                    if let Some(pos) = self
+                        .rec_held_notes
+                        .iter()
+                        .position(|&(rt, n, _, _)| rt == target && n == note)
+                    {
+                        let (_, _, s_idx, press_t) = self.rec_held_notes.remove(pos);
+                        let step_secs = 60.0 / p.bpm.clamp(40.0, 240.0) as f64 / 4.0;
+                        let held_steps = (((now - press_t).max(0.0) / step_secs * 4.0).round() / 4.0)
+                            .clamp(0.35, 16.0) as f32;
+                        let pat = p.current_pattern_mut();
+                        let seq_opt = match target {
+                            RecordTarget::Core(tr) => pat.melodic_mut(tr),
+                            RecordTarget::Extra(ei) => pat.extra_seqs.get_mut(ei),
+                        };
+                        if let Some(seq) = seq_opt {
+                            if let Some(st) = seq.steps.get_mut(s_idx) {
+                                if st.active {
+                                    st.gate = held_steps;
+                                }
+                            }
+                        }
+                    }
+                } else if !playing
+                    && self.armed_record == Some(target)
+                    && self.target_is_poly_step_rec(p, target)
+                    && !self.has_held_for_target(target)
+                    && !self.step_rec_chord_buf.is_empty()
+                {
+                    let len = self.target_step_count(p, target).as_usize();
+                    self.step_rec_last_step = Some(self.step_rec_cursor % len);
+                    self.step_rec_chord_buf.clear();
+                    self.advance_step_rec_cursor(len);
+                }
+            }
+        }
+    }
+
     fn handle_midi(
         &mut self,
+        ctx: &egui::Context,
         p: &mut Project,
         pads: &[AutoChordPad],
         playing: bool,
@@ -301,59 +1055,48 @@ impl FunKeySynthApp {
         for msg in msgs {
             match msg {
                 MidiMsg::NoteOn { note, velocity } => {
-                    if self.tab == StudioTab::Sampler && (36..44).contains(&note) {
+                    let held = if self.tab == StudioTab::Sampler && (36..44).contains(&note) {
                         let part = (note - 36) as usize;
-                        self.volca_ui.selected_part = part;
-                        p.mixer.channels[TrackId::Sampler.index()].mute = false;
-                        self.engine.send_live(LiveEvent::TriggerSamplePart { part, velocity });
-                        if self.record_live && playing {
-                            let lane = &mut p.current_pattern_mut().sample_lanes[part];
-                            let s_idx = cur_step % lane.step_count.as_usize();
-                            lane.steps[s_idx].active = true;
-                            lane.steps[s_idx].velocity = velocity;
-                        }
-                    } else if p.auto_chord_mode {
+                        self.trigger_sampler_pad_down(ctx, p, part, velocity, playing, cur_step)
+                    } else if self.keyboard_mode == KeyboardMode::Chords {
                         let idx = (note as usize) % pads.len().max(1);
-                        self.trigger_pad_down(idx, p, pads, playing, cur_step);
+                        self.trigger_chord_pad_down(ctx, idx, p, pads, playing, cur_step);
+                        HeldNote::AutoChord
                     } else {
-                        let target = if self.selected_track == TrackId::Drums {
-                            TrackId::Monologue
-                        } else {
-                            self.selected_track
-                        };
-                        self.engine.send_live(LiveEvent::PlayNote {
-                            track: target,
-                            note,
-                            velocity,
-                        });
-                        if self.record_live && playing {
-                            if let Some(seq) = p.current_pattern_mut().melodic_mut(target) {
-                                let s_idx = cur_step % seq.step_count.as_usize();
-                                let st = &mut seq.steps[s_idx];
-                                st.active = true;
-                                st.note = note;
-                                st.velocity = velocity;
-                                st.gate = 1.5;
-                            }
-                        }
-                    }
+                        let target = self.effective_play_target(p);
+                        self.play_and_record_note_down(
+                            ctx, p, target, note, velocity, playing, cur_step,
+                        )
+                    };
+                    self.held_midi.push(held);
                 }
                 MidiMsg::NoteOff { note } => {
-                    if self.tab == StudioTab::Sampler && (36..44).contains(&note) {
+                    let held = if self.tab == StudioTab::Sampler && (36..44).contains(&note) {
                         let part = (note - 36) as usize;
-                        if p.sample_parts[part].loop_mode != LoopMode::OneShot {
-                            self.engine.send_live(LiveEvent::ReleaseSamplePart { part });
-                        }
-                    } else if p.auto_chord_mode {
-                        self.engine.send_live(LiveEvent::ReleaseChord);
+                        HeldNote::SamplerPad(part)
+                    } else if self.keyboard_mode == KeyboardMode::Chords {
+                        HeldNote::AutoChord
                     } else {
-                        let target = if self.selected_track == TrackId::Drums {
-                            TrackId::Monologue
-                        } else {
-                            self.selected_track
-                        };
-                        self.engine.send_live(LiveEvent::ReleaseNote { track: target, note });
+                        let target = self.effective_play_target(p);
+                        match target {
+                            RecordTarget::Core(TrackId::Drums) => {
+                                let lane = if (36..44).contains(&note) {
+                                    (note - 36) as usize
+                                } else {
+                                    (note as usize) % 8
+                                };
+                                HeldNote::Drum(lane)
+                            }
+                            RecordTarget::Core(TrackId::Sampler) => {
+                                HeldNote::SamplerPitched(self.volca_ui.selected_part.min(7), note)
+                            }
+                            _ => HeldNote::Melodic(target, note),
+                        }
+                    };
+                    if let Some(pos) = self.held_midi.iter().position(|&h| h == held) {
+                        self.held_midi.remove(pos);
                     }
+                    self.release_held_note(ctx, p, held, playing);
                 }
                 MidiMsg::Cc { cc, value } => match cc {
                     1 | 74 => {
@@ -411,12 +1154,28 @@ impl FunKeySynthApp {
             self.engine.playing.store(!playing, Ordering::Relaxed);
         }
 
-        // Octave shift for Scale Lead mode
-        if ctx.input(|i| i.key_pressed(Key::OpenBracket)) {
+        // Octave shift: Z / [ down, X / ] up
+        if ctx.input(|i| i.key_pressed(Key::Z) || i.key_pressed(Key::OpenBracket)) {
             self.octave_offset = (self.octave_offset - 1).clamp(-2, 2);
         }
-        if ctx.input(|i| i.key_pressed(Key::CloseBracket)) {
+        if ctx.input(|i| i.key_pressed(Key::X) || i.key_pressed(Key::CloseBracket)) {
             self.octave_offset = (self.octave_offset + 1).clamp(-2, 2);
+        }
+
+        // Monologue Step Record navigation & Rest/Tie keys when armed & stopped
+        if self.armed_record.is_some() && !playing {
+            if ctx.input(|i| i.key_pressed(Key::Tab) || i.key_pressed(Key::Period)) {
+                self.step_rec_rest(p);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Minus)) {
+                self.step_rec_tie(p);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Backspace) || i.key_pressed(Key::ArrowLeft)) {
+                self.step_rec_back(p);
+            }
+            if ctx.input(|i| i.key_pressed(Key::ArrowRight)) {
+                self.step_rec_forward(p);
+            }
         }
 
         const PAD_KEYS: [Key; 8] = [
@@ -430,14 +1189,69 @@ impl FunKeySynthApp {
             Key::K,
         ];
 
-        for (idx, &key) in PAD_KEYS.iter().enumerate() {
-            if ctx.input(|i| i.key_pressed(key)) {
-                self.trigger_pad_down(idx, p, pads, playing, cur_step);
-                self.held_pad_idx = Some(idx);
+        // Release any keys that were released this frame using their stored HeldNote
+        let mut released_indices = Vec::new();
+        for (idx, &(key, _)) in self.held_keys.iter().enumerate() {
+            if ctx.input(|i| i.key_released(key)) {
+                released_indices.push(idx);
             }
-            if ctx.input(|i| i.key_released(key)) && self.held_pad_idx == Some(idx) {
-                self.trigger_pad_up(idx, p);
-                self.held_pad_idx = None;
+        }
+        for idx in released_indices.into_iter().rev() {
+            let (_, held) = self.held_keys.remove(idx);
+            self.release_held_note(ctx, p, held, playing);
+        }
+        if let Some(ck) = self.held_chord_key {
+            if ctx.input(|i| i.key_released(ck)) {
+                self.held_chord_key = None;
+                self.release_held_note(ctx, p, HeldNote::AutoChord, playing);
+            }
+        }
+
+        let target = self.effective_play_target(p);
+        if self.keyboard_mode == KeyboardMode::Chords {
+            for (idx, &key) in PAD_KEYS.iter().enumerate() {
+                if ctx.input(|i| i.key_pressed(key)) {
+                    self.trigger_chord_pad_down(ctx, idx, p, pads, playing, cur_step);
+                    self.held_chord_key = Some(key);
+                }
+            }
+        } else if target == RecordTarget::Core(TrackId::Drums) {
+            for (idx, &key) in PAD_KEYS.iter().enumerate() {
+                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
+                    let held = self.trigger_drum_pad_down(ctx, p, idx, 0.90, playing, cur_step);
+                    self.held_keys.push((key, held));
+                }
+            }
+        } else if self.keyboard_mode == KeyboardMode::Scale
+            && target == RecordTarget::Core(TrackId::Sampler)
+        {
+            for (idx, &key) in PAD_KEYS.iter().enumerate() {
+                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
+                    let held = self.trigger_sampler_pad_down(ctx, p, idx, 0.90, playing, cur_step);
+                    self.held_keys.push((key, held));
+                }
+            }
+        } else if self.keyboard_mode == KeyboardMode::Scale {
+            for (idx, &key) in PAD_KEYS.iter().enumerate() {
+                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
+                    let note = self.scale_lead_note(p, idx);
+                    let held = self.play_and_record_note_down(
+                        ctx, p, target, note, 0.88, playing, cur_step,
+                    );
+                    self.held_keys.push((key, held));
+                }
+            }
+        } else {
+            // Monologue-style Chromatic 1.5-octave QWERTY Piano (A W S E D F T G Y H U J K O L P ; ')
+            let base = self.chromatic_base_midi();
+            for &(key, semi, _) in &CHROMATIC_KEY_MAP {
+                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
+                    let note = (base as i16 + semi as i16).clamp(12, 108) as u8;
+                    let held = self.play_and_record_note_down(
+                        ctx, p, target, note, 0.88, playing, cur_step,
+                    );
+                    self.held_keys.push((key, held));
+                }
             }
         }
     }
@@ -448,81 +1262,119 @@ impl FunKeySynthApp {
         notes.get(idx % notes.len().max(1)).copied().unwrap_or(60)
     }
 
-    fn trigger_pad_down(
+    fn trigger_chord_pad_down(
         &mut self,
+        ctx: &egui::Context,
         idx: usize,
         p: &mut Project,
         pads: &[AutoChordPad],
         playing: bool,
         cur_step: usize,
     ) {
-        if p.auto_chord_mode {
-            if let Some(pad) = pads.get(idx) {
-                self.engine.send_live(LiveEvent::PlayChord {
-                    notes: pad.chord_notes.clone(),
-                    bass: Some(pad.bass_midi),
-                    velocity: 0.86,
-                    slot: pad.slot,
-                });
-                if self.record_live && playing {
-                    let pat = p.current_pattern_mut();
-                    let s_idx = cur_step % pat.moog_pad.step_count.as_usize();
-                    let st = &mut pat.moog_pad.steps[s_idx];
-                    st.active = true;
-                    st.note = pad.chord_notes.first().copied().unwrap_or(60);
-                    st.chord = pad.slot.chord;
-                    st.velocity = 0.82;
-                    st.gate = 8.0;
-                    let b_idx = cur_step % pat.moog.step_count.as_usize();
-                    let bst = &mut pat.moog.steps[b_idx];
-                    bst.active = true;
-                    bst.note = pad.bass_midi;
-                    bst.velocity = 0.88;
-                    bst.gate = 4.0;
-                }
-            }
-        } else {
-            let note = self.scale_lead_note(p, idx);
-            let target = if self.selected_track == TrackId::Drums {
-                TrackId::Monologue
-            } else {
-                self.selected_track
-            };
-            self.engine.send_live(LiveEvent::PlayNote {
-                track: target,
-                note,
-                velocity: 0.88,
+        if let Some(pad) = pads.get(idx) {
+            self.engine.send_live(LiveEvent::PlayChord {
+                notes: pad.chord_notes.clone(),
+                bass: Some(pad.bass_midi),
+                velocity: 0.86,
+                slot: pad.slot,
             });
-            if self.record_live && playing {
-                let pat = p.current_pattern_mut();
-                if let Some(seq) = pat.melodic_mut(target) {
-                    let s_idx = cur_step % seq.step_count.as_usize();
-                    let st = &mut seq.steps[s_idx];
-                    st.active = true;
-                    st.note = note;
-                    st.velocity = 0.86;
-                    st.gate = 1.5;
-                }
-            }
-        }
-    }
+            if let Some(armed) = self.armed_record {
+                self.maybe_clear_for_replace(p, armed);
+                let shift_acc = ctx.input(|i| i.modifiers.shift);
+                let len = self.target_step_count(p, armed).as_usize();
+                let s_idx = if playing {
+                    let phase = self.engine.step_phase();
+                    let q_global = if phase >= 0.65 { cur_step + 1 } else { cur_step };
+                    if q_global > cur_step {
+                        let (tr_opt, ex_opt) = match armed {
+                            RecordTarget::Core(tr) => (Some(tr), None),
+                            RecordTarget::Extra(ei) => (None, Some(ei)),
+                        };
+                        self.engine.send_live(LiveEvent::SuppressTrackStep {
+                            track: tr_opt,
+                            extra_idx: ex_opt,
+                            lane: None,
+                            global_step: q_global,
+                        });
+                    }
+                    q_global % len
+                } else {
+                    self.step_rec_cursor % len
+                };
 
-    fn trigger_pad_up(&mut self, idx: usize, p: &Project) {
-        if p.auto_chord_mode {
-            self.engine.send_live(LiveEvent::ReleaseChord);
-        } else {
-            let note = self.scale_lead_note(p, idx);
-            let target = if self.selected_track == TrackId::Drums {
-                TrackId::Monologue
-            } else {
-                self.selected_track
-            };
-            self.engine.send_live(LiveEvent::ReleaseNote {
-                track: target,
-                note,
-            });
+                let pat = p.current_pattern_mut();
+                match armed {
+                    RecordTarget::Core(TrackId::Moog) => {
+                        let st = &mut pat.moog.steps[s_idx];
+                        st.active = true;
+                        st.note = pad.bass_midi;
+                        st.velocity = 0.88;
+                        st.gate = 4.0;
+                        st.accent = shift_acc || self.step_rec_accent;
+                    }
+                    RecordTarget::Core(tr) if tr != TrackId::Drums && tr != TrackId::Sampler => {
+                        if let Some(seq) = pat.melodic_mut(tr) {
+                            let st = &mut seq.steps[s_idx];
+                            st.active = true;
+                            st.note = pad.chord_notes.first().copied().unwrap_or(60);
+                            st.chord = pad.slot.chord;
+                            st.velocity = 0.84;
+                            st.gate = 8.0;
+                            st.accent = shift_acc || self.step_rec_accent;
+                        }
+                    }
+                    RecordTarget::Extra(ei) => {
+                        if let Some(seq) = pat.extra_seqs.get_mut(ei) {
+                            let st = &mut seq.steps[s_idx];
+                            st.active = true;
+                            st.note = pad.chord_notes.first().copied().unwrap_or(60);
+                            st.chord = pad.slot.chord;
+                            st.velocity = 0.84;
+                            st.gate = 8.0;
+                            st.accent = shift_acc || self.step_rec_accent;
+                        }
+                    }
+                    _ => {}
+                }
+                if !playing {
+                    self.step_rec_last_step = Some(s_idx);
+                    self.advance_step_rec_cursor(len);
+                } else {
+                    self.selected_step = s_idx;
+                }
+            }
         }
     }
+}
+
+const CHROMATIC_KEY_MAP: [(Key, i8, &str); 18] = [
+    (Key::A, 0, "A"),
+    (Key::W, 1, "W"),
+    (Key::S, 2, "S"),
+    (Key::E, 3, "E"),
+    (Key::D, 4, "D"),
+    (Key::F, 5, "F"),
+    (Key::T, 6, "T"),
+    (Key::G, 7, "G"),
+    (Key::Y, 8, "Y"),
+    (Key::H, 9, "H"),
+    (Key::U, 10, "U"),
+    (Key::J, 11, "J"),
+    (Key::K, 12, "K"),
+    (Key::O, 13, "O"),
+    (Key::L, 14, "L"),
+    (Key::P, 15, "P"),
+    (Key::Semicolon, 16, ";"),
+    (Key::Quote, 17, "'"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldNote {
+    Melodic(RecordTarget, u8),
+    Drum(usize),
+    SamplerPad(usize),
+    SamplerPitched(usize, u8),
+    AutoChord,
 }
 
 impl eframe::App for FunKeySynthApp {
@@ -742,6 +1594,12 @@ impl FunKeySynthApp {
                                             .unwrap_or(1);
                                     }
                                     *proj = loaded;
+                                    self.keyboard_mode = if proj.auto_chord_mode {
+                                        KeyboardMode::Chords
+                                    } else {
+                                        KeyboardMode::Chromatic
+                                    };
+                                    self.armed_record = None;
                                     self.set_toast(ctx, "Project loaded (all patterns, synths & samples)!");
                                 }
                                 Err(e) => self.set_toast(ctx, format!("Load error: {e}")),
@@ -819,11 +1677,13 @@ impl FunKeySynthApp {
         let theme = self.settings.theme;
 
         self.handle_keyboard(ctx, &mut proj, &pads, playing, cur_step);
-        self.handle_midi(&mut proj, &pads, playing, cur_step);
+        self.handle_midi(ctx, &mut proj, &pads, playing, cur_step);
         self.update_test_repeat(ctx, &proj, playing);
 
         if playing && self.follow_playhead {
-            self.bar_page = (cur_step / 16) % 4;
+            let active_target = self.effective_play_target(&proj);
+            let active_len = self.target_step_count(&proj, active_target).as_usize();
+            self.bar_page = (cur_step % active_len) / 16;
         }
 
         // ==================== TOP VIBE BAR ====================
@@ -956,13 +1816,19 @@ impl FunKeySynthApp {
                         Color32::from_rgb(255, 168, 52),
                         "Automatically plays groovy drums matched to your Vibe & Beat Energy",
                     );
-                    toggle_pill(
+                    if toggle_pill(
                         ui,
                         "AUTO-CHORD",
                         &mut proj.auto_chord_mode,
                         Color32::from_rgb(92, 198, 255),
                         "1-key lush voice-led chords on keys A-K",
-                    );
+                    ) {
+                        self.keyboard_mode = if proj.auto_chord_mode {
+                            KeyboardMode::Chords
+                        } else {
+                            KeyboardMode::Chromatic
+                        };
+                    }
                     if toggle_pill(
                         ui,
                         if proj.party_mode { "PARTY DJ ON" } else { "PARTY DJ" },
@@ -1027,7 +1893,7 @@ impl FunKeySynthApp {
                 });
             });
 
-        // ==================== BOTTOM DOCK: PLAYABLE AUTO-CHORD / SCALE PADS ====================
+        // ==================== BOTTOM DOCK: CHROMATIC KEYBOARD / DRUM PADS / CHORDS ====================
         egui::TopBottomPanel::bottom("playable_pads_dock")
             .frame(
                 egui::Frame::none()
@@ -1036,130 +1902,481 @@ impl FunKeySynthApp {
                     .stroke(Stroke::new(1.0_f32, theme.border())),
             )
             .show(ctx, |ui| {
+                let play_target = self.effective_play_target(&proj);
+                let is_armed_here = self.armed_record == Some(play_target);
+                let rec_col = Color32::from_rgb(228, 54, 70);
+                let tc = Self::target_color(&proj, play_target);
+
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.set_width(174.0);
-                        ui.set_max_width(174.0);
+                        ui.set_width(186.0);
+                        ui.set_max_width(186.0);
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(if proj.auto_chord_mode {
-                                    "AUTO-CHORD PADS"
-                                } else {
-                                    "SCALE-LOCKED KEYS"
-                                })
-                                .strong()
-                                .size(12.0)
-                                .color(accent),
-                            );
-                        });
-                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             if ui
-                                .selectable_label(proj.auto_chord_mode, "Chords")
+                                .selectable_label(self.keyboard_mode == KeyboardMode::Chromatic, "Keys")
+                                .on_hover_text("25-key chromatic Monologue keyboard (A W S E D F T G Y H U J K O L P ; ')")
                                 .clicked()
                             {
-                                proj.auto_chord_mode = true;
-                            }
-                            if ui
-                                .selectable_label(!proj.auto_chord_mode, "Lead")
-                                .clicked()
-                            {
+                                self.keyboard_mode = KeyboardMode::Chromatic;
                                 proj.auto_chord_mode = false;
                             }
-                            ui.checkbox(&mut self.record_live, "Rec")
-                                .on_hover_text("Record pads into pattern while playing");
+                            if ui
+                                .selectable_label(self.keyboard_mode == KeyboardMode::Scale, "Scale")
+                                .on_hover_text("8 scale-locked pads / 8 sample pads on keys A–K")
+                                .clicked()
+                            {
+                                self.keyboard_mode = KeyboardMode::Scale;
+                                proj.auto_chord_mode = false;
+                            }
+                            if ui
+                                .selectable_label(self.keyboard_mode == KeyboardMode::Chords, "Chords")
+                                .on_hover_text("8 Auto-Chord voice-led pads on keys A–K")
+                                .clicked()
+                            {
+                                self.keyboard_mode = KeyboardMode::Chords;
+                                proj.auto_chord_mode = true;
+                            }
                         });
                         ui.horizontal(|ui| {
-                            if proj.auto_chord_mode {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let rec_btn = egui::Button::new(
+                                RichText::new("● REC")
+                                    .strong()
+                                    .size(11.0)
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(if is_armed_here {
+                                rec_col
+                            } else {
+                                Color32::from_rgb(44, 34, 42)
+                            });
+                            if ui
+                                .add(rec_btn)
+                                .on_hover_text("Toggle Record Mode for the active instrument (step record when stopped, live when playing)")
+                                .clicked()
+                            {
+                                self.toggle_arm_record(ctx, &mut proj, play_target);
+                            }
+                            if ui
+                                .selectable_label(self.rec_replace, "Rep")
+                                .on_hover_text("Replace mode: clears track once on the first recorded note")
+                                .clicked()
+                            {
+                                self.rec_replace = true;
+                            }
+                            if ui
+                                .selectable_label(!self.rec_replace, "Ovd")
+                                .on_hover_text("Overdub mode: layer notes onto existing steps")
+                                .clicked()
+                            {
+                                self.rec_replace = false;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if self.keyboard_mode == KeyboardMode::Chords {
                                 ui.checkbox(&mut proj.auto_chord_follow, "Band Follow")
                                     .on_hover_text("Bass & Arp follow the chord pad you hold!");
+                            } else if play_target == RecordTarget::Core(TrackId::Drums) {
+                                ui.label(RichText::new("DRUM PADS (A–K)").strong().size(10.5).color(tc));
+                            } else if self.keyboard_mode == KeyboardMode::Scale
+                                && play_target == RecordTarget::Core(TrackId::Sampler)
+                            {
+                                ui.label(RichText::new("8-PAD VOLCA (A–K)").strong().size(10.5).color(tc));
                             } else {
-                                ui.label(RichText::new(format!("Octave {:+}", self.octave_offset)).size(11.0).weak());
-                                if ui.small_button("-").clicked() {
+                                let base = if self.keyboard_mode == KeyboardMode::Chromatic {
+                                    self.chromatic_base_midi()
+                                } else {
+                                    (60 + self.octave_offset as i32 * 12).clamp(36, 84) as u8
+                                };
+                                let span_lbl = if self.keyboard_mode == KeyboardMode::Chromatic {
+                                    format!("{}–{}", note_name(base), note_name((base + 24).min(108)))
+                                } else {
+                                    format!("Oct {:+}", self.octave_offset)
+                                };
+                                ui.label(RichText::new(span_lbl).size(11.0).color(tc));
+                                if ui.small_button("-").on_hover_text("Octave Down (Z or [)").clicked() {
                                     self.octave_offset = (self.octave_offset - 1).clamp(-2, 2);
                                 }
-                                if ui.small_button("+").clicked() {
+                                if ui.small_button("+").on_hover_text("Octave Up (X or ])").clicked() {
                                     self.octave_offset = (self.octave_offset + 1).clamp(-2, 2);
                                 }
                             }
                         });
                     });
 
-                    // 8 Large Playable Pads (Keys A S D F G H J K)
-                    let pads_total_w = (ui.available_width() - 188.0).max(240.0);
-                    let pad_w = ((pads_total_w - 7.0 * 6.0) / 8.0).clamp(32.0, 150.0);
-                    let pad_h = 56.0;
-                    ui.allocate_ui(Vec2::new(pads_total_w, pad_h), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            for (idx, pad) in pads.iter().enumerate() {
-                                let is_held =
-                                    self.held_pad_idx == Some(idx) || self.held_mouse_pad == Some(idx);
-                                let main_label = if proj.auto_chord_mode {
-                                    pad.chord_name.clone()
-                                } else {
-                                    note_name(self.scale_lead_note(&proj, idx))
-                                };
-                                let bg = if is_held {
-                                    accent
-                                } else {
-                                    Color32::from_rgb(26, 32, 46)
-                                };
-                                let fg = if is_held {
-                                    Color32::from_rgb(12, 15, 22)
-                                } else {
-                                    Color32::from_rgb(232, 238, 250)
-                                };
-                                let (rect, resp) =
-                                    ui.allocate_exact_size(Vec2::new(pad_w, pad_h), Sense::click_and_drag());
-                                if resp.is_pointer_button_down_on() && self.held_mouse_pad != Some(idx) {
-                                    self.trigger_pad_down(idx, &mut proj, &pads, playing, cur_step);
-                                    self.held_mouse_pad = Some(idx);
-                                } else if !resp.is_pointer_button_down_on() && self.held_mouse_pad == Some(idx)
-                                {
-                                    self.trigger_pad_up(idx, &proj);
-                                    self.held_mouse_pad = None;
-                                }
-                                let painter = ui.painter();
-                                painter.rect_filled(rect, Rounding::same(8.0), bg);
-                                painter.rect_stroke(
-                                    rect,
-                                    Rounding::same(8.0),
-                                    Stroke::new(
-                                        if is_held { 2.0_f32 } else { 1.0_f32 },
-                                        if is_held { Color32::WHITE } else { accent.gamma_multiply(0.45) },
-                                    ),
-                                );
-                                painter.text(
-                                    rect.left_top() + Vec2::new(7.0, 5.0),
-                                    egui::Align2::LEFT_TOP,
-                                    pad.key_label,
-                                    egui::FontId::proportional(10.5),
-                                    if is_held {
-                                        Color32::from_rgb(20, 24, 32)
+                    // Middle Playable Surface: 25-Key Chromatic Piano OR 8 Large Performance Pads
+                    let pads_total_w = (ui.available_width() - 184.0).max(240.0);
+                    let pad_h = 74.0;
+                    let show_8_pads = self.keyboard_mode == KeyboardMode::Chords
+                        || self.keyboard_mode == KeyboardMode::Scale
+                        || play_target == RecordTarget::Core(TrackId::Drums);
+
+                    if show_8_pads {
+                        let pad_w = ((pads_total_w - 7.0 * 6.0) / 8.0).clamp(32.0, 150.0);
+                        ui.allocate_ui(Vec2::new(pads_total_w, pad_h), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                for (idx, pad) in pads.iter().enumerate() {
+                                    let is_held = self.held_mouse_pad == Some(idx)
+                                        || (self.keyboard_mode == KeyboardMode::Chords
+                                            && self.held_chord_key.is_some()
+                                            && ctx.input(|i| {
+                                                i.key_down(
+                                                    [
+                                                        Key::A,
+                                                        Key::S,
+                                                        Key::D,
+                                                        Key::F,
+                                                        Key::G,
+                                                        Key::H,
+                                                        Key::J,
+                                                        Key::K,
+                                                    ][idx],
+                                                )
+                                            }))
+                                        || self.held_keys.iter().any(|&(_, h)| match h {
+                                            HeldNote::Drum(l) => l == idx,
+                                            HeldNote::SamplerPad(p_i) => p_i == idx,
+                                            HeldNote::Melodic(_, m) => {
+                                                self.keyboard_mode == KeyboardMode::Scale
+                                                    && m == self.scale_lead_note(&proj, idx)
+                                            }
+                                            _ => false,
+                                        });
+
+                                    let main_label = if self.keyboard_mode == KeyboardMode::Chords {
+                                        pad.chord_name.clone()
+                                    } else if play_target == RecordTarget::Core(TrackId::Drums) {
+                                        let voice = DrumVoiceId::from_index(idx).unwrap();
+                                        let vm = proj.drums.voices[idx].model;
+                                        voice.short_name_for_model(vm).to_string()
+                                    } else if play_target == RecordTarget::Core(TrackId::Sampler) {
+                                        format!("P{}: {}", idx + 1, proj.sample_parts[idx].name.chars().take(5).collect::<String>())
                                     } else {
-                                        Color32::from_rgb(130, 145, 175)
+                                        note_name(self.scale_lead_note(&proj, idx))
+                                    };
+                                    let pad_accent = if is_armed_here {
+                                        rec_col
+                                    } else if self.keyboard_mode == KeyboardMode::Chords {
+                                        accent
+                                    } else {
+                                        tc
+                                    };
+                                    let bg = if is_held {
+                                        pad_accent
+                                    } else {
+                                        Color32::from_rgb(26, 32, 46)
+                                    };
+                                    let fg = if is_held {
+                                        Color32::from_rgb(12, 15, 22)
+                                    } else {
+                                        Color32::from_rgb(232, 238, 250)
+                                    };
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        Vec2::new(pad_w, pad_h),
+                                        Sense::click_and_drag(),
+                                    );
+                                    if resp.is_pointer_button_down_on()
+                                        && self.held_mouse_pad != Some(idx)
+                                    {
+                                        if self.keyboard_mode == KeyboardMode::Chords {
+                                            self.trigger_chord_pad_down(
+                                                ctx, idx, &mut proj, &pads, playing, cur_step,
+                                            );
+                                            self.held_mouse = Some(HeldNote::AutoChord);
+                                        } else if play_target == RecordTarget::Core(TrackId::Drums) {
+                                            let held = self.trigger_drum_pad_down(
+                                                ctx, &mut proj, idx, 0.90, playing, cur_step,
+                                            );
+                                            self.held_mouse = Some(held);
+                                        } else if play_target == RecordTarget::Core(TrackId::Sampler) {
+                                            let held = self.trigger_sampler_pad_down(
+                                                ctx, &mut proj, idx, 0.90, playing, cur_step,
+                                            );
+                                            self.held_mouse = Some(held);
+                                        } else {
+                                            let note = self.scale_lead_note(&proj, idx);
+                                            let held = self.play_and_record_note_down(
+                                                ctx, &mut proj, play_target, note, 0.88, playing, cur_step,
+                                            );
+                                            self.held_mouse = Some(held);
+                                        }
+                                        self.held_mouse_pad = Some(idx);
+                                    } else if !resp.is_pointer_button_down_on()
+                                        && self.held_mouse_pad == Some(idx)
+                                    {
+                                        if let Some(held) = self.held_mouse.take() {
+                                            self.release_held_note(ctx, &mut proj, held, playing);
+                                        }
+                                        self.held_mouse_pad = None;
+                                    }
+                                    let painter = ui.painter();
+                                    painter.rect_filled(rect, Rounding::same(8.0), bg);
+                                    painter.rect_stroke(
+                                        rect,
+                                        Rounding::same(8.0),
+                                        Stroke::new(
+                                            if is_held { 2.0_f32 } else { 1.0_f32 },
+                                            if is_held {
+                                                Color32::WHITE
+                                            } else {
+                                                pad_accent.gamma_multiply(0.45)
+                                            },
+                                        ),
+                                    );
+                                    painter.text(
+                                        rect.left_top() + Vec2::new(7.0, 5.0),
+                                        egui::Align2::LEFT_TOP,
+                                        pad.key_label,
+                                        egui::FontId::proportional(10.0),
+                                        if is_held {
+                                            Color32::from_rgb(20, 24, 32)
+                                        } else {
+                                            Color32::from_rgb(130, 145, 175)
+                                        },
+                                    );
+                                    painter.text(
+                                        rect.center() + Vec2::new(0.0, 6.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        main_label,
+                                        egui::FontId::proportional(11.0),
+                                        fg,
+                                    );
+                                }
+                            });
+                        });
+                    } else {
+                        // 25-Key (2-Octave) Monologue-Style Chromatic Piano Keyboard
+                        let base = self.chromatic_base_midi();
+                        let (kb_rect, kb_resp) = ui.allocate_exact_size(
+                            Vec2::new(pads_total_w, pad_h),
+                            Sense::click_and_drag(),
+                        );
+                        const WHITE_SEMIS: [i8; 15] =
+                            [0, 2, 4, 5, 7, 9, 11, 12, 14, 16, 17, 19, 21, 23, 24];
+                        const BLACK_LAYOUT: [(usize, i8); 10] = [
+                            (0, 1),
+                            (1, 3),
+                            (3, 6),
+                            (4, 8),
+                            (5, 10),
+                            (7, 13),
+                            (8, 15),
+                            (10, 18),
+                            (11, 20),
+                            (12, 22),
+                        ];
+                        let white_w = kb_rect.width() / 15.0;
+                        let black_w = (white_w * 0.62).clamp(10.0, 24.0);
+                        let black_h = (kb_rect.height() * 0.55).round();
+
+                        let white_rect = |wi: usize| {
+                            let x0 = kb_rect.left() + wi as f32 * white_w;
+                            let x1 = x0 + white_w - 1.5;
+                            egui::Rect::from_min_max(
+                                egui::pos2(x0, kb_rect.top()),
+                                egui::pos2(x1, kb_rect.bottom()),
+                            )
+                        };
+                        let black_rect = |w_idx: usize| {
+                            let cx = kb_rect.left() + (w_idx + 1) as f32 * white_w - 0.75;
+                            egui::Rect::from_min_max(
+                                egui::pos2(cx - black_w * 0.5, kb_rect.top()),
+                                egui::pos2(cx + black_w * 0.5, kb_rect.top() + black_h),
+                            )
+                        };
+
+                        if kb_resp.is_pointer_button_down_on() {
+                            if let Some(pos) = kb_resp.interact_pointer_pos() {
+                                let mut hit_semi: Option<i8> = None;
+                                for &(w_idx, semi) in &BLACK_LAYOUT {
+                                    if black_rect(w_idx).contains(pos) {
+                                        hit_semi = Some(semi);
+                                        break;
+                                    }
+                                }
+                                if hit_semi.is_none() {
+                                    for (wi, &semi) in WHITE_SEMIS.iter().enumerate() {
+                                        if white_rect(wi).contains(pos) {
+                                            hit_semi = Some(semi);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if let Some(semi) = hit_semi {
+                                    let midi = (base as i16 + semi as i16).clamp(12, 108) as u8;
+                                    let same_held = matches!(
+                                        self.held_mouse,
+                                        Some(HeldNote::Melodic(t, m)) if t == play_target && m == midi
+                                    ) || matches!(
+                                        self.held_mouse,
+                                        Some(HeldNote::SamplerPitched(_, m)) if play_target == RecordTarget::Core(TrackId::Sampler) && m == midi
+                                    );
+                                    if !same_held {
+                                        if let Some(prev) = self.held_mouse.take() {
+                                            self.release_held_note(ctx, &mut proj, prev, playing);
+                                        }
+                                        let held = self.play_and_record_note_down(
+                                            ctx, &mut proj, play_target, midi, 0.88, playing, cur_step,
+                                        );
+                                        self.held_mouse = Some(held);
+                                    }
+                                }
+                            }
+                        } else if self.held_mouse.is_some() && self.held_mouse_pad.is_none() {
+                            if let Some(prev) = self.held_mouse.take() {
+                                self.release_held_note(ctx, &mut proj, prev, playing);
+                            }
+                        }
+
+                        let key_lbl_for = |semi: i8| -> Option<&'static str> {
+                            CHROMATIC_KEY_MAP
+                                .iter()
+                                .find(|&&(_, s, _)| s == semi)
+                                .map(|&(_, _, lbl)| lbl)
+                        };
+                        let is_midi_held = |midi: u8| -> bool {
+                            self.held_keys.iter().any(|&(_, h)| match h {
+                                HeldNote::Melodic(_, m) | HeldNote::SamplerPitched(_, m) => m == midi,
+                                _ => false,
+                            }) || match self.held_mouse {
+                                Some(HeldNote::Melodic(_, m)) | Some(HeldNote::SamplerPitched(_, m)) => {
+                                    m == midi
+                                }
+                                _ => false,
+                            }
+                        };
+                        let active_col = if is_armed_here { rec_col } else { tc };
+                        let root_pc = proj.root_note % 12;
+                        let scale_ivs = proj.scale.intervals();
+                        let painter = ui.painter();
+
+                        // 1. Draw 15 White Keys
+                        for (wi, &semi) in WHITE_SEMIS.iter().enumerate() {
+                            let rect = white_rect(wi);
+                            let midi = (base as i16 + semi as i16).clamp(12, 108) as u8;
+                            let held = is_midi_held(midi);
+                            let pc = (midi + 12 - root_pc) % 12;
+                            let in_scale = scale_ivs.contains(&pc);
+                            let is_root = pc == 0;
+                            let bg = if held {
+                                active_col
+                            } else if is_root {
+                                Color32::from_rgb(236, 242, 255)
+                            } else {
+                                Color32::from_rgb(212, 220, 234)
+                            };
+                            painter.rect_filled(rect, Rounding::same(4.0), bg);
+                            painter.rect_stroke(
+                                rect,
+                                Rounding::same(4.0),
+                                Stroke::new(
+                                    if held { 1.5_f32 } else { 1.0_f32 },
+                                    if held {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(48, 56, 74)
+                                    },
+                                ),
+                            );
+                            if !held && in_scale {
+                                painter.circle_filled(
+                                    egui::pos2(rect.center().x, rect.bottom() - 31.0),
+                                    if is_root { 3.0 } else { 2.0 },
+                                    if is_root {
+                                        tc
+                                    } else {
+                                        tc.gamma_multiply(0.55)
                                     },
                                 );
+                            }
+                            if let Some(klbl) = key_lbl_for(semi) {
                                 painter.text(
-                                    rect.center() + Vec2::new(0.0, 5.0),
+                                    egui::pos2(rect.center().x, rect.bottom() - 21.0),
                                     egui::Align2::CENTER_CENTER,
-                                    main_label,
-                                    egui::FontId::proportional(14.5),
-                                    fg,
+                                    klbl,
+                                    egui::FontId::proportional(9.5),
+                                    Color32::from_rgb(22, 28, 40),
                                 );
                             }
-                        });
-                    });
+                            if white_w >= 28.0 || (midi % 12 == 0) {
+                                painter.text(
+                                    egui::pos2(rect.center().x, rect.bottom() - 7.5),
+                                    egui::Align2::CENTER_CENTER,
+                                    note_name(midi),
+                                    egui::FontId::proportional(8.0),
+                                    if held {
+                                        Color32::from_rgb(12, 15, 22)
+                                    } else {
+                                        Color32::from_rgb(70, 82, 104)
+                                    },
+                                );
+                            }
+                        }
+
+                        // 2. Draw 10 Raised Black Keys on top
+                        for &(w_idx, semi) in &BLACK_LAYOUT {
+                            let rect = black_rect(w_idx);
+                            let midi = (base as i16 + semi as i16).clamp(12, 108) as u8;
+                            let held = is_midi_held(midi);
+                            let pc = (midi + 12 - root_pc) % 12;
+                            let in_scale = scale_ivs.contains(&pc);
+                            let bg = if held {
+                                active_col
+                            } else {
+                                Color32::from_rgb(24, 28, 40)
+                            };
+                            painter.rect_filled(rect, Rounding::same(3.0), bg);
+                            painter.rect_stroke(
+                                rect,
+                                Rounding::same(3.0),
+                                Stroke::new(
+                                    1.0_f32,
+                                    if held {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(70, 80, 104)
+                                    },
+                                ),
+                            );
+                            if !held && in_scale {
+                                painter.circle_filled(
+                                    egui::pos2(rect.center().x, rect.bottom() - 6.0),
+                                    2.0,
+                                    if pc == 0 {
+                                        tc
+                                    } else {
+                                        tc.gamma_multiply(0.55)
+                                    },
+                                );
+                            }
+                            if let Some(klbl) = key_lbl_for(semi) {
+                                painter.text(
+                                    egui::pos2(rect.center().x, rect.top() + 14.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    klbl,
+                                    egui::FontId::proportional(9.0),
+                                    if held {
+                                        Color32::from_rgb(12, 15, 22)
+                                    } else {
+                                        Color32::from_rgb(190, 200, 222)
+                                    },
+                                );
+                            }
+                        }
+                    }
 
                     // Mini Oscilloscope + Live Stereo VU & Sidechain Meter + Status
                     ui.vertical(|ui| {
-                        ui.set_width(180.0);
-                        ui.set_max_width(180.0);
+                        ui.set_width(176.0);
+                        ui.set_max_width(176.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            let scope_rect = ui.allocate_exact_size(Vec2::new(132.0, 40.0), Sense::hover()).0;
+                            let scope_rect = ui.allocate_exact_size(Vec2::new(128.0, 46.0), Sense::hover()).0;
                             draw_scope(ui.painter(), scope_rect, &self.scope_buf, accent);
-                            let meter_rect = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::hover()).0;
+                            let meter_rect = ui.allocate_exact_size(Vec2::new(36.0, 46.0), Sense::hover()).0;
                             draw_vu_meters(
                                 ui.painter(),
                                 meter_rect,
@@ -1197,6 +2414,10 @@ impl FunKeySynthApp {
                         self.ui_studio(ui, ctx, &mut proj, &telemetry, playing, cur_step, accent, theme)
                     }
                     StudioTab::Sampler => {
+                        let mut sampler_armed =
+                            self.armed_record == Some(RecordTarget::Core(TrackId::Sampler));
+                        let was_armed = sampler_armed;
+                        let step_phase = self.engine.step_phase();
                         if let Some(msg) = crate::volca_ui::render_volca_sampler(
                             ui,
                             ctx,
@@ -1209,7 +2430,11 @@ impl FunKeySynthApp {
                             cur_step,
                             &mut self.bar_page,
                             &mut self.follow_playhead,
-                            self.record_live,
+                            &mut sampler_armed,
+                            &mut self.step_rec_cursor,
+                            self.rec_replace,
+                            &mut self.rec_take_cleared,
+                            step_phase,
                             &mut self.rec_motion,
                             &mut self.test_repeat_on,
                             &mut self.test_repeat_next_t,
@@ -1217,6 +2442,13 @@ impl FunKeySynthApp {
                             theme,
                         ) {
                             self.set_toast(ctx, msg);
+                        }
+                        if sampler_armed != was_armed {
+                            self.armed_record = if sampler_armed {
+                                Some(RecordTarget::Core(TrackId::Sampler))
+                            } else {
+                                None
+                            };
                         }
                     }
                     StudioTab::ArrangeParty => {
@@ -1477,7 +2709,7 @@ impl FunKeySynthApp {
             });
             ui.label(
                 RichText::new(format!(
-                    "{}  •  Press Space to Play/Stop, A-K to play in-key chords/notes",
+                    "{}  •  Space = Play/Stop  •  A–' / W–P = Chromatic Keys  •  Z/X = Octave  •  R = Record Track",
                     proj.vibe.tagline()
                 ))
                 .size(11.5)
@@ -1505,7 +2737,7 @@ impl FunKeySynthApp {
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
             left_ui.set_width(left_w);
-            self.ui_studio_tracks_card(&mut left_ui, proj, accent, theme);
+            self.ui_studio_tracks_card(&mut left_ui, ctx, proj, accent, theme);
 
             let right_pos = egui::pos2(top_left.x + left_w + gap, top_left.y);
             let right_rect = egui::Rect::from_min_max(right_pos, egui::pos2(right_pos.x + right_w, max_y));
@@ -1520,7 +2752,7 @@ impl FunKeySynthApp {
             let max_h = left_ui.min_rect().height().max(right_ui.min_rect().height());
             ui.advance_cursor_after_rect(egui::Rect::from_min_size(top_left, Vec2::new(total_w, max_h)));
         } else {
-            self.ui_studio_tracks_card(ui, proj, accent, theme);
+            self.ui_studio_tracks_card(ui, ctx, proj, accent, theme);
             ui.add_space(8.0);
             self.ui_studio_sequencer_card(ui, ctx, proj, playing, cur_step, accent, theme);
         }
@@ -1534,6 +2766,7 @@ impl FunKeySynthApp {
     fn ui_studio_tracks_card(
         &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         proj: &mut Project,
         accent: Color32,
         theme: StudioTheme,
@@ -1665,12 +2898,14 @@ impl FunKeySynthApp {
                     continue;
                 }
                 let selected = self.selected_extra.is_none() && self.selected_track == track;
+                let armed = self.armed_record == Some(RecordTarget::Core(track));
                 let tc = track_color(track);
                 let row_bg = if selected {
                     Color32::from_rgb(30, 38, 56)
                 } else {
                     Color32::from_rgb(20, 24, 34)
                 };
+                let mut row_rec = false;
                 let mut row_rnd = false;
                 let mut row_clr = false;
                 let mut row_rm = false;
@@ -1679,8 +2914,14 @@ impl FunKeySynthApp {
                     .rounding(Rounding::same(6.0))
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                     .stroke(Stroke::new(
-                        if selected { 1.5_f32 } else { 1.0_f32 },
-                        if selected { tc } else { Color32::from_rgb(34, 40, 56) },
+                        if armed || selected { 1.5_f32 } else { 1.0_f32 },
+                        if armed {
+                            Color32::from_rgb(228, 54, 70)
+                        } else if selected {
+                            tc
+                        } else {
+                            Color32::from_rgb(34, 40, 56)
+                        },
                     ))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
@@ -1709,7 +2950,7 @@ impl FunKeySynthApp {
                                 }),
                             )
                             .fill(Color32::TRANSPARENT)
-                            .min_size(Vec2::new(82.0, 22.0));
+                            .min_size(Vec2::new(78.0, 22.0));
                             let sel_resp = ui
                                 .add(sel_btn)
                                 .on_hover_text("Click: select  •  Double-click: open full synth  •  Right-click: instrument menu");
@@ -1857,7 +3098,7 @@ impl FunKeySynthApp {
                                         .color(Color32::from_rgb(255, 214, 110)),
                                 )
                                 .fill(Color32::from_rgb(36, 34, 46))
-                                .min_size(Vec2::new(116.0, 22.0));
+                                .min_size(Vec2::new(104.0, 22.0));
                                 if ui
                                     .add(vbtn)
                                     .on_hover_text("Open 8-Part Volca Performance Sampler (load MP3/WAV, auto-chop, Isolator EQ)")
@@ -1869,7 +3110,7 @@ impl FunKeySynthApp {
                                 let presets = voice_preset_names(track);
                                 let cur_preset = proj.voice_presets[row_idx] % presets.len().max(1);
                                 egui::ComboBox::from_id_salt(("vp", row_idx))
-                                    .width(116.0)
+                                    .width(104.0)
                                     .selected_text(presets[cur_preset])
                                     .show_ui(ui, |ui| {
                                         for (pi, &pname) in presets.iter().enumerate() {
@@ -1881,23 +3122,30 @@ impl FunKeySynthApp {
                             }
 
                             let (vol, mute, solo) = track_mixer_mut(proj, track);
-                            let (r, c, rm) = ui_track_mix_strip(
+                            let (rec, r, c, rm) = ui_track_mix_strip(
                                 ui,
+                                armed,
                                 vol,
                                 mute,
                                 solo,
                                 "Generate fresh pattern for this track",
                                 "Remove track from mix (mutes & hides it; re-add below anytime)",
                             );
+                            row_rec = rec;
                             row_rnd = r;
                             row_clr = c;
                             row_rm = rm;
                         });
                     });
+                if row_rec {
+                    self.toggle_arm_record(ctx, proj, RecordTarget::Core(track));
+                }
                 if row_rnd {
+                    let prev_sc = self.target_step_count(proj, RecordTarget::Core(track));
                     let seed = self.next_seed();
                     if track == TrackId::Drums {
-                        let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                        let mut drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                        drums.set_all_step_counts(prev_sc, false);
                         proj.current_pattern_mut().drums = drums;
                     } else if track == TrackId::Sampler {
                         let pat = proj.current_pattern_mut();
@@ -1913,9 +3161,10 @@ impl FunKeySynthApp {
                                 s.velocity = if step % 4 == 0 { 0.92 } else { 0.78 };
                             }
                         }
+                        pat.set_sampler_step_counts(prev_sc);
                         proj.mixer.channels[TrackId::Sampler.index()].mute = false;
                     } else {
-                        let (bass, pad, arp, acid, samp) = generate_melodic_tracks(
+                        let (mut bass, mut pad, mut arp, mut acid, mut samp) = generate_melodic_tracks(
                             proj.vibe,
                             proj.root_note,
                             proj.progression_idx,
@@ -1923,11 +3172,26 @@ impl FunKeySynthApp {
                         );
                         let pat = proj.current_pattern_mut();
                         match track {
-                            TrackId::Moog => pat.moog = bass,
-                            TrackId::MoogPad => pat.moog_pad = pad,
-                            TrackId::Monologue => pat.monologue = arp,
-                            TrackId::Tb303 => pat.tb303 = acid,
-                            TrackId::Sampler => pat.sampler = samp,
+                            TrackId::Moog => {
+                                bass.step_count = prev_sc;
+                                pat.moog = bass;
+                            }
+                            TrackId::MoogPad => {
+                                pad.step_count = prev_sc;
+                                pat.moog_pad = pad;
+                            }
+                            TrackId::Monologue => {
+                                arp.step_count = prev_sc;
+                                pat.monologue = arp;
+                            }
+                            TrackId::Tb303 => {
+                                acid.step_count = prev_sc;
+                                pat.tb303 = acid;
+                            }
+                            TrackId::Sampler => {
+                                samp.step_count = prev_sc;
+                                pat.sampler = samp;
+                            }
                             _ => {}
                         }
                     }
@@ -1959,6 +3223,9 @@ impl FunKeySynthApp {
                 let (_, mute, solo) = track_mixer_mut(proj, rm_track);
                 *mute = true;
                 *solo = false;
+                if self.armed_record == Some(RecordTarget::Core(rm_track)) {
+                    self.armed_record = None;
+                }
                 if self.selected_track == rm_track {
                     if let Some((next_idx, _)) =
                         proj.active_tracks.iter().enumerate().find(|(_, &a)| a)
@@ -1973,6 +3240,7 @@ impl FunKeySynthApp {
             let pad_presets = voice_preset_names(TrackId::MoogPad);
             for ei in 0..proj.extra_tracks.len() {
                 let selected = self.selected_extra == Some(ei);
+                let armed = self.armed_record == Some(RecordTarget::Extra(ei));
                 let [cr, cg, cb] = proj.extra_tracks[ei].color;
                 let tc = Color32::from_rgb(cr, cg, cb);
                 let row_bg = if selected {
@@ -1980,6 +3248,7 @@ impl FunKeySynthApp {
                 } else {
                     Color32::from_rgb(20, 24, 34)
                 };
+                let mut ex_rec = false;
                 let mut ex_rnd = false;
                 let mut ex_clr = false;
                 let mut ex_rm = false;
@@ -1988,8 +3257,14 @@ impl FunKeySynthApp {
                     .rounding(Rounding::same(6.0))
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                     .stroke(Stroke::new(
-                        if selected { 1.5_f32 } else { 1.0_f32 },
-                        if selected { tc } else { Color32::from_rgb(34, 40, 56) },
+                        if armed || selected { 1.5_f32 } else { 1.0_f32 },
+                        if armed {
+                            Color32::from_rgb(228, 54, 70)
+                        } else if selected {
+                            tc
+                        } else {
+                            Color32::from_rgb(34, 40, 56)
+                        },
                     ))
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
@@ -2014,7 +3289,7 @@ impl FunKeySynthApp {
                                     }),
                             )
                             .fill(Color32::TRANSPARENT)
-                            .min_size(Vec2::new(82.0, 22.0));
+                            .min_size(Vec2::new(78.0, 22.0));
                             let resp = ui
                                 .add(sel_btn)
                                 .on_hover_text("Click: edit steps  •  Double-click: open in Sound Lab");
@@ -2029,7 +3304,7 @@ impl FunKeySynthApp {
                             // Preset dropdown
                             let cur_p = proj.extra_tracks[ei].preset_idx % pad_presets.len();
                             egui::ComboBox::from_id_salt(("extra_vp", ei))
-                                .width(116.0)
+                                .width(104.0)
                                 .selected_text(pad_presets[cur_p])
                                 .show_ui(ui, |ui| {
                                     for (pi, &pname) in pad_presets.iter().enumerate() {
@@ -2041,27 +3316,34 @@ impl FunKeySynthApp {
                                 });
 
                             let tr = &mut proj.extra_tracks[ei];
-                            let (r, c, rm) = ui_track_mix_strip(
+                            let (rec, r, c, rm) = ui_track_mix_strip(
                                 ui,
+                                armed,
                                 &mut tr.volume,
                                 &mut tr.mute,
                                 &mut tr.solo,
                                 "Generate fresh chord-locked pattern for this track",
                                 "Delete this synth track from the mix",
                             );
+                            ex_rec = rec;
                             ex_rnd = r;
                             ex_clr = c;
                             ex_rm = rm;
                         });
                     });
+                if ex_rec {
+                    self.toggle_arm_record(ctx, proj, RecordTarget::Extra(ei));
+                }
                 if ex_rnd {
+                    let prev_sc = self.target_step_count(proj, RecordTarget::Extra(ei));
                     let seed = self.next_seed();
-                    let seq = generate_extra_track_seq(
+                    let mut seq = generate_extra_track_seq(
                         proj.root_note,
                         proj.progression_idx,
                         proj.extra_tracks[ei].preset_idx,
                         seed,
                     );
+                    seq.step_count = prev_sc;
                     if let Some(slot) = proj.current_pattern_mut().extra_seqs.get_mut(ei) {
                         *slot = seq;
                     }
@@ -2088,6 +3370,13 @@ impl FunKeySynthApp {
                 } else if let Some(cur) = self.selected_extra {
                     if cur > rm_e {
                         self.selected_extra = Some(cur - 1);
+                    }
+                }
+                if self.armed_record == Some(RecordTarget::Extra(rm_e)) {
+                    self.armed_record = None;
+                } else if let Some(RecordTarget::Extra(cur)) = self.armed_record {
+                    if cur > rm_e {
+                        self.armed_record = Some(RecordTarget::Extra(cur - 1));
                     }
                 }
             }
@@ -2267,9 +3556,37 @@ impl FunKeySynthApp {
                 }
             });
 
-            // Row 2: Bar 1..4 + Follow + Contextual Track Controls
+            let active_target = self.active_target(proj);
+            let cur_sc = self.target_step_count(proj, active_target);
+            let cur_len = cur_sc.as_usize();
+            let cur_pages = cur_sc.pages();
+            self.bar_page = self.bar_page.min(cur_pages.saturating_sub(1));
+            self.step_rec_cursor = self.step_rec_cursor % cur_len;
+            let rec_col = Color32::from_rgb(228, 54, 70);
+            let is_armed_here = self.armed_record == Some(active_target);
+
+            // Row 2: Pattern Length by 16s + Bar 1..N + Follow + 16-Step Block Copy
             ui.horizontal_wrapped(|ui| {
-                for b in 0..4 {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                ui.label(RichText::new("Len:").size(11.0).weak());
+                for &sc in &StepCount::ALL {
+                    if ui.selectable_label(cur_sc == sc, sc.label()).clicked() {
+                        self.set_target_step_count(proj, active_target, sc);
+                        self.bar_page = self.bar_page.min(sc.pages().saturating_sub(1));
+                        self.step_rec_cursor = self.step_rec_cursor % sc.as_usize();
+                    }
+                }
+                if ui
+                    .small_button("->All")
+                    .on_hover_text("Apply this step length (16/32/48/64) to all tracks in the active Bank")
+                    .clicked()
+                {
+                    let len_now = cur_sc.as_usize();
+                    proj.current_pattern_mut().set_all_step_counts(cur_sc);
+                    self.set_toast(ctx, format!("Set all tracks in Bank to {len_now} steps"));
+                }
+                ui.separator();
+                for b in 0..cur_pages {
                     let label = format!("Bar {}", b + 1);
                     if ui.selectable_label(self.bar_page == b, label).clicked() {
                         self.bar_page = b;
@@ -2277,12 +3594,157 @@ impl FunKeySynthApp {
                     }
                 }
                 ui.checkbox(&mut self.follow_playhead, "Follow");
+                ui.separator();
+                if ui
+                    .small_button("Copy->Rest")
+                    .on_hover_text("Copy this 16-step Bar to the remaining bars of this track (expands 16 -> 64 automatically)")
+                    .clicked()
+                {
+                    let new_sc = match active_target {
+                        RecordTarget::Core(TrackId::Drums) => {
+                            proj.current_pattern_mut().drums.copy_page_to_rest(self.bar_page)
+                        }
+                        RecordTarget::Core(TrackId::Sampler) => {
+                            proj.current_pattern_mut().copy_sampler_page_to_rest(self.bar_page)
+                        }
+                        RecordTarget::Core(tr) => proj
+                            .current_pattern_mut()
+                            .melodic_mut(tr)
+                            .map(|s| s.copy_page_to_rest(self.bar_page))
+                            .unwrap_or(cur_sc),
+                        RecordTarget::Extra(ei) => proj
+                            .current_pattern_mut()
+                            .extra_seqs
+                            .get_mut(ei)
+                            .map(|s| s.copy_page_to_rest(self.bar_page))
+                            .unwrap_or(cur_sc),
+                    };
+                    self.set_toast(
+                        ctx,
+                        format!(
+                            "Copied Bar {} -> rest ({} steps)",
+                            self.bar_page + 1,
+                            new_sc.as_usize()
+                        ),
+                    );
+                }
+                if ui
+                    .small_button("->Next")
+                    .on_hover_text("Copy this 16-step Bar to the next Bar (expands 16 -> 32) and jump there")
+                    .clicked()
+                {
+                    let dst = match active_target {
+                        RecordTarget::Core(TrackId::Drums) => {
+                            proj.current_pattern_mut().drums.copy_page_to_next(self.bar_page)
+                        }
+                        RecordTarget::Core(TrackId::Sampler) => {
+                            proj.current_pattern_mut().copy_sampler_page_to_next(self.bar_page)
+                        }
+                        RecordTarget::Core(tr) => proj
+                            .current_pattern_mut()
+                            .melodic_mut(tr)
+                            .map(|s| s.copy_page_to_next(self.bar_page))
+                            .unwrap_or(0),
+                        RecordTarget::Extra(ei) => proj
+                            .current_pattern_mut()
+                            .extra_seqs
+                            .get_mut(ei)
+                            .map(|s| s.copy_page_to_next(self.bar_page))
+                            .unwrap_or(0),
+                    };
+                    self.bar_page = dst;
+                    self.follow_playhead = false;
+                    self.set_toast(ctx, format!("Copied Bar -> Bar {}", dst + 1));
+                }
+                if ui
+                    .small_button("All->Rest")
+                    .on_hover_text("Copy this 16-step Bar across the rest of the pattern for ALL tracks")
+                    .clicked()
+                {
+                    proj.current_pattern_mut()
+                        .copy_all_tracks_page_to_rest(self.bar_page);
+                    self.set_toast(
+                        ctx,
+                        format!("Copied Bar {} to rest across all tracks", self.bar_page + 1),
+                    );
+                }
+            });
+
+            // Row 2b: Per-Instrument Record Bar + Track Contextual Controls
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let rec_btn = egui::Button::new(
+                    RichText::new("● REC")
+                        .strong()
+                        .size(11.0)
+                        .color(Color32::WHITE),
+                )
+                .fill(if is_armed_here {
+                    rec_col
+                } else {
+                    Color32::from_rgb(44, 34, 42)
+                });
+                if ui
+                    .add(rec_btn)
+                    .on_hover_text("Put this instrument in Record Mode: play when stopped to Step Record, or while playing to Live Record")
+                    .clicked()
+                {
+                    self.toggle_arm_record(ctx, proj, active_target);
+                }
+                if ui.selectable_label(self.rec_replace, "Replace").clicked() {
+                    self.rec_replace = true;
+                }
+                if ui.selectable_label(!self.rec_replace, "Overdub").clicked() {
+                    self.rec_replace = false;
+                }
+
+                if self.armed_record == Some(active_target) {
+                    if playing {
+                        ui.label(
+                            RichText::new("LIVE REC")
+                                .strong()
+                                .size(11.0)
+                                .color(Color32::from_rgb(255, 110, 120)),
+                        );
+                    } else {
+                        let cur_disp = (self.step_rec_cursor % cur_len) + 1;
+                        ui.label(
+                            RichText::new(format!("STEP {cur_disp}/{cur_len}"))
+                                .strong()
+                                .size(11.0)
+                                .color(Color32::from_rgb(255, 110, 120)),
+                        );
+                        if ui.small_button("Rest").on_hover_text("Insert rest and advance (Tab / .)").clicked() {
+                            self.step_rec_rest(proj);
+                        }
+                        if !matches!(
+                            active_target,
+                            RecordTarget::Core(TrackId::Drums | TrackId::Sampler)
+                        ) {
+                            if ui.small_button("Tie").on_hover_text("Extend previous note over this step (-)").clicked() {
+                                self.step_rec_tie(proj);
+                            }
+                            if ui.selectable_label(self.step_rec_accent, "Acc").on_hover_text("Accent next recorded notes (or hold Shift)").clicked() {
+                                self.step_rec_accent = !self.step_rec_accent;
+                            }
+                            if ui.selectable_label(self.step_rec_slide, "Slide").on_hover_text("Slide/tie next recorded notes").clicked() {
+                                self.step_rec_slide = !self.step_rec_slide;
+                            }
+                        }
+                        if ui.small_button("←").on_hover_text("Previous step (Backspace / Left)").clicked() {
+                            self.step_rec_back(proj);
+                        }
+                        if ui.small_button("→").on_hover_text("Next step (Right)").clicked() {
+                            self.step_rec_forward(proj);
+                        }
+                    }
+                }
 
                 if self.selected_extra.is_none() && self.selected_track == TrackId::Drums {
                     ui.separator();
                     ui.label(RichText::new("Beat Energy:").size(11.5));
                     ui.scope(|ui| {
-                        ui.spacing_mut().slider_width = 96.0;
+                        ui.spacing_mut().slider_width = 88.0;
                         if ui
                             .add(
                                 egui::Slider::new(&mut proj.beat_energy, 0.1..=1.0)
@@ -2292,15 +3754,19 @@ impl FunKeySynthApp {
                             .changed()
                             && !proj.auto_beat_mode
                         {
+                            let prev_sc = proj.current_pattern().drums.step_count;
                             let seed = proj.party_seed;
-                            let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                            let mut drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                            drums.set_all_step_counts(prev_sc, false);
                             proj.current_pattern_mut().drums = drums;
                         }
                     });
                     if ui.small_button("New Beat").clicked() {
+                        let prev_sc = proj.current_pattern().drums.step_count;
                         let seed = self.next_seed();
                         proj.party_seed = seed;
-                        let drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                        let mut drums = generate_auto_beat(proj.vibe, proj.beat_energy, seed);
+                        drums.set_all_step_counts(prev_sc, false);
                         proj.current_pattern_mut().drums = drums;
                     }
                     if ui.small_button("Fill Now").clicked() {
@@ -2321,7 +3787,6 @@ impl FunKeySynthApp {
             ui.add_space(6.0);
 
             let page_start = self.bar_page * 16;
-            let play_step = if playing { Some(cur_step % 64) } else { None };
 
             if self.selected_extra.is_none() && self.selected_track == TrackId::Drums {
                 // 8-lane compact Drum Beat Grid (16 steps per bar page)
@@ -2438,6 +3903,10 @@ impl FunKeySynthApp {
                                         s.velocity = 0.72;
                                     }
                                 }
+                                if ui.small_button("Copy Bar -> Rest").clicked() {
+                                    lane.copy_page_to_rest(self.bar_page);
+                                    ui.close_menu();
+                                }
                                 if ui.small_button("Clear").clicked() {
                                     lane.clear();
                                     ui.close_menu();
@@ -2446,10 +3915,14 @@ impl FunKeySynthApp {
                         });
 
                         let lane = &mut proj.patterns[active_pat].drums.lanes[lane_idx];
+                        let d_len = lane.step_count.as_usize();
                         for col in 0..16 {
-                            let idx = (page_start + col) % lane.step_count.as_usize();
+                            let idx = (page_start + col) % d_len;
                             let st = &mut lane.steps[idx];
-                            let is_play = play_step == Some(page_start + col);
+                            let is_play = playing && (cur_step % d_len) == (page_start + col);
+                            let is_rec_col = is_armed_here
+                                && !playing
+                                && (self.step_rec_cursor % d_len) == (page_start + col);
                             let beat_tint = if (col / 4) % 2 == 0 {
                                 Color32::from_rgb(26, 31, 44)
                             } else {
@@ -2475,7 +3948,11 @@ impl FunKeySynthApp {
                             let (rect, resp) =
                                 ui.allocate_exact_size(Vec2::new(cell_w, cell_h), Sense::click());
                             if resp.clicked() {
+                                proj.auto_beat_mode = false;
                                 st.active = !st.active;
+                                if is_armed_here && !playing {
+                                    self.step_rec_cursor = idx;
+                                }
                                 if st.active {
                                     st.velocity = 0.85;
                                     st.ratchet = 1;
@@ -2517,6 +3994,13 @@ impl FunKeySynthApp {
                             });
                             let painter = ui.painter();
                             painter.rect_filled(rect, Rounding::same(4.0), fill);
+                            if is_rec_col {
+                                painter.rect_stroke(
+                                    rect,
+                                    Rounding::same(4.0),
+                                    Stroke::new(2.0_f32, Color32::from_rgb(245, 72, 86)),
+                                );
+                            }
                             if st.active && (st.ratchet > 1 || st.has_step_fx()) {
                                 let b = if st.ratchet > 1 {
                                     format!("{}x", st.ratchet)
@@ -2588,10 +4072,14 @@ impl FunKeySynthApp {
                             proj.sample_parts[part_idx].mute = !proj.sample_parts[part_idx].mute;
                         }
                         let lane = &mut proj.patterns[active_pat].sample_lanes[part_idx];
+                        let s_len = lane.step_count.as_usize();
                         for col in 0..16 {
-                            let idx = (page_start + col) % lane.step_count.as_usize();
+                            let idx = (page_start + col) % s_len;
                             let st = &mut lane.steps[idx];
-                            let is_play = play_step == Some(page_start + col);
+                            let is_play = playing && (cur_step % s_len) == (page_start + col);
+                            let is_rec_col = is_armed_here
+                                && !playing
+                                && (self.step_rec_cursor % s_len) == (page_start + col);
                             let beat_tint = if (col / 4) % 2 == 0 {
                                 Color32::from_rgb(26, 31, 44)
                             } else {
@@ -2615,6 +4103,9 @@ impl FunKeySynthApp {
                             let (rect, resp) = ui.allocate_exact_size(Vec2::new(cell_w, cell_h), Sense::click());
                             if resp.clicked() {
                                 st.active = !st.active;
+                                if is_armed_here && !playing {
+                                    self.step_rec_cursor = idx;
+                                }
                                 if st.active {
                                     st.velocity = 0.88;
                                     st.ratchet = 1;
@@ -2627,6 +4118,13 @@ impl FunKeySynthApp {
                             }
                             let painter = ui.painter();
                             painter.rect_filled(rect, Rounding::same(4.0), fill);
+                            if is_rec_col {
+                                painter.rect_stroke(
+                                    rect,
+                                    Rounding::same(4.0),
+                                    Stroke::new(2.0_f32, Color32::from_rgb(245, 72, 86)),
+                                );
+                            }
                             if st.active && st.ratchet > 1 {
                                 painter.text(
                                     rect.center(),
@@ -2662,8 +4160,10 @@ impl FunKeySynthApp {
                                 let step_in_page = row * 8 + col;
                                 let idx = (page_start + step_in_page) % len;
                                 let st = &mut seq.steps[idx];
-                                let is_play = play_step == Some(page_start + step_in_page);
+                                let is_play = playing && (cur_step % len) == (page_start + step_in_page);
                                 let is_sel = self.selected_step == idx;
+                                let is_rec_cur =
+                                    is_armed_here && !playing && (self.step_rec_cursor % len) == idx;
                                 let fill = if st.active {
                                     if is_play {
                                         Color32::WHITE
@@ -2682,9 +4182,15 @@ impl FunKeySynthApp {
                                 if resp.clicked() {
                                     st.active = !st.active;
                                     self.selected_step = idx;
+                                    if is_armed_here && !playing {
+                                        self.step_rec_cursor = idx;
+                                    }
                                 }
                                 if resp.secondary_clicked() {
                                     self.selected_step = idx;
+                                    if is_armed_here && !playing {
+                                        self.step_rec_cursor = idx;
+                                    }
                                 }
                                 let painter = ui.painter();
                                 painter.rect_filled(rect, Rounding::same(6.0), fill);
@@ -2692,8 +4198,10 @@ impl FunKeySynthApp {
                                     rect,
                                     Rounding::same(6.0),
                                     Stroke::new(
-                                        if is_sel { 2.0_f32 } else { 1.0_f32 },
-                                        if is_sel {
+                                        if is_rec_cur || is_sel { 2.0_f32 } else { 1.0_f32 },
+                                        if is_rec_cur {
+                                            Color32::from_rgb(245, 72, 86)
+                                        } else if is_sel {
                                             Color32::WHITE
                                         } else {
                                             Color32::from_rgb(44, 52, 72)
@@ -4036,12 +5544,30 @@ fn track_mixer_mut(p: &mut Project, track: TrackId) -> (&mut f32, &mut bool, &mu
 
 fn ui_track_mix_strip(
     ui: &mut egui::Ui,
+    armed: bool,
     vol: &mut f32,
     mute: &mut bool,
     solo: &mut bool,
     rnd_hover: &str,
     rm_hover: &str,
-) -> (bool, bool, bool) {
+) -> (bool, bool, bool, bool) {
+    let r_btn = egui::Button::new(
+        RichText::new("R").strong().size(11.0).color(if armed {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(200, 140, 148)
+        }),
+    )
+    .fill(if armed {
+        Color32::from_rgb(228, 54, 70)
+    } else {
+        Color32::from_rgb(44, 30, 36)
+    });
+    let rec = ui
+        .add(r_btn)
+        .on_hover_text("Arm track for Record Mode (stopped = Step Rec, playing = Live Rec)")
+        .clicked();
+
     let m_btn = egui::Button::new(
         RichText::new("M").strong().size(11.0).color(if *mute {
             Color32::WHITE
@@ -4074,7 +5600,7 @@ fn ui_track_mix_strip(
         *solo = !*solo;
     }
 
-    let slider_w = (ui.available_width() - 108.0).clamp(48.0, 150.0);
+    let slider_w = (ui.available_width() - 116.0).clamp(34.0, 150.0);
     ui.scope(|ui| {
         ui.spacing_mut().slider_width = slider_w;
         ui.add(
@@ -4094,7 +5620,7 @@ fn ui_track_mix_strip(
     )
     .fill(Color32::from_rgb(44, 26, 32));
     let rm = ui.add(sub_btn).on_hover_text(rm_hover).clicked();
-    (rnd, clr, rm)
+    (rec, rnd, clr, rm)
 }
 
 fn macro_cell(
@@ -4465,7 +5991,42 @@ mod ui_layout_tests {
             assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-ExtraTrack-Filter", w, h);
             app.selected_extra = None;
 
-            // 9. Sound Lab tab across all track types
+            // 9. Studio / Chromatic Monologue + Step Rec + Live Rec + Drums + Scale + Chords + Sampler Armed
+            app.tab = StudioTab::Studio;
+            app.selected_track = TrackId::Monologue;
+            app.selected_extra = None;
+            app.keyboard_mode = KeyboardMode::Chromatic;
+            app.armed_record = None;
+            app.engine.playing.store(false, Ordering::Relaxed);
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-Chromatic-Monologue", w, h);
+
+            app.armed_record = Some(RecordTarget::Core(TrackId::Monologue));
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-StepRec-Armed", w, h);
+
+            app.engine.playing.store(true, Ordering::Relaxed);
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-LiveRec-Armed", w, h);
+            app.engine.playing.store(false, Ordering::Relaxed);
+
+            app.selected_track = TrackId::Drums;
+            app.armed_record = Some(RecordTarget::Core(TrackId::Drums));
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-Drums-Pads-Armed", w, h);
+
+            app.armed_record = None;
+            app.selected_track = TrackId::Monologue;
+            app.keyboard_mode = KeyboardMode::Scale;
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-Scale-Dock", w, h);
+
+            app.selected_track = TrackId::MoogPad;
+            app.keyboard_mode = KeyboardMode::Chords;
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Studio-Chords-Dock", w, h);
+
+            app.keyboard_mode = KeyboardMode::Chromatic;
+            app.tab = StudioTab::Sampler;
+            app.armed_record = Some(RecordTarget::Core(TrackId::Sampler));
+            assert_no_overlap_or_overflow(&ctx, &mut app, "Tab-Sampler-Armed", w, h);
+            app.armed_record = None;
+
+            // 10. Sound Lab tab across all track types
             app.tab = StudioTab::SoundLab;
             {
                 let mut g = app.engine.project.lock().unwrap();
@@ -4488,6 +6049,140 @@ mod ui_layout_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn step_recording_monologue_notes_rest_tie_back_saves_to_pattern() {
+        let ctx = egui::Context::default();
+        let mut app = FunKeySynthApp::new_for_test(&ctx);
+        let mut proj = Project::default();
+        let mono_target = RecordTarget::Core(TrackId::Monologue);
+
+        app.set_target_step_count(&mut proj, mono_target, StepCount::Steps16);
+        app.rec_replace = true;
+        app.toggle_arm_record(&ctx, &mut proj, mono_target);
+        assert_eq!(app.armed_record, Some(mono_target));
+        assert_eq!(app.step_rec_cursor, 0);
+
+        // Step 0: C3 (48), Step 1: E3 (52)
+        let h0 = app.play_and_record_note_down(&ctx, &mut proj, mono_target, 48, 0.88, false, 0);
+        app.release_held_note(&ctx, &mut proj, h0, false);
+        let h1 = app.play_and_record_note_down(&ctx, &mut proj, mono_target, 52, 0.88, false, 0);
+        app.release_held_note(&ctx, &mut proj, h1, false);
+        assert_eq!(app.step_rec_cursor, 2);
+
+        // Step 2: Rest -> advances to step 3
+        app.step_rec_rest(&mut proj);
+        assert_eq!(app.step_rec_cursor, 3);
+
+        // Step 3: G3 (55) + Tie over step 4 -> advances to step 5
+        let h3 = app.play_and_record_note_down(&ctx, &mut proj, mono_target, 55, 0.90, false, 0);
+        app.release_held_note(&ctx, &mut proj, h3, false);
+        app.step_rec_tie(&mut proj);
+        assert_eq!(app.step_rec_cursor, 5);
+
+        // Step back to 4 and record A3 (57) -> advances to 5
+        app.step_rec_back(&proj);
+        assert_eq!(app.step_rec_cursor, 4);
+        let h4 = app.play_and_record_note_down(&ctx, &mut proj, mono_target, 57, 0.90, false, 0);
+        app.release_held_note(&ctx, &mut proj, h4, false);
+        assert_eq!(app.step_rec_cursor, 5);
+
+        let seq = &proj.current_pattern().monologue;
+        assert!(seq.steps[0].active && seq.steps[0].note == 48);
+        assert!(seq.steps[1].active && seq.steps[1].note == 52);
+        assert!(!seq.steps[2].active);
+        assert!(seq.steps[3].active && seq.steps[3].note == 55);
+        assert!((seq.steps[3].gate - 1.85).abs() < 1e-4);
+        assert!(seq.steps[4].active && seq.steps[4].note == 57);
+    }
+
+    #[test]
+    fn step_recording_moog_pad_chord_detects_triad_and_advances_on_release() {
+        let ctx = egui::Context::default();
+        let mut app = FunKeySynthApp::new_for_test(&ctx);
+        let mut proj = Project::default();
+        let pad_target = RecordTarget::Core(TrackId::MoogPad);
+
+        app.rec_replace = true;
+        app.toggle_arm_record(&ctx, &mut proj, pad_target);
+
+        // Hold C4 (60), Eb4 (63), G4 (67) simultaneously
+        let h0 = app.play_and_record_note_down(&ctx, &mut proj, pad_target, 60, 0.88, false, 0);
+        app.held_keys.push((Key::A, h0));
+        let h1 = app.play_and_record_note_down(&ctx, &mut proj, pad_target, 63, 0.88, false, 0);
+        app.held_keys.push((Key::E, h1));
+        let h2 = app.play_and_record_note_down(&ctx, &mut proj, pad_target, 67, 0.88, false, 0);
+        app.held_keys.push((Key::G, h2));
+
+        // Still held: cursor must remain on step 0
+        assert_eq!(app.step_rec_cursor, 0);
+
+        // Release first two keys: still held by third
+        app.held_keys.remove(0);
+        app.release_held_note(&ctx, &mut proj, h0, false);
+        assert_eq!(app.step_rec_cursor, 0);
+        app.held_keys.remove(0);
+        app.release_held_note(&ctx, &mut proj, h1, false);
+        assert_eq!(app.step_rec_cursor, 0);
+
+        // Release final key: chord completes and cursor advances to step 1
+        app.held_keys.remove(0);
+        app.release_held_note(&ctx, &mut proj, h2, false);
+        assert_eq!(app.step_rec_cursor, 1);
+
+        let st0 = &proj.current_pattern().moog_pad.steps[0];
+        assert!(st0.active);
+        assert_eq!(st0.note, 60);
+        assert_eq!(st0.chord, ChordType::Minor);
+    }
+
+    #[test]
+    fn live_recording_drums_disables_autobeat_and_replaces_once_per_take() {
+        let ctx = egui::Context::default();
+        let mut app = FunKeySynthApp::new_for_test(&ctx);
+        let mut proj = Project::default();
+        proj.auto_beat_mode = true;
+        proj.current_pattern_mut().drums.lanes[1].steps[15].active = true;
+
+        let drum_target = RecordTarget::Core(TrackId::Drums);
+        app.rec_replace = true;
+        app.toggle_arm_record(&ctx, &mut proj, drum_target);
+        assert!(!proj.auto_beat_mode);
+
+        // Live record Kick at step 0, then Closed Hat at step 2
+        let h_kick = app.trigger_drum_pad_down(&ctx, &mut proj, 0, 0.92, true, 0);
+        app.release_held_note(&ctx, &mut proj, h_kick, true);
+        let h_hat = app.trigger_drum_pad_down(&ctx, &mut proj, 4, 0.85, true, 2);
+        app.release_held_note(&ctx, &mut proj, h_hat, true);
+
+        let drums = &proj.current_pattern().drums;
+        assert!(!drums.lanes[1].steps[15].active, "Replace should clear old beat once on first hit");
+        assert!(drums.lanes[0].steps[0].active, "Kick should be saved on step 0");
+        assert!(drums.lanes[4].steps[2].active, "Closed Hat should remain saved on step 2");
+    }
+
+    #[test]
+    fn recording_extra_track_writes_into_extra_seqs() {
+        let ctx = egui::Context::default();
+        let mut app = FunKeySynthApp::new_for_test(&ctx);
+        let mut proj = Project::default();
+        proj.extra_tracks.push(ExtraTrack::default());
+        let seq = crate::model::MelodicTrackSeq::with_default_note(60, StepCount::Steps16);
+        for pat in &mut proj.patterns {
+            pat.extra_seqs.push(seq.clone());
+        }
+
+        let ex_target = RecordTarget::Extra(0);
+        app.rec_replace = true;
+        app.toggle_arm_record(&ctx, &mut proj, ex_target);
+        let h = app.play_and_record_note_down(&ctx, &mut proj, ex_target, 64, 0.88, false, 0);
+        app.release_held_note(&ctx, &mut proj, h, false);
+
+        assert_eq!(app.step_rec_cursor, 1);
+        let st = &proj.current_pattern().extra_seqs[0].steps[0];
+        assert!(st.active);
+        assert_eq!(st.note, 64);
     }
 }
 

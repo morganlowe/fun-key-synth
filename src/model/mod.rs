@@ -14,8 +14,9 @@ pub use project::{
     MAX_EXTRA_TRACKS,
 };
 pub use sequencer::{
-    euclidean_rhythm, ChordType, DrumLane, DrumStep, DrumTrackSeq, DrumVoiceId, MelodicStep,
-    MelodicTrackSeq, MidiStep, MidiTrackSeq, MotionAutomation, MotionLocks, Pattern,
+    detect_chord_from_notes, euclidean_rhythm, ChordType, DrumLane, DrumStep, DrumTrackSeq,
+    DrumVoiceId, MelodicStep, MelodicTrackSeq, MidiStep, MidiTrackSeq, MotionAutomation,
+    MotionLocks, Pattern,
 };
 pub use vibe::{
     apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, arp_tones_for,

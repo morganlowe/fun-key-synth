@@ -79,6 +79,11 @@ pub enum LiveEvent {
         part: usize,
         velocity: f32,
     },
+    TriggerSamplePartPitched {
+        part: usize,
+        velocity: f32,
+        pitch_offset: i8,
+    },
     ReleaseSamplePart {
         part: usize,
     },
@@ -90,6 +95,12 @@ pub enum LiveEvent {
     ReleaseExtraNote {
         idx: usize,
         note: u8,
+    },
+    SuppressTrackStep {
+        track: Option<TrackId>,
+        extra_idx: Option<usize>,
+        lane: Option<usize>,
+        global_step: usize,
     },
 }
 
@@ -649,8 +660,10 @@ struct Runtime {
     gfilt_env_attacking: bool,
     // Timing & sequencer
     tick_left: f32,
+    last_step_dur: f32,
     step: usize,
     was_playing: bool,
+    suppressed_steps: Vec<(Option<TrackId>, Option<usize>, Option<usize>, usize)>,
     // Gate tracking (samples left before note_off; <=0 means off)
     gate_moog: f32,
     gate_pad: f32,
@@ -772,8 +785,10 @@ impl Runtime {
             gfilt_env: 0.0,
             gfilt_env_attacking: false,
             tick_left: 0.0,
+            last_step_dur: (sr * 0.125).max(1.0),
             step: 0,
             was_playing: false,
+            suppressed_steps: Vec::new(),
             gate_moog: 0.0,
             gate_pad: 0.0,
             gate_mono: 0.0,
@@ -1185,12 +1200,30 @@ impl Runtime {
                 self.volca.sync_parts(&p.sample_parts);
                 self.volca.trigger_part(part, velocity, &p.sample_parts);
             }
+            LiveEvent::TriggerSamplePartPitched {
+                part,
+                velocity,
+                pitch_offset,
+            } => {
+                self.volca.sync_parts(&p.sample_parts);
+                let st = crate::model::DrumStep {
+                    active: true,
+                    velocity,
+                    pitch_offset: pitch_offset.clamp(-24, 24),
+                    ..Default::default()
+                };
+                self.volca
+                    .trigger_part_with_step(part, velocity, &st, &p.sample_parts);
+            }
             LiveEvent::ReleaseSamplePart { part } => {
                 self.volca.release_part(part);
             }
             LiveEvent::PlayExtraNote { idx, note, velocity } => {
                 if let (Some(synth), Some(tr)) = (self.extra_synths.get_mut(idx), p.extra_tracks.get(idx)) {
                     synth.note_on(note, velocity, false, false, &tr.synth);
+                    if idx < MAX_EXTRA_TRACKS {
+                        self.extra_gates[idx] = self.sr * 4.0;
+                    }
                 }
             }
             LiveEvent::ReleaseExtraNote { idx, note } => {
@@ -1198,7 +1231,30 @@ impl Runtime {
                     synth.note_off(note);
                 }
             }
+            LiveEvent::SuppressTrackStep {
+                track,
+                extra_idx,
+                lane,
+                global_step,
+            } => {
+                if self.suppressed_steps.len() < 32 {
+                    self.suppressed_steps
+                        .push((track, extra_idx, lane, global_step));
+                }
+            }
         }
+    }
+
+    fn is_step_suppressed(
+        &self,
+        track: Option<TrackId>,
+        extra_idx: Option<usize>,
+        lane: Option<usize>,
+        global: usize,
+    ) -> bool {
+        self.suppressed_steps
+            .iter()
+            .any(|&(t, e, l, gs)| gs == global && t == track && e == extra_idx && l == lane)
     }
 
     fn all_notes_off(&mut self) {
@@ -1735,7 +1791,10 @@ impl Runtime {
                 let d_lane = &drum_seq.lanes[lane];
                 let d_len = d_lane.step_count.as_usize();
                 let st = d_lane.steps[global % d_len];
-                if st.active && (st.probability >= 0.999 || hash_f32(seed, global, lane as u32) <= st.probability) {
+                if st.active
+                    && !self.is_step_suppressed(Some(TrackId::Drums), None, Some(lane), global)
+                    && (st.probability >= 0.999 || hash_f32(seed, global, lane as u32) <= st.probability)
+                {
                     if let Some(voice) = DrumVoiceId::from_index(lane) {
                         // Subtle velocity humanization + per-step Pitch/Pan P-Locks!
                         let human = 0.94 + hash_f32(seed, global, lane as u32 + 99) * 0.12;
@@ -1941,7 +2000,7 @@ impl Runtime {
                     };
                 }
             }
-            if st.active {
+            if st.active && !self.is_step_suppressed(Some(TrackId::Moog), None, None, global) {
                 let note = st.note;
                 if st.motion.any_locked() {
                     let mut m = st.motion;
@@ -2023,7 +2082,7 @@ impl Runtime {
                     };
                 }
             }
-            if st.active {
+            if st.active && !self.is_step_suppressed(Some(TrackId::MoogPad), None, None, global) {
                 if st.motion.any_locked() {
                     let mut m = st.motion;
                     if p.party_mode && p.party_sound_morph {
@@ -2078,7 +2137,7 @@ impl Runtime {
             for ei in 0..extra_n {
                 let seq = &pat.extra_seqs[ei];
                 let st = seq.steps[global % seq.step_count.as_usize()];
-                if st.active {
+                if st.active && !self.is_step_suppressed(None, Some(ei), None, global) {
                     let synth = &mut self.extra_synths[ei];
                     let tr = &p.extra_tracks[ei];
                     if st.motion.any_locked() {
@@ -2152,7 +2211,7 @@ impl Runtime {
                     st.note += 12;
                 }
             }
-            if st.active {
+            if st.active && !self.is_step_suppressed(Some(TrackId::Monologue), None, None, global) {
                 let note = if follow_override {
                     pick_arp_note(global)
                 } else {
@@ -2212,7 +2271,7 @@ impl Runtime {
                     };
                 }
             }
-            if st.active {
+            if st.active && !self.is_step_suppressed(Some(TrackId::Tb303), None, None, global) {
                 let note = if follow_override {
                     let tone = arp_tones[global % arp_tones.len().max(1)];
                     (bass_root + 12 + (tone % 12)).clamp(36, 76)
@@ -2240,7 +2299,7 @@ impl Runtime {
         if (section_mask & 0b100000) != 0 {
             let seq = if p.party_mode { &self.party_melodic.4 } else { &pat.sampler };
             let st = seq.steps[global % seq.step_count.as_usize()];
-            if st.active {
+            if st.active && !self.is_step_suppressed(Some(TrackId::Sampler), None, None, global) {
                 let note = if follow_override {
                     (48 + (dj_root + active_slot.offset) % 12).clamp(48, 66)
                 } else {
@@ -2265,6 +2324,7 @@ impl Runtime {
                 let len = lane.step_count.as_usize();
                 let dst = lane.steps[global % len];
                 if dst.active
+                    && !self.is_step_suppressed(Some(TrackId::Sampler), None, Some(part_idx), global)
                     && (dst.probability >= 0.999
                         || hash_f32(seed, global, 200 + part_idx as u32) <= dst.probability)
                 {
@@ -2286,6 +2346,7 @@ impl Runtime {
                 }
             }
         }
+        self.suppressed_steps.retain(|&(_, _, _, gs)| gs > global);
     }
 
     fn process_sample(
@@ -2359,6 +2420,7 @@ impl Runtime {
             if self.tick_left <= 0.0 {
                 self.trigger_step(p, drum_cut, snare_build, telemetry);
                 self.tick_left = self.step_duration_samples(p, self.step);
+                self.last_step_dur = self.tick_left.max(1.0);
                 self.step = self.step.wrapping_add(1);
             }
             self.tick_left -= 1.0;
@@ -2945,6 +3007,7 @@ pub struct AudioEngine {
     pub project: Arc<Mutex<Project>>,
     pub playing: Arc<AtomicBool>,
     pub current_step: Arc<AtomicUsize>,
+    pub step_progress: Arc<AtomicU32>,
     pub scope: Arc<OutputScope>,
     pub status: String,
     pub drum_cut: Arc<AtomicBool>,
@@ -2962,6 +3025,7 @@ impl AudioEngine {
             project: Arc::new(Mutex::new(project)),
             playing: Arc::new(AtomicBool::new(false)),
             current_step: Arc::new(AtomicUsize::new(0)),
+            step_progress: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             scope: Arc::new(OutputScope::new(256)),
             status: "Stereo Audio Live @ 44100 Hz".into(),
             drum_cut: Arc::new(AtomicBool::new(false)),
@@ -2983,6 +3047,7 @@ impl AudioEngine {
         let project = Arc::new(Mutex::new(project));
         let playing = Arc::new(AtomicBool::new(false));
         let current_step = Arc::new(AtomicUsize::new(0));
+        let step_progress = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let scope = Arc::new(OutputScope::new(256));
         let drum_cut = Arc::new(AtomicBool::new(false));
         let snare_build = Arc::new(AtomicBool::new(false));
@@ -2997,6 +3062,7 @@ impl AudioEngine {
                 project,
                 playing,
                 current_step,
+                step_progress,
                 scope,
                 status: "No audio output device".into(),
                 drum_cut,
@@ -3012,6 +3078,7 @@ impl AudioEngine {
                 project,
                 playing,
                 current_step,
+                step_progress,
                 scope,
                 status: "No default output config".into(),
                 drum_cut,
@@ -3027,6 +3094,7 @@ impl AudioEngine {
         let p_ref = project.clone();
         let play_ref = playing.clone();
         let step_ref = current_step.clone();
+        let prog_ref = step_progress.clone();
         let scope_ref = scope.clone();
         let cut_ref = drum_cut.clone();
         let build_ref = snare_build.clone();
@@ -3076,6 +3144,8 @@ impl AudioEngine {
                     }
                 }
                 step_ref.store(rt.step.saturating_sub(1), Ordering::Relaxed);
+                let prog = (1.0 - rt.tick_left / rt.last_step_dur.max(1.0)).clamp(0.0, 1.0);
+                prog_ref.store(prog.to_bits(), Ordering::Relaxed);
                 if let Ok(mut t) = tel_ref.try_lock() {
                     *t = local_tel.clone();
                 }
@@ -3091,6 +3161,7 @@ impl AudioEngine {
                     project,
                     playing,
                     current_step,
+                    step_progress,
                     scope,
                     status: format!("Stereo Audio Live @ {} Hz", sr as u32),
                     drum_cut,
@@ -3104,6 +3175,7 @@ impl AudioEngine {
                     project,
                     playing,
                     current_step,
+                    step_progress,
                     scope,
                     status: format!("Audio play error: {e}"),
                     drum_cut,
@@ -3118,6 +3190,7 @@ impl AudioEngine {
                 project,
                 playing,
                 current_step,
+                step_progress,
                 scope,
                 status: format!("Audio stream error: {e}"),
                 drum_cut,
@@ -3127,6 +3200,10 @@ impl AudioEngine {
                 telemetry,
             },
         }
+    }
+
+    pub fn step_phase(&self) -> f32 {
+        f32::from_bits(self.step_progress.load(Ordering::Relaxed)).clamp(0.0, 1.0)
     }
 
     pub fn send_live(&self, ev: LiveEvent) {
@@ -3349,7 +3426,7 @@ mod tests {
             let sym = chord_symbol(0, ChordSlot { offset: 0, chord: ct });
             assert!(!sym.is_empty());
         }
-        assert_eq!(PROGRESSIONS.len(), 20);
+        assert_eq!(PROGRESSIONS.len(), 21);
 
         // 4. Every FactoryPreset builds cleanly, and drum voice names adapt to 808/909 models
         for &fp in &FactoryPreset::ALL {
@@ -3840,5 +3917,113 @@ mod tests {
             "Expected Auto-Drop 8B to cycle BUILD -> DROP!, got {:?}",
             auto_phases
         );
+    }
+
+    #[test]
+    fn pitched_volca_sample_renders_clean_audio_across_transpositions() {
+        let mut p = Project::default();
+        p.party_mode = false;
+        p.mixer.channels[TrackId::Sampler.index()].mute = false;
+        p.sample_parts[0].mute = false;
+
+        let sr = 44_100.0_f32;
+        for &pitch_offset in &[-12_i8, 0, 12] {
+            let mut rt = Runtime::new(sr);
+            let mut tel = EngineTelemetry::default();
+            rt.handle_live_event(
+                LiveEvent::TriggerSamplePartPitched {
+                    part: 0,
+                    velocity: 0.92,
+                    pitch_offset,
+                },
+                &p,
+            );
+            let mut sum_sq = 0.0_f64;
+            let n = 4096;
+            for _ in 0..n {
+                let (l, r) = rt.process_sample(&p, false, false, false, 0, &mut tel);
+                assert!(l.is_finite() && r.is_finite(), "Non-finite pitched sample output at {pitch_offset}");
+                assert!(l.abs() <= 1.0 && r.abs() <= 1.0, "Clipping pitched sample output at {pitch_offset}");
+                sum_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            let rms = (sum_sq / (n as f64 * 2.0)).sqrt() as f32;
+            assert!(rms > 0.001, "Expected audible pitched sample at {pitch_offset}st, got rms={rms}");
+        }
+    }
+
+    #[test]
+    fn suppress_track_step_prevents_double_trigger_on_target_only() {
+        use crate::model::{FactoryPreset, StepCount};
+
+        let mut p = Project::factory(FactoryPreset::BlankInit);
+        p.party_mode = false;
+        let pat = p.current_pattern_mut();
+        pat.monologue.step_count = StepCount::Steps16;
+        pat.monologue.steps[0].active = true;
+        pat.monologue.steps[0].note = 60;
+        pat.monologue.steps[1].active = true;
+        pat.monologue.steps[1].note = 64;
+        pat.moog.step_count = StepCount::Steps16;
+        pat.moog.steps[1].active = true;
+        pat.moog.steps[1].note = 43;
+
+        let mut rt = Runtime::new(44_100.0);
+        let mut tel = EngineTelemetry::default();
+
+        // Step 0 triggers Monologue 60
+        rt.step = 0;
+        rt.trigger_step(&p, false, false, &mut tel);
+        assert_eq!(rt.last_mono_note, Some(60));
+
+        // Suppress Monologue step 1 only
+        rt.handle_live_event(
+            LiveEvent::SuppressTrackStep {
+                track: Some(TrackId::Monologue),
+                extra_idx: None,
+                lane: None,
+                global_step: 1,
+            },
+            &p,
+        );
+        rt.step = 1;
+        rt.trigger_step(&p, false, false, &mut tel);
+        assert_eq!(rt.last_mono_note, Some(60), "Monologue step 1 should be suppressed");
+        assert_eq!(rt.last_moog_note, Some(43), "Moog step 1 should still trigger normally");
+
+        // Next loop wrap (step 17 = step 1) should trigger Monologue 64 normally
+        rt.step = 17;
+        rt.trigger_step(&p, false, false, &mut tel);
+        assert_eq!(rt.last_mono_note, Some(64));
+    }
+
+    #[test]
+    fn pattern_length_16_and_32_loop_at_step_count() {
+        use crate::model::{FactoryPreset, StepCount};
+
+        let mut p = Project::factory(FactoryPreset::BlankInit);
+        p.party_mode = false;
+        {
+            let pat = p.current_pattern_mut();
+            pat.monologue.step_count = StepCount::Steps16;
+            pat.monologue.steps[0].active = true;
+            pat.monologue.steps[0].note = 60;
+            pat.monologue.steps[16].active = true;
+            pat.monologue.steps[16].note = 67;
+        }
+
+        let mut rt = Runtime::new(44_100.0);
+        let mut tel = EngineTelemetry::default();
+        rt.step = 16;
+        rt.trigger_step(&p, false, false, &mut tel);
+        assert_eq!(rt.last_mono_note, Some(60), "16-step pattern should wrap step 16 to step 0");
+
+        p.current_pattern_mut().monologue.step_count = StepCount::Steps32;
+        rt.step = 16;
+        rt.trigger_step(&p, false, false, &mut tel);
+        assert_eq!(rt.last_mono_note, Some(67), "32-step pattern should play step 16");
+
+        rt.step = 32;
+        rt.trigger_step(&p, false, false, &mut tel);
+        assert_eq!(rt.last_mono_note, Some(60), "32-step pattern should wrap step 32 to step 0");
     }
 }
