@@ -6,7 +6,7 @@ use crate::{
     },
     engine::{export_stems, export_wav, AudioEngine, EngineTelemetry, LiveEvent},
     mic::MicRecorder,
-    midi::{MidiManager, MidiMsg},
+    midi::{export_project_midi, MidiManager, MidiMsg},
     model::{
         apply_extra_track_preset, apply_philharmonia_instrument, apply_vibe_to_project,
         apply_voice_preset, auto_arrange_project_song, build_auto_chord_pads,
@@ -14,11 +14,11 @@ use crate::{
         generate_extra_track_seq, generate_melodic_tracks, generate_philharmonia_track_seq,
         load_pattern, load_project, note_name, root_name, save_pattern, save_project,
         voice_preset_category, voice_preset_names, ArpMode, ArpRate, AutoChordPad, ChordType,
-        DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack, FilterEnvTrigger,
-        GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MonologueOscWave, MoogWave,
-        Osc2ModMode, PartyMixMode, PartyPace, Project, SamplerMode, SavedSample, Scale,
-        SongSection, StepCount, SynthEngine, Tb303Wave, TrackFilterParams, TrackId, Vibe,
-        MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
+        ClockDiv, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack, FilterEnvTrigger,
+        GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MidiCcMapping, MidiCcTarget,
+        MonologueOscWave, MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project, SamplerMode,
+        SavedSample, Scale, SongSection, StepCount, SynthEngine, Tb303Wave, TrackFilterParams,
+        TrackId, Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
         restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
@@ -117,6 +117,13 @@ pub struct FunKeySynthApp {
     redo_stack: Vec<Project>,
     drag_base_proj: Option<Project>,
     undo_action_this_frame: bool,
+    seq_euclid_hits: usize,
+    seq_euclid_rot: usize,
+    selected_drum_lane: usize,
+    midi_learn_target: Option<MidiCcTarget>,
+    midi_bend_val: f32,
+    midi_aftertouch_val: f32,
+    last_midi_cc: Option<(u8, f32)>,
 }
 
 fn key_pressed_no_repeat(i: &egui::InputState, key: Key) -> bool {
@@ -280,6 +287,13 @@ impl FunKeySynthApp {
             redo_stack: Vec::with_capacity(32),
             drag_base_proj: None,
             undo_action_this_frame: false,
+            seq_euclid_hits: 5,
+            seq_euclid_rot: 0,
+            selected_drum_lane: 0,
+            midi_learn_target: None,
+            midi_bend_val: 0.0,
+            midi_aftertouch_val: 0.0,
+            last_midi_cc: None,
         }
     }
 
@@ -1253,41 +1267,177 @@ impl FunKeySynthApp {
                     }
                     self.release_held_note(ctx, p, held, playing);
                 }
-                MidiMsg::Cc { cc, value } => match cc {
-                    1 | 74 => {
-                        p.fx.global_filter_cutoff = 120.0 * (18_000.0_f32 / 120.0).powf(value);
-                        if self.rec_motion && playing {
-                            p.current_pattern_mut().motion.filter[cur_step % 64] = Some(value);
+                MidiMsg::Cc { cc, value } => {
+                    self.last_midi_cc = Some((cc, value));
+                    if let Some(learn_tgt) = self.midi_learn_target.take() {
+                        p.midi.cc_mappings.retain(|m| m.cc != cc);
+                        p.midi.cc_mappings.push(MidiCcMapping { cc, target: learn_tgt });
+                        self.set_toast(ctx, format!("MIDI Learn: CC {cc} → {}", learn_tgt.name()));
+                    }
+                    let mut matched = false;
+                    let mapped_targets: Vec<MidiCcTarget> = p
+                        .midi
+                        .cc_mappings
+                        .iter()
+                        .filter(|m| m.cc == cc)
+                        .map(|m| m.target)
+                        .collect();
+                    for tgt in mapped_targets {
+                        matched = true;
+                        self.apply_midi_cc_target(p, tgt, value, playing, cur_step);
+                    }
+                    if !matched && cc == 11 {
+                        self.apply_midi_cc_target(
+                            p,
+                            MidiCcTarget::TrackCutoff,
+                            value,
+                            playing,
+                            cur_step,
+                        );
+                    }
+                }
+                MidiMsg::PitchBend { bend } => {
+                    self.midi_bend_val = bend;
+                    let semi = bend * (p.midi.pitch_bend_range.clamp(1, 12) as f32);
+                    self.engine.send_live(LiveEvent::SetMidiExpression {
+                        bend_semi: semi,
+                        aftertouch: self.midi_aftertouch_val,
+                    });
+                }
+                MidiMsg::Aftertouch { pressure } => {
+                    self.midi_aftertouch_val = pressure;
+                    let semi = self.midi_bend_val * (p.midi.pitch_bend_range.clamp(1, 12) as f32);
+                    self.engine.send_live(LiveEvent::SetMidiExpression {
+                        bend_semi: semi,
+                        aftertouch: pressure,
+                    });
+                }
+            }
+        }
+    }
+
+    fn apply_midi_cc_target(
+        &mut self,
+        p: &mut Project,
+        target: MidiCcTarget,
+        value: f32,
+        playing: bool,
+        cur_step: usize,
+    ) {
+        let v = value.clamp(0.0, 1.0);
+        match target {
+            MidiCcTarget::MasterFilter => {
+                p.fx.global_filter_cutoff = 120.0 * (18_000.0_f32 / 120.0).powf(v);
+                if self.rec_motion && playing {
+                    p.current_pattern_mut().motion.filter[cur_step % 64] = Some(v);
+                }
+            }
+            MidiCcTarget::MasterResonance => {
+                p.fx.global_filter_resonance = v * 0.85;
+                p.tb303.resonance = (v * 0.92).clamp(0.1, 0.94);
+            }
+            MidiCcTarget::ReverbSpace => {
+                p.fx.reverb_mix = v;
+                p.fx.delay_mix = (v * 0.92).min(0.85);
+                if self.rec_motion && playing {
+                    p.current_pattern_mut().motion.space[cur_step % 64] = Some(v);
+                }
+            }
+            MidiCcTarget::DelayMix => {
+                p.fx.delay_enabled = true;
+                p.fx.delay_mix = v.min(0.90);
+            }
+            MidiCcTarget::MasterVolume => {
+                p.mixer.master_volume = (v * 1.15).clamp(0.0, 1.15);
+            }
+            MidiCcTarget::SidechainPump => {
+                p.sidechain_amount = v;
+                if self.rec_motion && playing {
+                    p.current_pattern_mut().motion.sidechain[cur_step % 64] = Some(v);
+                }
+            }
+            MidiCcTarget::BeatEnergy => {
+                p.beat_energy = 0.1 + v * 0.9;
+            }
+            MidiCcTarget::TrackVolume => {
+                let vol = (v * 1.35).clamp(0.0, 1.35);
+                if let Some(ei) = self.selected_extra {
+                    if let Some(et) = p.extra_tracks.get_mut(ei) {
+                        et.volume = vol;
+                    }
+                } else if self.selected_track == TrackId::MoogPad {
+                    p.mixer.moog_pad_volume = vol;
+                } else {
+                    p.mixer.channels[self.selected_track.index()].volume = vol;
+                }
+            }
+            MidiCcTarget::TrackCutoff => {
+                let hz = 45.0 * (16_000.0_f32 / 45.0).powf(v);
+                if let Some(ei) = self.selected_extra {
+                    if let Some(et) = p.extra_tracks.get_mut(ei) {
+                        et.synth.cutoff = hz;
+                    }
+                } else {
+                    match self.selected_track {
+                        TrackId::Moog => p.moog.cutoff = hz,
+                        TrackId::MoogPad => p.moog_pad.cutoff = hz,
+                        TrackId::Monologue => p.monologue.cutoff = hz,
+                        TrackId::Tb303 => p.tb303.cutoff = hz.clamp(80.0, 6000.0),
+                        TrackId::Sampler => {
+                            p.sampler.filter_enabled = true;
+                            p.sampler.cutoff = hz.clamp(150.0, 18_000.0);
                         }
+                        TrackId::Drums | TrackId::MidiOut => {}
                     }
-                    71 => {
-                        p.fx.global_filter_resonance = value * 0.85;
-                        p.tb303.resonance = (value * 0.92).clamp(0.1, 0.94);
+                }
+            }
+            MidiCcTarget::TrackResonance => {
+                let r = (v * 0.94).clamp(0.0, 0.94);
+                if let Some(ei) = self.selected_extra {
+                    if let Some(et) = p.extra_tracks.get_mut(ei) {
+                        et.synth.resonance = r;
                     }
-                    91 => {
-                        p.fx.reverb_mix = value;
-                        p.fx.delay_mix = (value * 0.92).min(0.85);
-                        if self.rec_motion && playing {
-                            p.current_pattern_mut().motion.space[cur_step % 64] = Some(value);
+                } else {
+                    match self.selected_track {
+                        TrackId::Moog => p.moog.resonance = r,
+                        TrackId::MoogPad => p.moog_pad.resonance = r,
+                        TrackId::Monologue => p.monologue.resonance = r,
+                        TrackId::Tb303 => p.tb303.resonance = r,
+                        TrackId::Sampler => {
+                            p.sampler.filter_enabled = true;
+                            p.sampler.resonance = r.min(0.88);
                         }
+                        TrackId::Drums | TrackId::MidiOut => {}
                     }
-                    7 => {
-                        p.mixer.master_volume = (value * 1.15).clamp(0.0, 1.15);
+                }
+            }
+            MidiCcTarget::TrackDrive => {
+                if let Some(ei) = self.selected_extra {
+                    if let Some(et) = p.extra_tracks.get_mut(ei) {
+                        et.synth.drive = v;
                     }
-                    16 => {
-                        p.sampler_iso_bass = value * 2.0;
-                        if self.rec_motion && playing {
-                            p.current_pattern_mut().motion.iso_bass[cur_step % 64] = Some(value * 2.0);
-                        }
+                } else {
+                    match self.selected_track {
+                        TrackId::Moog => p.moog.drive = v,
+                        TrackId::MoogPad => p.moog_pad.drive = v,
+                        TrackId::Monologue => p.monologue.drive = v,
+                        TrackId::Tb303 => p.tb303.overdrive = v,
+                        TrackId::Sampler => p.sampler.bit_crush = v * 0.85,
+                        TrackId::Drums | TrackId::MidiOut => {}
                     }
-                    17 => {
-                        p.sampler_iso_treble = value * 2.0;
-                        if self.rec_motion && playing {
-                            p.current_pattern_mut().motion.iso_treble[cur_step % 64] = Some(value * 2.0);
-                        }
-                    }
-                    _ => {}
-                },
+                }
+            }
+            MidiCcTarget::IsoBass => {
+                p.sampler_iso_bass = v * 2.0;
+                if self.rec_motion && playing {
+                    p.current_pattern_mut().motion.iso_bass[cur_step % 64] = Some(v * 2.0);
+                }
+            }
+            MidiCcTarget::IsoTreble => {
+                p.sampler_iso_treble = v * 2.0;
+                if self.rec_motion && playing {
+                    p.current_pattern_mut().motion.iso_treble[cur_step % 64] = Some(v * 2.0);
+                }
             }
         }
     }
@@ -1619,6 +1769,7 @@ impl eframe::App for FunKeySynthApp {
 enum TopUtilItem {
     Prefs,
     Update,
+    MidiFile,
     Stems,
     Wav,
     Load,
@@ -1677,9 +1828,10 @@ impl FunKeySynthApp {
     }
 
     fn ui_top_utils(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, proj: &mut Project, rtl: bool) {
-        const ITEMS: [TopUtilItem; 10] = [
+        const ITEMS: [TopUtilItem; 11] = [
             TopUtilItem::Prefs,
             TopUtilItem::Update,
+            TopUtilItem::MidiFile,
             TopUtilItem::Stems,
             TopUtilItem::Wav,
             TopUtilItem::Load,
@@ -1792,6 +1944,24 @@ impl FunKeySynthApp {
                         _ => {}
                     }
                 }
+                TopUtilItem::MidiFile => {
+                    if ui
+                        .button("MID")
+                        .on_hover_text("Export Pattern or full Song Arrangement as a multi-track Standard MIDI (.mid) file")
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_file_name(format!("{}.mid", proj.vibe.name().to_lowercase().replace(' ', "_")))
+                            .add_filter("Standard MIDI", &["mid", "midi"])
+                            .save_file()
+                        {
+                            match export_project_midi(proj, &path) {
+                                Ok(()) => self.set_toast(ctx, "Exported Standard MIDI (.mid) tracks!"),
+                                Err(e) => self.set_toast(ctx, format!("MIDI export error: {e}")),
+                            }
+                        }
+                    }
+                }
                 TopUtilItem::Stems => {
                     if ui
                         .button("Stems")
@@ -1878,15 +2048,18 @@ impl FunKeySynthApp {
                     ui.separator();
                 }
                 TopUtilItem::Midi => {
-                    let midi_lbl = if let Some(ref name) = self.midi.connected_name {
+                    let midi_lbl = if let Some(tgt) = self.midi_learn_target {
+                        format!("LEARN: {}", tgt.name().chars().take(7).collect::<String>())
+                    } else if let Some(ref name) = self.midi.connected_name {
                         format!("MIDI: {}", name.chars().take(10).collect::<String>())
                     } else {
                         "MIDI".to_string()
                     };
                     egui::ComboBox::from_id_salt("midi_port_combo")
-                        .width(92.0)
+                        .width(102.0)
                         .selected_text(midi_lbl)
                         .show_ui(ui, |ui| {
+                            ui.set_min_width(250.0);
                             if ui.button("Rescan MIDI Devices").clicked() {
                                 self.midi.refresh_ports();
                             }
@@ -1902,6 +2075,52 @@ impl FunKeySynthApp {
                                         Err(e) => self.set_toast(ctx, e),
                                     }
                                 }
+                            }
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Pitch Bend:").size(11.0));
+                                let mut pb = proj.midi.pitch_bend_range.clamp(1, 12);
+                                if ui.add(egui::DragValue::new(&mut pb).range(1..=12).suffix(" st")).changed() {
+                                    proj.midi.pitch_bend_range = pb;
+                                }
+                                if let Some((lcc, lval)) = self.last_midi_cc {
+                                    ui.label(RichText::new(format!("Last CC{lcc}={:.0}%", lval * 100.0)).size(10.5).weak());
+                                }
+                            });
+                            ui.label(RichText::new("MIDI CC Learn (click target then twist knob):").size(11.0).strong());
+                            for &tgt in &MidiCcTarget::ALL {
+                                let mapped_ccs: Vec<u8> = proj
+                                    .midi
+                                    .cc_mappings
+                                    .iter()
+                                    .filter(|m| m.target == tgt)
+                                    .map(|m| m.cc)
+                                    .collect();
+                                let cc_str = if mapped_ccs.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    mapped_ccs
+                                        .iter()
+                                        .map(|c| format!("CC{c}"))
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                };
+                                let is_learning = self.midi_learn_target == Some(tgt);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(tgt.name()).size(11.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui
+                                            .selectable_label(
+                                                is_learning,
+                                                if is_learning { "Listening…" } else { "Learn" },
+                                            )
+                                            .clicked()
+                                        {
+                                            self.midi_learn_target = if is_learning { None } else { Some(tgt) };
+                                        }
+                                        ui.label(RichText::new(cc_str).size(10.5).weak());
+                                    });
+                                });
                             }
                         });
                 }
@@ -4058,6 +4277,37 @@ impl FunKeySynthApp {
                         format!("Copied Bar {} to rest across all tracks", self.bar_page + 1),
                     );
                 }
+                if self.selected_extra.is_some() || !matches!(self.selected_track, TrackId::Drums | TrackId::Sampler) {
+                    ui.separator();
+                    ui.label(RichText::new("Div:").size(11.0).weak());
+                    let cur_div = if let Some(ei) = self.selected_extra {
+                        proj.current_pattern()
+                            .extra_seqs
+                            .get(ei)
+                            .map(|s| s.clock_div)
+                            .unwrap_or(ClockDiv::Sixteenth)
+                    } else {
+                        proj.current_pattern()
+                            .melodic(self.selected_track)
+                            .map(|s| s.clock_div)
+                            .unwrap_or(ClockDiv::Sixteenth)
+                    };
+                    for &dv in &ClockDiv::ALL {
+                        if ui
+                            .selectable_label(cur_div == dv, dv.label())
+                            .on_hover_text("Track step clock rate (1/8 half-time, 1/16 normal, 1/32 double-time)")
+                            .clicked()
+                        {
+                            if let Some(ei) = self.selected_extra {
+                                if let Some(seq) = proj.current_pattern_mut().extra_seqs.get_mut(ei) {
+                                    seq.clock_div = dv;
+                                }
+                            } else if let Some(seq) = proj.current_pattern_mut().melodic_mut(self.selected_track) {
+                                seq.clock_div = dv;
+                            }
+                        }
+                    }
+                }
             });
 
             // Row 2b: Per-Instrument Record Bar + Track Contextual Controls
@@ -4170,6 +4420,131 @@ impl FunKeySynthApp {
                 }
             });
 
+            // Row 2c: Lane ClockDiv / Euclidean / Transform / Humanize Tools
+            if self.selected_extra.is_none() && self.selected_track == TrackId::Drums {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    let dl = self.selected_drum_lane.min(7);
+                    let dl_name = DrumVoiceId::from_index(dl)
+                        .map(|d| d.short_name_for_model(proj.drums.voices[dl].model))
+                        .unwrap_or("KICK");
+                    ui.label(RichText::new(format!("Lane {dl_name}:")).size(11.0).color(tc));
+                    let lane_div = proj.current_pattern().drums.lanes[dl].clock_div;
+                    for &dv in &ClockDiv::ALL {
+                        if ui
+                            .selectable_label(lane_div == dv, dv.label())
+                            .on_hover_text("Clock division for selected drum lane")
+                            .clicked()
+                        {
+                            proj.auto_beat_mode = false;
+                            proj.current_pattern_mut().drums.lanes[dl].clock_div = dv;
+                        }
+                    }
+                    let max_e = proj.current_pattern().drums.lanes[dl].effective_len().min(32).max(1);
+                    self.seq_euclid_hits = self.seq_euclid_hits.clamp(1, max_e);
+                    self.seq_euclid_rot = self.seq_euclid_rot.min(max_e.saturating_sub(1));
+                    ui.add(egui::DragValue::new(&mut self.seq_euclid_hits).range(1..=max_e).prefix("H:"));
+                    ui.add(egui::DragValue::new(&mut self.seq_euclid_rot).range(0..=max_e.saturating_sub(1)).prefix("R:"));
+                    if ui.small_button("Euclid").on_hover_text("Fill selected drum lane with an even Euclidean rhythm").clicked() {
+                        proj.auto_beat_mode = false;
+                        proj.current_pattern_mut().drums.lanes[dl]
+                            .fill_euclidean(self.seq_euclid_hits, self.seq_euclid_rot);
+                    }
+                    if ui.small_button("Humanize").on_hover_text("Add subtle organic velocity feel to this drum lane").clicked() {
+                        proj.auto_beat_mode = false;
+                        let seed = self.next_seed();
+                        proj.current_pattern_mut().drums.lanes[dl].humanize_velocities(seed, 0.14);
+                    }
+                });
+            } else if self.selected_extra.is_some()
+                || !matches!(self.selected_track, TrackId::Drums | TrackId::Sampler)
+            {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    let target = self.selected_track;
+                    let extra_sel = self.selected_extra;
+                    let root_note = proj.root_note;
+                    let scale = proj.scale;
+                    let next_seed = self.next_seed();
+                    let seq_len = if let Some(ei) = extra_sel {
+                        proj.current_pattern()
+                            .extra_seqs
+                            .get(ei)
+                            .map(|s| s.step_count.as_usize())
+                            .unwrap_or(16)
+                    } else {
+                        proj.current_pattern()
+                            .melodic(target)
+                            .map(|s| s.step_count.as_usize())
+                            .unwrap_or(16)
+                    }
+                    .min(32)
+                    .max(1);
+                    self.seq_euclid_hits = self.seq_euclid_hits.clamp(1, seq_len);
+                    self.seq_euclid_rot = self.seq_euclid_rot.min(seq_len.saturating_sub(1));
+                    let base_oct = match target {
+                        TrackId::Moog => 2,
+                        TrackId::Tb303 => 3,
+                        _ => 4,
+                    };
+                    let mut op: Option<u8> = None;
+                    if ui.small_button("◀").on_hover_text("Rotate steps left by 1").clicked() {
+                        op = Some(1);
+                    }
+                    if ui.small_button("▶").on_hover_text("Rotate steps right by 1").clicked() {
+                        op = Some(2);
+                    }
+                    if ui.small_button("-1").on_hover_text("Transpose pattern -1 semitone in scale").clicked() {
+                        op = Some(3);
+                    }
+                    if ui.small_button("+1").on_hover_text("Transpose pattern +1 semitone in scale").clicked() {
+                        op = Some(4);
+                    }
+                    if ui.small_button("-12").on_hover_text("Shift pattern down 1 octave").clicked() {
+                        op = Some(5);
+                    }
+                    if ui.small_button("+12").on_hover_text("Shift pattern up 1 octave").clicked() {
+                        op = Some(6);
+                    }
+                    if ui.small_button("Humanize").on_hover_text("Add natural groove velocity variation").clicked() {
+                        op = Some(7);
+                    }
+                    ui.add(egui::DragValue::new(&mut self.seq_euclid_hits).range(1..=seq_len).prefix("H:"));
+                    ui.add(egui::DragValue::new(&mut self.seq_euclid_rot).range(0..=seq_len.saturating_sub(1)).prefix("R:"));
+                    if ui.small_button("Euclid").on_hover_text("Generate Euclidean melody in current Key & Scale").clicked() {
+                        op = Some(8);
+                    }
+                    if let Some(code) = op {
+                        let pat = proj.current_pattern_mut();
+                        let seq_opt = if let Some(ei) = extra_sel {
+                            pat.extra_seqs.get_mut(ei)
+                        } else {
+                            pat.melodic_mut(target)
+                        };
+                        if let Some(seq) = seq_opt {
+                            match code {
+                                1 => seq.shift(-1),
+                                2 => seq.shift(1),
+                                3 => seq.transpose(-1, root_note, scale, true),
+                                4 => seq.transpose(1, root_note, scale, true),
+                                5 => seq.transpose(-12, root_note, scale, false),
+                                6 => seq.transpose(12, root_note, scale, false),
+                                7 => seq.humanize_velocities(next_seed, 0.14),
+                                8 => seq.fill_euclidean(
+                                    self.seq_euclid_hits,
+                                    self.seq_euclid_rot,
+                                    root_note,
+                                    scale,
+                                    base_oct,
+                                    next_seed,
+                                ),
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            }
+
             ui.add_space(4.0);
             let f_params = track_filter_mut(proj, self.selected_track, self.selected_extra);
             ui_instrument_filter_bar(ui, f_params, tc, theme);
@@ -4219,9 +4594,13 @@ impl FunKeySynthApp {
 
                         let lbl_resp = ui
                             .add(lbl_btn)
-                            .on_hover_text(format!("{v_full} — Left-click: Mute/Unmute  •  Right-click: Tune, 808/909 & Fill options"));
+                            .on_hover_text(format!("{v_full} — Left-click: Mute/Select Lane  •  Right-click: Tune, 808/909 & Fill options"));
                         if lbl_resp.clicked() {
+                            self.selected_drum_lane = lane_idx;
                             proj.drums.voices[lane_idx].mute = !proj.drums.voices[lane_idx].mute;
+                        }
+                        if lbl_resp.secondary_clicked() {
+                            self.selected_drum_lane = lane_idx;
                         }
                         lbl_resp.context_menu(|ui| {
                             ui.set_min_width(220.0);
@@ -4377,14 +4756,33 @@ impl FunKeySynthApp {
                                     }
                                 });
                                 ui.checkbox(&mut st.accent, "Accent");
+                                ui.checkbox(&mut st.flam, "Flam");
                                 ui.add(egui::Slider::new(&mut st.velocity, 0.1..=1.0).text("Vel").max_decimals(2));
+                                let mut prob_pct = (st.probability * 100.0).round();
+                                if ui.add(egui::Slider::new(&mut prob_pct, 10.0..=100.0).suffix("%").text("Prob").max_decimals(0)).changed() {
+                                    st.probability = (prob_pct / 100.0).clamp(0.1, 1.0);
+                                    st.active = true;
+                                }
                                 if ui.small_button("Reset Step FX").clicked() {
                                     st.clear_step_fx();
                                     st.ratchet = 1;
+                                    st.flam = false;
+                                    st.probability = 1.0;
                                 }
                             });
                             let painter = ui.painter();
                             painter.rect_filled(rect, Rounding::same(4.0), fill);
+                            if st.active && st.probability < 0.999 {
+                                let w = rect.width() * st.probability.clamp(0.1, 1.0);
+                                painter.rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(rect.min.x + 1.0, rect.max.y - 3.0),
+                                        egui::pos2((rect.min.x + w - 1.0).max(rect.min.x + 3.0), rect.max.y - 1.0),
+                                    ),
+                                    Rounding::same(1.0),
+                                    Color32::from_rgb(76, 218, 255),
+                                );
+                            }
                             if is_rec_col {
                                 painter.rect_stroke(
                                     rect,
@@ -4392,9 +4790,11 @@ impl FunKeySynthApp {
                                     Stroke::new(2.0_f32, Color32::from_rgb(245, 72, 86)),
                                 );
                             }
-                            if st.active && (st.ratchet > 1 || st.has_step_fx()) {
+                            if st.active && (st.ratchet > 1 || st.has_step_fx() || st.flam) {
                                 let b = if st.ratchet > 1 {
                                     format!("{}x", st.ratchet)
+                                } else if st.flam {
+                                    "f".to_string()
                                 } else {
                                     "*".to_string()
                                 };
@@ -4618,17 +5018,95 @@ impl FunKeySynthApp {
                                         note_name(st.note)
                                     };
                                     painter.text(
-                                        rect.center() + Vec2::new(0.0, 5.0),
+                                        rect.center() + Vec2::new(0.0, 3.0),
                                         egui::Align2::CENTER_CENTER,
                                         label,
                                         egui::FontId::proportional(11.5),
                                         Color32::from_rgb(12, 15, 22),
                                     );
+                                    // Velocity bottom fill bar + micro-badges (prob / lock / slide)
+                                    let v_w = (rect.width() - 8.0) * st.velocity.clamp(0.1, 1.0);
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(rect.min.x + 4.0, rect.max.y - 5.0),
+                                            egui::pos2(rect.min.x + 4.0 + v_w, rect.max.y - 2.5),
+                                        ),
+                                        Rounding::same(1.5),
+                                        if st.accent {
+                                            Color32::from_rgb(255, 214, 96)
+                                        } else {
+                                            Color32::from_rgb(18, 22, 32)
+                                        },
+                                    );
+                                    let mut dot_x = rect.max.x - 6.0;
+                                    if st.motion.any_locked() {
+                                        painter.circle_filled(
+                                            egui::pos2(dot_x, rect.min.y + 6.0),
+                                            2.5,
+                                            Color32::from_rgb(255, 118, 210),
+                                        );
+                                        dot_x -= 6.5;
+                                    }
+                                    if st.probability < 0.999 {
+                                        painter.circle_filled(
+                                            egui::pos2(dot_x, rect.min.y + 6.0),
+                                            2.5,
+                                            Color32::from_rgb(64, 226, 255),
+                                        );
+                                        dot_x -= 6.5;
+                                    }
+                                    if st.slide {
+                                        painter.circle_filled(
+                                            egui::pos2(dot_x, rect.min.y + 6.0),
+                                            2.5,
+                                            Color32::from_rgb(14, 18, 28),
+                                        );
+                                    }
                                 }
                             }
                         });
                         ui.add_space(6.0);
                     }
+
+                    // Interactive 16-Step Velocity Paint Lane
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let bar_w = ((ui.available_width() - 15.0 * 3.0) / 16.0).clamp(12.0, 56.0);
+                        for col in 0..16 {
+                            let idx = (page_start + col) % len;
+                            let st = &mut seq.steps[idx];
+                            let (vrect, vresp) = ui.allocate_exact_size(
+                                Vec2::new(bar_w, 22.0),
+                                Sense::click_and_drag(),
+                            );
+                            if let Some(pos) = vresp.interact_pointer_pos() {
+                                let norm = ((vrect.max.y - pos.y) / vrect.height()).clamp(0.10, 1.0);
+                                st.velocity = norm;
+                                self.selected_step = idx;
+                            }
+                            let pnt = ui.painter();
+                            pnt.rect_filled(vrect, Rounding::same(2.0), Color32::from_rgb(18, 22, 32));
+                            let fill_h = (vrect.height() - 2.0) * st.velocity.clamp(0.1, 1.0);
+                            let bar_col = if st.active {
+                                if idx == self.selected_step % len {
+                                    Color32::WHITE
+                                } else {
+                                    tc.gamma_multiply(0.85)
+                                }
+                            } else {
+                                Color32::from_rgb(48, 56, 74)
+                            };
+                            pnt.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(vrect.min.x + 1.0, vrect.max.y - 1.0 - fill_h),
+                                    egui::pos2(vrect.max.x - 1.0, vrect.max.y - 1.0),
+                                ),
+                                Rounding::same(1.5),
+                                bar_col,
+                            );
+                        }
+                    });
+                    ui.add_space(4.0);
 
                     // Clean Step Inspector (right-click any step to inspect without toggling!)
                     let sel_idx = self.selected_step % len;
@@ -4657,24 +5135,39 @@ impl FunKeySynthApp {
                             });
                         ui.add(egui::Slider::new(&mut st.velocity, 0.1..=1.0).text("Vel").max_decimals(2));
                         ui.add(egui::Slider::new(&mut st.gate, 0.25..=16.0).text("Len").max_decimals(1));
+                        let mut prob_pct = (st.probability * 100.0).round();
+                        if ui.add(egui::Slider::new(&mut prob_pct, 10.0..=100.0).suffix("%").text("Prob").max_decimals(0)).changed() {
+                            st.probability = (prob_pct / 100.0).clamp(0.1, 1.0);
+                            st.active = true;
+                        }
                         ui.checkbox(&mut st.accent, "Acc");
                         ui.checkbox(&mut st.slide, "Slide");
-                        // Per-Step Filter / Res P-Locks for Synths!
+                        // Per-Step P-Locks (Filter / Res / Drive / Shape) for Synths!
                         let mut c_val = st.motion.cutoff.unwrap_or(0.6);
-                        if ui.add(egui::Slider::new(&mut c_val, 0.0..=1.0).text("Filt Lock").max_decimals(2)).changed() {
+                        if ui.add(egui::Slider::new(&mut c_val, 0.0..=1.0).text("Filt").max_decimals(2)).changed() {
                             st.motion.cutoff = Some(c_val);
                             st.active = true;
                         }
                         let mut r_val = st.motion.resonance.unwrap_or(0.3);
-                        if ui.add(egui::Slider::new(&mut r_val, 0.0..=1.0).text("Res Lock").max_decimals(2)).changed() {
+                        if ui.add(egui::Slider::new(&mut r_val, 0.0..=1.0).text("Res").max_decimals(2)).changed() {
                             st.motion.resonance = Some(r_val);
+                            st.active = true;
+                        }
+                        let mut d_val = st.motion.drive.unwrap_or(0.3);
+                        if ui.add(egui::Slider::new(&mut d_val, 0.0..=1.0).text("Drive").max_decimals(2)).changed() {
+                            st.motion.drive = Some(d_val);
+                            st.active = true;
+                        }
+                        let mut s_val = st.motion.shape.unwrap_or(0.5);
+                        if ui.add(egui::Slider::new(&mut s_val, 0.0..=1.0).text("Shape").max_decimals(2)).changed() {
+                            st.motion.shape = Some(s_val);
                             st.active = true;
                         }
                         if st.motion.any_locked() && ui.small_button("Clr Lock").clicked() {
                             st.motion.clear();
                         }
                     });
-                    ui.label(RichText::new("Left-click = toggle step  •  Right-click = select step to edit").size(10.5).weak());
+                    ui.label(RichText::new("Left-click = toggle step  •  Right-click = select step  •  Drag velocity strip below pads").size(10.5).weak());
                 }
             }
         });
@@ -5467,6 +5960,15 @@ impl FunKeySynthApp {
                 {
                     proj.party_mode = false;
                 }
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("Total: {total_bars} bars ({mins}:{secs:02})"))
+                        .size(11.5)
+                        .weak(),
+                );
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
                 let auto_btn = egui::Button::new(
                     RichText::new("Auto-Arrange Loop → Song")
                         .strong()
@@ -5515,12 +6017,22 @@ impl FunKeySynthApp {
                 if ui.button("Reset Default").clicked() {
                     proj.song_sections = crate::model::default_vibe_sections(proj.active_pattern);
                 }
-                ui.separator();
-                ui.label(
-                    RichText::new(format!("Total: {total_bars} bars ({mins}:{secs:02})"))
-                        .size(11.5)
-                        .weak(),
-                );
+                if ui
+                    .button("Export .MID")
+                    .on_hover_text("Export arranged sections / active pattern as a multi-track Standard MIDI (.mid) file")
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name(format!("{}_song.mid", proj.vibe.name().to_lowercase().replace(' ', "_")))
+                        .add_filter("Standard MIDI", &["mid", "midi"])
+                        .save_file()
+                    {
+                        match export_project_midi(proj, &path) {
+                            Ok(()) => self.set_toast(ui.ctx(), "Exported Standard MIDI (.mid) tracks!"),
+                            Err(e) => self.set_toast(ui.ctx(), format!("MIDI export error: {e}")),
+                        }
+                    }
+                }
             });
 
             ui.add_space(8.0);
@@ -6548,31 +7060,186 @@ impl FunKeySynthApp {
                 ui.add_space(8.0);
 
                 card_frame(ui, theme, |ui| {
-                    ui.label(RichText::new("STEREO MIXER & SENDS").strong().size(13.0).color(accent));
-                    ui.add_space(4.0);
-                    ui.spacing_mut().slider_width = 72.0;
-                    egui::Grid::new("stereo_mix_grid").striped(true).show(ui, |ui| {
-                        ui.strong("Track");
-                        ui.strong("Pan");
-                        ui.strong("Delay");
-                        ui.strong("Reverb");
-                        ui.end_row();
-
-                        for &track in &TrackId::STUDIO_TRACKS {
-                            ui.label(RichText::new(track.role_name()).strong().color(track_color(track)));
-                            if track == TrackId::MoogPad {
-                                ui.label(RichText::new("Wide").weak());
-                                ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_delay_send, 0.0..=1.0).show_value(false));
-                                ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_reverb_send, 0.0..=1.0).show_value(false));
-                            } else {
-                                let ch = &mut proj.mixer.channels[track.index()];
-                                ui.add(egui::Slider::new(&mut ch.pan, -1.0..=1.0).show_value(false));
-                                ui.add(egui::Slider::new(&mut ch.delay_send, 0.0..=1.0).show_value(false));
-                                ui.add(egui::Slider::new(&mut ch.reverb_send, 0.0..=1.0).show_value(false));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("STEREO CONSOLE & METERS").strong().size(13.0).color(accent));
+                        ui.separator();
+                        let mono_btn = egui::Button::new(
+                            RichText::new(if proj.mixer.mono_sub { "MONO SUB ON" } else { "Mono Sub <120Hz" })
+                                .size(10.5)
+                                .strong(),
+                        )
+                        .fill(if proj.mixer.mono_sub {
+                            Color32::from_rgb(64, 188, 255)
+                        } else {
+                            Color32::from_rgb(36, 42, 58)
+                        });
+                        if ui
+                            .add(mono_btn)
+                            .on_hover_text("Sum master frequencies below 120 Hz to pure mono for club/PA tight sub bass")
+                            .clicked()
+                        {
+                            proj.mixer.mono_sub = !proj.mixer.mono_sub;
+                        }
+                        if ui.small_button("Reset Pan/Width").clicked() {
+                            for ch in &mut proj.mixer.channels {
+                                ch.pan = 0.0;
+                                ch.width = 1.0;
                             }
-                            ui.end_row();
+                            proj.mixer.moog_pad_width = 1.0;
+                            for tr in &mut proj.extra_tracks {
+                                tr.pan = 0.0;
+                                tr.width = 1.0;
+                            }
                         }
                     });
+                    // Master L/R Peak Readout
+                    let pk = tel.peak_l.max(tel.peak_r);
+                    let db = if pk > 0.0001 {
+                        20.0 * pk.log10()
+                    } else {
+                        -60.0
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("Master Peak: {db:.1} dBFS")).size(10.5).weak());
+                        let (mrect, _) = ui.allocate_exact_size(Vec2::new(110.0, 8.0), Sense::hover());
+                        let pnt = ui.painter();
+                        pnt.rect_filled(mrect, Rounding::same(3.0), Color32::from_rgb(20, 24, 34));
+                        let mw = mrect.width() * pk.clamp(0.0, 1.0);
+                        let mcol = if pk > 0.92 {
+                            Color32::from_rgb(245, 76, 86)
+                        } else if pk > 0.72 {
+                            Color32::from_rgb(255, 198, 66)
+                        } else {
+                            Color32::from_rgb(72, 224, 148)
+                        };
+                        pnt.rect_filled(
+                            egui::Rect::from_min_size(mrect.min, Vec2::new(mw, mrect.height())),
+                            Rounding::same(3.0),
+                            mcol,
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.spacing_mut().slider_width = 52.0;
+                    egui::ScrollArea::horizontal()
+                        .id_salt("console_mix_scroll")
+                        .show(ui, |ui| {
+                            egui::Grid::new("stereo_mix_grid").striped(true).show(ui, |ui| {
+                                ui.strong("Track");
+                                ui.strong("M/S");
+                                ui.strong("Lvl");
+                                ui.strong("Vol");
+                                ui.strong("Pan");
+                                ui.strong("Width");
+                                ui.strong("Delay");
+                                ui.strong("Reverb");
+                                ui.end_row();
+
+                                for &track in &TrackId::STUDIO_TRACKS {
+                                    let peak_slot = match track {
+                                        TrackId::Moog => 0,
+                                        TrackId::Monologue => 1,
+                                        TrackId::Tb303 => 2,
+                                        TrackId::Drums => 3,
+                                        TrackId::Sampler => 4,
+                                        TrackId::MoogPad => 5,
+                                        TrackId::MidiOut => 0,
+                                    };
+                                    let tpeak = tel.track_peaks[peak_slot].clamp(0.0, 1.0);
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_extra.is_none() && self.selected_track == track,
+                                            RichText::new(track.role_name()).strong().color(track_color(track)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_track = track;
+                                        self.selected_extra = None;
+                                    }
+                                    if track == TrackId::MoogPad {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 2.0;
+                                            let m_lbl = RichText::new("M").size(10.0).color(if proj.mixer.moog_pad_mute { Color32::from_rgb(245, 76, 86) } else { Color32::GRAY });
+                                            if ui.selectable_label(proj.mixer.moog_pad_mute, m_lbl).clicked() {
+                                                proj.mixer.moog_pad_mute = !proj.mixer.moog_pad_mute;
+                                            }
+                                            let s_lbl = RichText::new("S").size(10.0).color(if proj.mixer.moog_pad_solo { Color32::from_rgb(255, 208, 66) } else { Color32::GRAY });
+                                            if ui.selectable_label(proj.mixer.moog_pad_solo, s_lbl).clicked() {
+                                                proj.mixer.moog_pad_solo = !proj.mixer.moog_pad_solo;
+                                            }
+                                        });
+                                        let (lrect, _) = ui.allocate_exact_size(Vec2::new(34.0, 8.0), Sense::hover());
+                                        ui.painter().rect_filled(lrect, Rounding::same(2.0), Color32::from_rgb(20, 24, 34));
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(lrect.min, Vec2::new(lrect.width() * tpeak, lrect.height())),
+                                            Rounding::same(2.0),
+                                            track_color(track),
+                                        );
+                                        ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_volume, 0.0..=1.4).show_value(false));
+                                        ui.label(RichText::new("Wide").size(10.5).weak());
+                                        ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_width, 0.0..=1.8).show_value(false));
+                                        ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_delay_send, 0.0..=1.0).show_value(false));
+                                        ui.add(egui::Slider::new(&mut proj.mixer.moog_pad_reverb_send, 0.0..=1.0).show_value(false));
+                                    } else {
+                                        let ch = &mut proj.mixer.channels[track.index()];
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 2.0;
+                                            let m_lbl = RichText::new("M").size(10.0).color(if ch.mute { Color32::from_rgb(245, 76, 86) } else { Color32::GRAY });
+                                            if ui.selectable_label(ch.mute, m_lbl).clicked() {
+                                                ch.mute = !ch.mute;
+                                            }
+                                            let s_lbl = RichText::new("S").size(10.0).color(if ch.solo { Color32::from_rgb(255, 208, 66) } else { Color32::GRAY });
+                                            if ui.selectable_label(ch.solo, s_lbl).clicked() {
+                                                ch.solo = !ch.solo;
+                                            }
+                                        });
+                                        let (lrect, _) = ui.allocate_exact_size(Vec2::new(34.0, 8.0), Sense::hover());
+                                        ui.painter().rect_filled(lrect, Rounding::same(2.0), Color32::from_rgb(20, 24, 34));
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(lrect.min, Vec2::new(lrect.width() * tpeak, lrect.height())),
+                                            Rounding::same(2.0),
+                                            track_color(track),
+                                        );
+                                        ui.add(egui::Slider::new(&mut ch.volume, 0.0..=1.4).show_value(false));
+                                        ui.add(egui::Slider::new(&mut ch.pan, -1.0..=1.0).show_value(false));
+                                        ui.add(egui::Slider::new(&mut ch.width, 0.0..=1.8).show_value(false));
+                                        ui.add(egui::Slider::new(&mut ch.delay_send, 0.0..=1.0).show_value(false));
+                                        ui.add(egui::Slider::new(&mut ch.reverb_send, 0.0..=1.0).show_value(false));
+                                    }
+                                    ui.end_row();
+                                }
+
+                                for (ei, tr) in proj.extra_tracks.iter_mut().take(MAX_EXTRA_TRACKS).enumerate() {
+                                    let ec = Color32::from_rgb(tr.color[0], tr.color[1], tr.color[2]);
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_extra == Some(ei),
+                                            RichText::new(tr.name.chars().take(10).collect::<String>()).strong().color(ec),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_extra = Some(ei);
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        let m_lbl = RichText::new("M").size(10.0).color(if tr.mute { Color32::from_rgb(245, 76, 86) } else { Color32::GRAY });
+                                        if ui.selectable_label(tr.mute, m_lbl).clicked() {
+                                            tr.mute = !tr.mute;
+                                        }
+                                        let s_lbl = RichText::new("S").size(10.0).color(if tr.solo { Color32::from_rgb(255, 208, 66) } else { Color32::GRAY });
+                                        if ui.selectable_label(tr.solo, s_lbl).clicked() {
+                                            tr.solo = !tr.solo;
+                                        }
+                                    });
+                                    ui.label(RichText::new("Ext").size(10.0).weak());
+                                    ui.add(egui::Slider::new(&mut tr.volume, 0.0..=1.4).show_value(false));
+                                    ui.add(egui::Slider::new(&mut tr.pan, -1.0..=1.0).show_value(false));
+                                    ui.add(egui::Slider::new(&mut tr.width, 0.0..=1.8).show_value(false));
+                                    ui.add(egui::Slider::new(&mut tr.delay_send, 0.0..=1.0).show_value(false));
+                                    ui.add(egui::Slider::new(&mut tr.reverb_send, 0.0..=1.0).show_value(false));
+                                    ui.end_row();
+                                }
+                            });
+                        });
                 });
             });
         });
@@ -7745,6 +8412,35 @@ mod ui_layout_tests {
             },
             |c| app.render_ui(c),
         );
+    }
+
+    #[test]
+    fn midi_cc_learn_and_expression_update_project_targets() {
+        let ctx = egui::Context::default();
+        let mut app = FunKeySynthApp::new_for_test(&ctx);
+        let mut proj = Project::default();
+
+        // Simulate MIDI Learn binding CC 42 -> TrackCutoff
+        app.selected_track = TrackId::Moog;
+        app.midi_learn_target = Some(MidiCcTarget::TrackCutoff);
+        app.midi.push_test_msg(MidiMsg::Cc { cc: 42, value: 0.75 });
+        let pads = build_auto_chord_pads(proj.root_note, proj.scale);
+        app.handle_midi(&ctx, &mut proj, &pads, false, 0);
+
+        assert!(app.midi_learn_target.is_none());
+        assert!(proj
+            .midi
+            .cc_mappings
+            .iter()
+            .any(|m| m.cc == 42 && m.target == MidiCcTarget::TrackCutoff));
+        assert!(proj.moog.cutoff > 1500.0);
+
+        // Pitch Bend & Aftertouch update app expression values
+        app.midi.push_test_msg(MidiMsg::PitchBend { bend: 0.5 });
+        app.midi.push_test_msg(MidiMsg::Aftertouch { pressure: 0.8 });
+        app.handle_midi(&ctx, &mut proj, &pads, false, 0);
+        assert!((app.midi_bend_val - 0.5).abs() < 1e-4);
+        assert!((app.midi_aftertouch_val - 0.8).abs() < 1e-4);
     }
 }
 

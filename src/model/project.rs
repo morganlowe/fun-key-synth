@@ -9,6 +9,10 @@ use super::{Scale, StepCount, TrackId};
 pub const NUM_PATTERNS: usize = 8;
 pub const MAX_EXTRA_TRACKS: usize = 10;
 
+fn default_stereo_width() -> f32 {
+    1.0
+}
+
 /// A user-added dynamic polyphonic/monophonic synth track in the mix (tracks 7..=16).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -20,6 +24,8 @@ pub struct ExtraTrack {
     pub filter: TrackFilterParams,
     pub volume: f32,
     pub pan: f32,
+    #[serde(default = "default_stereo_width")]
+    pub width: f32,
     pub delay_send: f32,
     pub reverb_send: f32,
     pub mute: bool,
@@ -38,6 +44,7 @@ impl Default for ExtraTrack {
             filter: TrackFilterParams::default(),
             volume: 0.52,
             pan: 0.0,
+            width: 1.0,
             delay_send: 0.24,
             reverb_send: 0.38,
             mute: false,
@@ -1067,6 +1074,8 @@ impl SamplePart {
 pub struct TrackMixerChannel {
     pub volume: f32,      // 0..1.5
     pub pan: f32,         // -1..=1
+    #[serde(default = "default_stereo_width")]
+    pub width: f32,       // 0.0 (mono) .. 1.0 (stereo) .. 1.8 (wide)
     pub delay_send: f32,  // 0..1
     pub reverb_send: f32, // 0..1
     pub delay_enabled: bool,
@@ -1082,6 +1091,7 @@ impl Default for TrackMixerChannel {
         Self {
             volume: 0.82,
             pan: 0.0,
+            width: 1.0,
             delay_send: 0.15,
             reverb_send: 0.15,
             delay_enabled: true,
@@ -1099,6 +1109,8 @@ pub struct MixerParams {
     pub channels: [TrackMixerChannel; 6],
     pub master_volume: f32,
     pub moog_pad_volume: f32,
+    #[serde(default = "default_stereo_width")]
+    pub moog_pad_width: f32,
     pub moog_pad_reverb_send: f32,
     pub moog_pad_delay_send: f32,
     pub moog_pad_delay_enabled: bool,
@@ -1107,6 +1119,8 @@ pub struct MixerParams {
     pub moog_pad_solo: bool,
     #[serde(default)]
     pub moog_pad_filter: TrackFilterParams,
+    #[serde(default)]
+    pub mono_sub: bool,
 }
 
 impl Default for MixerParams {
@@ -1115,6 +1129,7 @@ impl Default for MixerParams {
         channels[0] = TrackMixerChannel {
             volume: 1.12,
             pan: -0.08,
+            width: 1.0,
             delay_send: 0.20,
             reverb_send: 0.06,
             delay_enabled: true,
@@ -1126,6 +1141,7 @@ impl Default for MixerParams {
         channels[1] = TrackMixerChannel {
             volume: 0.78,
             pan: 0.12,
+            width: 1.0,
             delay_send: 0.42,
             reverb_send: 0.36,
             delay_enabled: true,
@@ -1137,6 +1153,7 @@ impl Default for MixerParams {
         channels[2] = TrackMixerChannel {
             volume: 0.82,
             pan: 0.0,
+            width: 1.0,
             delay_send: 0.34,
             reverb_send: 0.18,
             delay_enabled: true,
@@ -1148,6 +1165,7 @@ impl Default for MixerParams {
         channels[3] = TrackMixerChannel {
             volume: 0.58,
             pan: 0.0,
+            width: 1.0,
             delay_send: 0.06,
             reverb_send: 0.14,
             delay_enabled: true,
@@ -1159,6 +1177,7 @@ impl Default for MixerParams {
         channels[4] = TrackMixerChannel {
             volume: 0.80,
             pan: -0.14,
+            width: 1.0,
             delay_send: 0.34,
             reverb_send: 0.36,
             delay_enabled: true,
@@ -1170,6 +1189,7 @@ impl Default for MixerParams {
         channels[5] = TrackMixerChannel {
             volume: 0.80,
             pan: 0.0,
+            width: 1.0,
             delay_send: 0.0,
             reverb_send: 0.0,
             delay_enabled: false,
@@ -1182,6 +1202,7 @@ impl Default for MixerParams {
             channels,
             master_volume: 0.88,
             moog_pad_volume: 0.80,
+            moog_pad_width: 1.0,
             moog_pad_reverb_send: 0.56,
             moog_pad_delay_send: 0.24,
             moog_pad_delay_enabled: true,
@@ -1189,6 +1210,7 @@ impl Default for MixerParams {
             moog_pad_mute: false,
             moog_pad_solo: false,
             moog_pad_filter: TrackFilterParams::default(),
+            mono_sub: false,
         }
     }
 }
@@ -1421,12 +1443,103 @@ fn default_reverb_shimmer() -> f32 {
     0.28
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum MidiCcTarget {
+    #[default]
+    MasterFilter,
+    MasterResonance,
+    ReverbSpace,
+    DelayMix,
+    MasterVolume,
+    SidechainPump,
+    BeatEnergy,
+    TrackVolume,
+    TrackCutoff,
+    TrackResonance,
+    TrackDrive,
+    IsoBass,
+    IsoTreble,
+}
+
+impl MidiCcTarget {
+    pub const ALL: [MidiCcTarget; 13] = [
+        MidiCcTarget::MasterFilter,
+        MidiCcTarget::MasterResonance,
+        MidiCcTarget::ReverbSpace,
+        MidiCcTarget::DelayMix,
+        MidiCcTarget::MasterVolume,
+        MidiCcTarget::SidechainPump,
+        MidiCcTarget::BeatEnergy,
+        MidiCcTarget::TrackVolume,
+        MidiCcTarget::TrackCutoff,
+        MidiCcTarget::TrackResonance,
+        MidiCcTarget::TrackDrive,
+        MidiCcTarget::IsoBass,
+        MidiCcTarget::IsoTreble,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            MidiCcTarget::MasterFilter => "Master Filter",
+            MidiCcTarget::MasterResonance => "Filter Reso",
+            MidiCcTarget::ReverbSpace => "Space / Reverb",
+            MidiCcTarget::DelayMix => "Delay Mix",
+            MidiCcTarget::MasterVolume => "Master Vol",
+            MidiCcTarget::SidechainPump => "Sidechain Pump",
+            MidiCcTarget::BeatEnergy => "Beat Energy",
+            MidiCcTarget::TrackVolume => "Selected Track Vol",
+            MidiCcTarget::TrackCutoff => "Selected Track Cutoff",
+            MidiCcTarget::TrackResonance => "Selected Track Reso",
+            MidiCcTarget::TrackDrive => "Selected Track Drive",
+            MidiCcTarget::IsoBass => "Volca Iso Bass",
+            MidiCcTarget::IsoTreble => "Volca Iso Treble",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MidiCcMapping {
+    pub cc: u8,
+    pub target: MidiCcTarget,
+}
+
+impl Default for MidiCcMapping {
+    fn default() -> Self {
+        Self {
+            cc: 74,
+            target: MidiCcTarget::MasterFilter,
+        }
+    }
+}
+
+pub fn default_midi_cc_mappings() -> Vec<MidiCcMapping> {
+    vec![
+        MidiCcMapping { cc: 1, target: MidiCcTarget::MasterFilter },
+        MidiCcMapping { cc: 74, target: MidiCcTarget::MasterFilter },
+        MidiCcMapping { cc: 71, target: MidiCcTarget::MasterResonance },
+        MidiCcMapping { cc: 91, target: MidiCcTarget::ReverbSpace },
+        MidiCcMapping { cc: 93, target: MidiCcTarget::DelayMix },
+        MidiCcMapping { cc: 7, target: MidiCcTarget::MasterVolume },
+        MidiCcMapping { cc: 16, target: MidiCcTarget::IsoBass },
+        MidiCcMapping { cc: 17, target: MidiCcTarget::IsoTreble },
+    ]
+}
+
+fn default_pitch_bend_range() -> u8 {
+    2
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MidiSettings {
     pub midi_in_target: TrackId,
     pub midi_clock_out: bool,
     pub quantize_record: bool,
+    #[serde(default = "default_midi_cc_mappings")]
+    pub cc_mappings: Vec<MidiCcMapping>,
+    #[serde(default = "default_pitch_bend_range")]
+    pub pitch_bend_range: u8,
 }
 
 impl Default for MidiSettings {
@@ -1435,6 +1548,8 @@ impl Default for MidiSettings {
             midi_in_target: TrackId::Tb303,
             midi_clock_out: true,
             quantize_record: true,
+            cc_mappings: default_midi_cc_mappings(),
+            pitch_bend_range: default_pitch_bend_range(),
         }
     }
 }
@@ -2210,6 +2325,7 @@ impl Project {
                         slide,
                         chord: super::ChordType::Single,
                         motion: MotionLocks::default(),
+                        ..Default::default()
                     };
                 }
 
@@ -2237,6 +2353,7 @@ impl Project {
                             drive: None,
                             shape: Some(shape_lock),
                         },
+                        ..Default::default()
                     };
                 }
 
@@ -2334,6 +2451,7 @@ impl Project {
                         slide,
                         chord: super::ChordType::Single,
                         motion: MotionLocks::default(),
+                        ..Default::default()
                     };
                 }
 

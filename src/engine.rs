@@ -10,8 +10,8 @@ use crate::{
         apply_voice_preset, arp_tones_for, bass_midi_for, build_party_song_rig_with_reroll,
         chord_symbol, generate_auto_beat, generate_melodic_tracks, party_palette_label,
         party_song_title, pick_party_vibe_crate, progression_at, vibe_progressions, voice_led_chord,
-        voice_led_chord_near, ChordSlot, DrumVoiceId, FactoryPreset, FilterEnvTrigger,
-        GlobalFilterMode, MelodicStep,
+        voice_led_chord_near, ChordSlot, ChordType, ClockDiv, DrumVoiceId, FactoryPreset,
+        FilterEnvTrigger, GlobalFilterMode, MelodicStep,
         MelodicTrackSeq, MotionLocks, PartyPace, PartySongRig, Project, SongSection,
         TrackFilterParams, TrackId, Vibe, ArpMode, ArpRate, MAX_EXTRA_TRACKS,
     },
@@ -120,6 +120,10 @@ pub enum LiveEvent {
     },
     QueueNextPartyVibe(Option<Vibe>),
     PrevPartySong,
+    SetMidiExpression {
+        bend_semi: f32,
+        aftertouch: f32,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,6 +151,7 @@ pub struct EngineTelemetry {
     pub active_song_section: Option<usize>,
     pub peak_l: f32,
     pub peak_r: f32,
+    pub track_peaks: [f32; 6],
     pub sidechain_duck: f32,
     pub sampler_playhead: Option<f32>,
     pub volca_active_mask: u8,
@@ -189,6 +194,37 @@ enum PendingTrigger {
         party_rig_cut: bool,
         gate_samples: f32,
     },
+    Melodic32 {
+        target: ArpTarget,
+        note: u8,
+        vel: f32,
+        accent: bool,
+        slide: bool,
+        chord: ChordType,
+        motion: MotionLocks,
+        gate_samples: f32,
+        dj_root: u8,
+    },
+    Volca32 {
+        part_idx: usize,
+        step: crate::model::DrumStep,
+    },
+}
+
+#[inline]
+fn clock_div_indices(clock_div: ClockDiv, global: usize, len: usize) -> (Option<usize>, Option<usize>, f32) {
+    let l = len.max(1);
+    match clock_div {
+        ClockDiv::Eighth => {
+            if global % 2 == 0 {
+                (Some((global / 2) % l), None, 2.0)
+            } else {
+                (None, None, 2.0)
+            }
+        }
+        ClockDiv::Sixteenth => (Some(global % l), None, 1.0),
+        ClockDiv::ThirtySecond => (Some((global * 2) % l), Some((global * 2 + 1) % l), 0.5),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +467,16 @@ enum DropMacroPhase {
     Impact {
         steps_left: usize,
     },
+}
+
+#[inline]
+fn apply_stereo_width(l: f32, r: f32, width: f32) -> (f32, f32) {
+    if (width - 1.0).abs() < 0.002 {
+        return (l, r);
+    }
+    let mid = 0.5 * (l + r);
+    let side = 0.5 * (l - r) * width.clamp(0.0, 1.8);
+    (mid + side, mid - side)
 }
 
 #[inline]
@@ -1055,6 +1101,10 @@ struct Runtime {
     // Peak metering
     peak_l: f32,
     peak_r: f32,
+    track_peaks: [f32; 6],
+    mono_sub_lpf: Svf12Filter,
+    midi_bend_semi: f32,
+    midi_aftertouch: f32,
 }
 
 impl Runtime {
@@ -1117,6 +1167,9 @@ impl Runtime {
             drop_boom_env: 0.0,
             drop_boom_phase: 0.0,
             drop_boom_pitch: 128.0,
+            mono_sub_lpf: Svf12Filter::new(sr),
+            midi_bend_semi: 0.0,
+            midi_aftertouch: 0.0,
             drop_whoosh_env: 0.0,
             drop_whoosh_filter: Svf12Filter::new(sr),
             drop_filter_slam: 0.0,
@@ -1179,6 +1232,7 @@ impl Runtime {
             party_melodic_sig: (255, 255, usize::MAX, 0),
             peak_l: 0.0,
             peak_r: 0.0,
+            track_peaks: [0.0; 6],
         }
     }
 
@@ -1661,6 +1715,10 @@ impl Runtime {
             }
             LiveEvent::QueueNextPartyVibe(vibe_opt) => {
                 self.party_queued_vibe = vibe_opt;
+            }
+            LiveEvent::SetMidiExpression { bend_semi, aftertouch } => {
+                self.midi_bend_semi = bend_semi.clamp(-12.0, 12.0);
+                self.midi_aftertouch = aftertouch.clamp(0.0, 1.0);
             }
             LiveEvent::ReloadPartyRig => {
                 let prev_presets = self.party_rig.as_ref().map(|r| r.voice_presets);
@@ -2146,6 +2204,140 @@ impl Runtime {
         };
         self.mono.note_on(note, vel, accent, slide, mono_p);
         self.gate_mono = gate_samples;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_melodic_32(
+        &mut self,
+        p: &Project,
+        use_rig: bool,
+        target: ArpTarget,
+        note: u8,
+        vel: f32,
+        accent: bool,
+        slide: bool,
+        chord: ChordType,
+        motion: MotionLocks,
+        gate_samples: f32,
+        dj_root: u8,
+    ) {
+        match target {
+            ArpTarget::Core(TrackId::Moog) => {
+                if motion.any_locked() {
+                    self.moog.set_motion_locks(motion);
+                } else {
+                    self.moog.clear_motion_locks();
+                }
+                if !slide {
+                    if let Some(prev) = self.last_moog_note.take() {
+                        self.moog.note_off(prev);
+                    }
+                }
+                let moog_p = if use_rig {
+                    self.party_rig.as_ref().map(|r| &r.moog).unwrap_or(&p.moog)
+                } else {
+                    &p.moog
+                };
+                self.moog.note_on(note, vel, accent, slide, moog_p);
+                self.last_moog_note = Some(note);
+                self.gate_moog = gate_samples;
+            }
+            ArpTarget::ChordPad | ArpTarget::Core(TrackId::MoogPad) => {
+                if motion.any_locked() {
+                    self.pad_moog.set_motion_locks(motion);
+                } else {
+                    self.pad_moog.clear_motion_locks();
+                }
+                self.pad_moog.all_notes_off();
+                let pad_p = if use_rig {
+                    self.party_rig.as_ref().map(|r| &r.moog_pad).unwrap_or(&p.moog_pad)
+                } else {
+                    &p.moog_pad
+                };
+                if chord != ChordType::Single {
+                    let slot = ChordSlot {
+                        offset: (note + 12 - (dj_root % 12)) % 12,
+                        chord,
+                    };
+                    let notes = voice_led_chord_near(dj_root, slot, &self.last_pad_notes, 60);
+                    self.last_pad_notes = notes.clone();
+                    for n in notes {
+                        self.pad_moog.note_on(n, vel, accent, false, pad_p);
+                    }
+                } else {
+                    self.pad_moog.note_on(note, vel, accent, false, pad_p);
+                }
+                self.gate_pad = gate_samples;
+            }
+            ArpTarget::Core(TrackId::Monologue) => {
+                let prev_note = self.last_mono_note.take();
+                self.last_mono_note = Some(note);
+                self.dispatch_mono_note(
+                    p,
+                    use_rig,
+                    note,
+                    prev_note,
+                    vel,
+                    accent,
+                    slide,
+                    motion,
+                    false,
+                    gate_samples,
+                );
+            }
+            ArpTarget::Core(TrackId::Tb303) => {
+                if motion.any_locked() {
+                    self.acid.set_motion_locks(motion);
+                } else {
+                    self.acid.clear_motion_locks();
+                }
+                if !slide {
+                    if let Some(prev) = self.last_acid_note.take() {
+                        self.acid.note_off(prev);
+                    }
+                }
+                self.acid.note_on(note, vel, accent, slide);
+                self.last_acid_note = Some(note);
+                self.gate_acid = gate_samples;
+            }
+            ArpTarget::Core(TrackId::Sampler) => {
+                if motion.any_locked() {
+                    self.sampler.set_motion_locks(motion);
+                } else {
+                    self.sampler.clear_motion_locks();
+                }
+                let samp_p = if use_rig {
+                    self.party_rig.as_ref().map(|r| &r.sampler).unwrap_or(&p.sampler)
+                } else {
+                    &p.sampler
+                };
+                self.sampler.note_on(note, vel, samp_p);
+                self.gate_sampler = gate_samples;
+            }
+            ArpTarget::Extra(ei) if ei < p.extra_tracks.len().min(MAX_EXTRA_TRACKS) => {
+                let synth = &mut self.extra_synths[ei];
+                let tr = &p.extra_tracks[ei];
+                if motion.any_locked() {
+                    synth.set_motion_locks(motion);
+                } else {
+                    synth.clear_motion_locks();
+                }
+                synth.all_notes_off();
+                if chord != ChordType::Single {
+                    let slot = ChordSlot {
+                        offset: (note + 12 - (dj_root % 12)) % 12,
+                        chord,
+                    };
+                    for n in voice_led_chord(dj_root, slot, 60) {
+                        synth.note_on(n, vel, accent, false, &tr.synth);
+                    }
+                } else {
+                    synth.note_on(note, vel, accent, false, &tr.synth);
+                }
+                self.extra_gates[ei] = gate_samples;
+            }
+            _ => {}
+        }
     }
 
     fn step_duration_samples(&self, p: &Project, step_index: usize) -> f32 {
@@ -2722,77 +2914,105 @@ impl Runtime {
             for lane in 0..8 {
                 let d_lane = &drum_seq.lanes[lane];
                 let d_len = d_lane.step_count.as_usize();
-                let st = d_lane.steps[global % d_len];
-                if st.active
-                    && !self.is_step_suppressed(Some(TrackId::Drums), None, Some(lane), global)
-                    && (st.probability >= 0.999 || hash_f32(seed, global, lane as u32) <= st.probability)
-                {
-                    if let Some(voice) = DrumVoiceId::from_index(lane) {
-                        // Subtle velocity humanization + per-step Pitch/Pan P-Locks + studio groove pocket
-                        let human = 0.94 + hash_f32(seed, global, lane as u32 + 99) * 0.12;
-                        let vel = (st.velocity * human).clamp(0.1, 1.0);
-                        let drums_p = if use_rig {
-                            self.party_rig.as_ref().map(|r| &r.drums).unwrap_or(&p.drums)
-                        } else {
-                            &p.drums
-                        };
-                        let delay_ms = match voice {
-                            DrumVoiceId::Kick => 0.0,
-                            DrumVoiceId::Snare | DrumVoiceId::Clap => {
-                                (3.5 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
-                            }
-                            DrumVoiceId::ClosedHat | DrumVoiceId::OpenHat => {
-                                (0.6 + hash_f32(seed, global, lane as u32 + 301) * 3.0) * pocket_scale
-                            }
-                            DrumVoiceId::CowbellRim | DrumVoiceId::Tom | DrumVoiceId::Cymbal => {
-                                (1.2 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
-                            }
-                        };
-                        let delay_samples = (delay_ms * 0.001 * self.sr).min(base_step_samples * 0.22);
-                        if delay_samples > 1.0 {
-                            self.pending_triggers.push((
-                                delay_samples,
-                                PendingTrigger::Drum {
+                let d_div = if use_auto_beat || p.party_mode {
+                    ClockDiv::Sixteenth
+                } else {
+                    d_lane.clock_div
+                };
+                let (prim_idx, sub_idx, _) = clock_div_indices(d_div, global, d_len);
+                if let Some(p_idx) = prim_idx {
+                    let st = d_lane.steps[p_idx];
+                    if st.active
+                        && !self.is_step_suppressed(Some(TrackId::Drums), None, Some(lane), global)
+                        && (st.probability >= 0.999 || hash_f32(seed, global, lane as u32) <= st.probability)
+                    {
+                        if let Some(voice) = DrumVoiceId::from_index(lane) {
+                            // Subtle velocity humanization + per-step Pitch/Pan P-Locks + studio groove pocket
+                            let human = 0.94 + hash_f32(seed, global, lane as u32 + 99) * 0.12;
+                            let vel = (st.velocity * human).clamp(0.1, 1.0);
+                            let drums_p = if use_rig {
+                                self.party_rig.as_ref().map(|r| &r.drums).unwrap_or(&p.drums)
+                            } else {
+                                &p.drums
+                            };
+                            let delay_ms = match voice {
+                                DrumVoiceId::Kick => 0.0,
+                                DrumVoiceId::Snare | DrumVoiceId::Clap => {
+                                    (3.5 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
+                                }
+                                DrumVoiceId::ClosedHat | DrumVoiceId::OpenHat => {
+                                    (0.6 + hash_f32(seed, global, lane as u32 + 301) * 3.0) * pocket_scale
+                                }
+                                DrumVoiceId::CowbellRim | DrumVoiceId::Tom | DrumVoiceId::Cymbal => {
+                                    (1.2 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
+                                }
+                            };
+                            let delay_samples = (delay_ms * 0.001 * self.sr).min(base_step_samples * 0.22);
+                            if delay_samples > 1.0 {
+                                self.pending_triggers.push((
+                                    delay_samples,
+                                    PendingTrigger::Drum {
+                                        lane,
+                                        vel,
+                                        accent: st.accent,
+                                        flam: st.flam,
+                                        pitch_offset: st.pitch_offset,
+                                        pan_lock: st.pan_lock,
+                                    },
+                                ));
+                            } else {
+                                trigger_drum_with_lock(
+                                    &mut self.drums,
+                                    drums_p,
                                     lane,
+                                    voice,
                                     vel,
-                                    accent: st.accent,
-                                    flam: st.flam,
-                                    pitch_offset: st.pitch_offset,
-                                    pan_lock: st.pan_lock,
-                                },
-                            ));
-                        } else {
-                            trigger_drum_with_lock(
-                                &mut self.drums,
-                                drums_p,
+                                    st.accent,
+                                    st.flam,
+                                    st.pitch_offset,
+                                    st.pan_lock,
+                                );
+                            }
+                            if voice == DrumVoiceId::Kick {
+                                self.sidechain_peak = self.sidechain_peak.max(vel);
+                                if p.fx.global_filter_env_trigger == FilterEnvTrigger::Kick {
+                                    self.gfilt_env_attacking = true;
+                                }
+                            }
+                            if st.ratchet > 1 {
+                                let n = st.ratchet.min(4) as usize;
+                                let sub_len = base_step_samples / n as f32;
+                                for r in 1..n {
+                                    self.ratchets.push(RatchetEvent {
+                                        lane,
+                                        samples_left: delay_samples + sub_len * r as f32,
+                                        vel: vel * (0.85 - r as f32 * 0.12).max(0.35),
+                                        accent: false,
+                                        tune_offset: 0.0,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(s_idx) = sub_idx {
+                    let st = d_lane.steps[s_idx];
+                    if st.active
+                        && !self.is_step_suppressed(Some(TrackId::Drums), None, Some(lane), global)
+                        && (st.probability >= 0.999
+                            || hash_f32(seed, global * 2 + 1, lane as u32) <= st.probability)
+                    {
+                        self.pending_triggers.push((
+                            base_step_samples * 0.5,
+                            PendingTrigger::Drum {
                                 lane,
-                                voice,
-                                vel,
-                                st.accent,
-                                st.flam,
-                                st.pitch_offset,
-                                st.pan_lock,
-                            );
-                        }
-                        if voice == DrumVoiceId::Kick {
-                            self.sidechain_peak = self.sidechain_peak.max(vel);
-                            if p.fx.global_filter_env_trigger == FilterEnvTrigger::Kick {
-                                self.gfilt_env_attacking = true;
-                            }
-                        }
-                        if st.ratchet > 1 {
-                            let n = st.ratchet.min(4) as usize;
-                            let sub_len = base_step_samples / n as f32;
-                            for r in 1..n {
-                                self.ratchets.push(RatchetEvent {
-                                    lane,
-                                    samples_left: delay_samples + sub_len * r as f32,
-                                    vel: vel * (0.85 - r as f32 * 0.12).max(0.35),
-                                    accent: false,
-                                    tune_offset: 0.0,
-                                });
-                            }
-                        }
+                                vel: st.velocity.clamp(0.1, 1.0),
+                                accent: st.accent,
+                                flam: st.flam,
+                                pitch_offset: st.pitch_offset,
+                                pan_lock: st.pan_lock,
+                            },
+                        ));
                     }
                 }
             }
@@ -2861,7 +3081,9 @@ impl Runtime {
         // --- 2. BASS / MOOG (bit 1) ---
         if (section_mask & 0b000010) != 0 && !follow_override {
             let seq = if p.party_mode { &self.party_melodic.0 } else { &pat.moog };
-            let mut st = seq.steps[global % seq.step_count.as_usize()];
+            let m_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
+            let (prim_idx, sub_idx, gate_scale) = clock_div_indices(m_div, global, seq.step_count.as_usize());
+            let mut st = prim_idx.map(|i| seq.steps[i]).unwrap_or_default();
             if p.party_mode {
                 let step16 = global % 16;
                 let bass_style = (party_phrase + self.party_section_idx as u32) % 4;
@@ -2920,7 +3142,8 @@ impl Runtime {
                     }
                 }
             }
-            if st.active && !self.is_step_suppressed(Some(TrackId::Moog), None, None, global) {
+            let moog_prob = p.party_mode || st.probability >= 0.999 || hash_f32(seed, global, 412) <= st.probability;
+            if st.active && moog_prob && !self.is_step_suppressed(Some(TrackId::Moog), None, None, global) {
                 let note = st.note;
                 if st.motion.any_locked() {
                     let mut m = st.motion;
@@ -2947,14 +3170,38 @@ impl Runtime {
                 self.moog
                     .note_on(note, vel, st.accent, st.slide, moog_p);
                 self.last_moog_note = Some(note);
-                self.gate_moog = base_step_samples * st.gate.clamp(0.15, 16.0);
+                self.gate_moog = base_step_samples * gate_scale * st.gate.clamp(0.15, 16.0);
+            }
+            if let Some(s_idx) = sub_idx {
+                let st2 = seq.steps[s_idx];
+                if st2.active
+                    && !self.is_step_suppressed(Some(TrackId::Moog), None, None, global)
+                    && (st2.probability >= 0.999 || hash_f32(seed, global * 2 + 1, 412) <= st2.probability)
+                {
+                    self.pending_triggers.push((
+                        base_step_samples * 0.5,
+                        PendingTrigger::Melodic32 {
+                            target: ArpTarget::Core(TrackId::Moog),
+                            note: st2.note,
+                            vel: st2.velocity.clamp(0.15, 1.0),
+                            accent: st2.accent,
+                            slide: st2.slide,
+                            chord: st2.chord,
+                            motion: st2.motion,
+                            gate_samples: base_step_samples * 0.5 * st2.gate.clamp(0.15, 16.0),
+                            dj_root,
+                        },
+                    ));
+                }
             }
         }
 
         // --- 3. CHORDS / MOOG PAD (bit 2) ---
         if (section_mask & 0b000100) != 0 && !follow_override {
             let seq = if p.party_mode { &self.party_melodic.1 } else { &pat.moog_pad };
-            let mut st = seq.steps[global % seq.step_count.as_usize()];
+            let p_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
+            let (pad_prim, pad_sub, pad_gscale) = clock_div_indices(p_div, global, seq.step_count.as_usize());
+            let mut st = pad_prim.map(|i| seq.steps[i]).unwrap_or_default();
             if p.party_mode {
                 let step16 = global % 16;
                 let chord_rhythm = (party_phrase + self.party_section_idx as u32) % 3;
@@ -3003,7 +3250,8 @@ impl Runtime {
                     };
                 }
             }
-            if st.active && !self.is_step_suppressed(Some(TrackId::MoogPad), None, None, global) {
+            let pad_prob = p.party_mode || st.probability >= 0.999 || hash_f32(seed, global, 452) <= st.probability;
+            if st.active && pad_prob && !self.is_step_suppressed(Some(TrackId::MoogPad), None, None, global) {
                 if st.motion.any_locked() {
                     let mut m = st.motion;
                     if p.party_mode && p.party_sound_morph {
@@ -3070,7 +3318,29 @@ impl Runtime {
                     self.pad_moog
                         .note_on(st.note, st.velocity, st.accent, false, pad_p);
                 }
-                self.gate_pad = base_step_samples * st.gate.clamp(0.25, 16.0);
+                self.gate_pad = base_step_samples * pad_gscale * st.gate.clamp(0.25, 16.0);
+            }
+            if let Some(s_idx) = pad_sub {
+                let st2 = seq.steps[s_idx];
+                if st2.active
+                    && !self.is_step_suppressed(Some(TrackId::MoogPad), None, None, global)
+                    && (st2.probability >= 0.999 || hash_f32(seed, global * 2 + 1, 452) <= st2.probability)
+                {
+                    self.pending_triggers.push((
+                        base_step_samples * 0.5,
+                        PendingTrigger::Melodic32 {
+                            target: ArpTarget::ChordPad,
+                            note: st2.note,
+                            vel: st2.velocity.clamp(0.15, 1.0),
+                            accent: st2.accent,
+                            slide: st2.slide,
+                            chord: st2.chord,
+                            motion: st2.motion,
+                            gate_samples: base_step_samples * 0.5 * st2.gate.clamp(0.25, 16.0),
+                            dj_root,
+                        },
+                    ));
+                }
             }
         }
 
@@ -3089,33 +3359,63 @@ impl Runtime {
                     continue;
                 }
                 let seq = &pat.extra_seqs[ei];
-                let st = seq.steps[global % seq.step_count.as_usize()];
-                if st.active && !self.is_step_suppressed(None, Some(ei), None, global) {
-                    let synth = &mut self.extra_synths[ei];
-                    let tr = &p.extra_tracks[ei];
-                    if st.motion.any_locked() {
-                        synth.set_motion_locks(st.motion);
-                    } else {
-                        synth.clear_motion_locks();
-                    }
-                    synth.all_notes_off();
-                    if st.chord != crate::model::ChordType::Single {
-                        let notes_to_play = if party_evolve_active || p.party_mode {
-                            pad_notes.clone()
+                let e_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
+                let (e_prim, e_sub, e_gscale) = clock_div_indices(e_div, global, seq.step_count.as_usize());
+                if let Some(e_idx) = e_prim {
+                    let st = seq.steps[e_idx];
+                    let e_prob = p.party_mode
+                        || st.probability >= 0.999
+                        || hash_f32(seed, global, 800 + ei as u32) <= st.probability;
+                    if st.active && e_prob && !self.is_step_suppressed(None, Some(ei), None, global) {
+                        let synth = &mut self.extra_synths[ei];
+                        let tr = &p.extra_tracks[ei];
+                        if st.motion.any_locked() {
+                            synth.set_motion_locks(st.motion);
                         } else {
-                            let slot = ChordSlot {
-                                offset: (st.note + 12 - (dj_root % 12)) % 12,
-                                chord: st.chord,
-                            };
-                            voice_led_chord(dj_root, slot, 60)
-                        };
-                        for n in notes_to_play {
-                            synth.note_on(n, st.velocity, st.accent, false, &tr.synth);
+                            synth.clear_motion_locks();
                         }
-                    } else {
-                        synth.note_on(st.note, st.velocity, st.accent, false, &tr.synth);
+                        synth.all_notes_off();
+                        if st.chord != crate::model::ChordType::Single {
+                            let notes_to_play = if party_evolve_active || p.party_mode {
+                                pad_notes.clone()
+                            } else {
+                                let slot = ChordSlot {
+                                    offset: (st.note + 12 - (dj_root % 12)) % 12,
+                                    chord: st.chord,
+                                };
+                                voice_led_chord(dj_root, slot, 60)
+                            };
+                            for n in notes_to_play {
+                                synth.note_on(n, st.velocity, st.accent, false, &tr.synth);
+                            }
+                        } else {
+                            synth.note_on(st.note, st.velocity, st.accent, false, &tr.synth);
+                        }
+                        self.extra_gates[ei] = base_step_samples * e_gscale * st.gate.clamp(0.25, 16.0);
                     }
-                    self.extra_gates[ei] = base_step_samples * st.gate.clamp(0.25, 16.0);
+                }
+                if let Some(s_idx) = e_sub {
+                    let st2 = seq.steps[s_idx];
+                    if st2.active
+                        && !self.is_step_suppressed(None, Some(ei), None, global)
+                        && (st2.probability >= 0.999
+                            || hash_f32(seed, global * 2 + 1, 800 + ei as u32) <= st2.probability)
+                    {
+                        self.pending_triggers.push((
+                            base_step_samples * 0.5,
+                            PendingTrigger::Melodic32 {
+                                target: ArpTarget::Extra(ei),
+                                note: st2.note,
+                                vel: st2.velocity.clamp(0.15, 1.0),
+                                accent: st2.accent,
+                                slide: st2.slide,
+                                chord: st2.chord,
+                                motion: st2.motion,
+                                gate_samples: base_step_samples * 0.5 * st2.gate.clamp(0.25, 16.0),
+                                dj_root,
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -3123,7 +3423,11 @@ impl Runtime {
         // --- 4. ARP / MONOLOGUE (bit 3) ---
         if (section_mask & 0b001000) != 0 {
             let seq = if p.party_mode { &self.party_melodic.2 } else { &pat.monologue };
-            let st = seq.steps[global % seq.step_count.as_usize()];
+            let m_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
+            let (mono_prim, mono_sub, mono_gscale) =
+                clock_div_indices(m_div, global, seq.step_count.as_usize());
+            let st = mono_prim.map(|i| seq.steps[i]).unwrap_or_default();
+            let st2_opt = mono_sub.map(|i| seq.steps[i]);
             let arp_len = arp_tones.len().max(1);
             let arp_mode = (party_phrase + self.party_section_idx as u32) % 5;
             let pick_arp_note = |step_i: usize| -> u8 {
@@ -3144,14 +3448,15 @@ impl Runtime {
                 }
                 n
             };
-            if st.active && !self.is_step_suppressed(Some(TrackId::Monologue), None, None, global) {
+            let mono_prob = p.party_mode || st.probability >= 0.999 || hash_f32(seed, global, 512) <= st.probability;
+            if st.active && mono_prob && !self.is_step_suppressed(Some(TrackId::Monologue), None, None, global) {
                 let note = if follow_override {
                     pick_arp_note(global)
                 } else {
                     st.note
                 };
                 let vel = (st.velocity * phrase_vel_mul(global, seed, 511)).clamp(0.15, 1.0);
-                let gate_samples = base_step_samples * st.gate.clamp(0.15, 8.0);
+                let gate_samples = base_step_samples * mono_gscale * st.gate.clamp(0.15, 8.0);
                 let apply_party_cut = p.party_mode && p.party_sound_morph;
                 let pocket_scale = groove_pocket_scale(song_vibe);
                 let mono_delay = if global % 4 != 0 && !st.slide {
@@ -3194,85 +3499,195 @@ impl Runtime {
                     );
                 }
             }
+            if let Some(st2) = st2_opt {
+                if st2.active
+                    && !self.is_step_suppressed(Some(TrackId::Monologue), None, None, global)
+                    && (st2.probability >= 0.999 || hash_f32(seed, global * 2 + 1, 512) <= st2.probability)
+                {
+                    let note = if follow_override {
+                        pick_arp_note(global * 2 + 1)
+                    } else {
+                        st2.note
+                    };
+                    self.pending_triggers.push((
+                        base_step_samples * 0.5,
+                        PendingTrigger::Melodic32 {
+                            target: ArpTarget::Core(TrackId::Monologue),
+                            note,
+                            vel: st2.velocity.clamp(0.15, 1.0),
+                            accent: st2.accent,
+                            slide: st2.slide,
+                            chord: st2.chord,
+                            motion: st2.motion,
+                            gate_samples: base_step_samples * 0.5 * st2.gate.clamp(0.15, 8.0),
+                            dj_root,
+                        },
+                    ));
+                }
+            }
         }
 
         // --- 5. LEAD / TB-303 (bit 4) ---
         if (section_mask & 0b010000) != 0 {
             let seq = if p.party_mode { &self.party_melodic.3 } else { &pat.tb303 };
-            let st = seq.steps[global % seq.step_count.as_usize()];
-            if st.active && !self.is_step_suppressed(Some(TrackId::Tb303), None, None, global) {
-                let note = if follow_override {
-                    let tone = arp_tones[global % arp_tones.len().max(1)];
-                    (bass_root + 12 + (tone % 12)).clamp(36, 76)
-                } else {
-                    st.note
-                };
-                if st.motion.any_locked() {
-                    self.acid.set_motion_locks(st.motion);
-                } else {
-                    self.acid.clear_motion_locks();
-                }
-                if !st.slide {
-                    if let Some(prev) = self.last_acid_note.take() {
-                        self.acid.note_off(prev);
+            let a_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
+            let (a_prim, a_sub, a_gscale) = clock_div_indices(a_div, global, seq.step_count.as_usize());
+            if let Some(a_idx) = a_prim {
+                let st = seq.steps[a_idx];
+                let a_prob = p.party_mode || st.probability >= 0.999 || hash_f32(seed, global, 612) <= st.probability;
+                if st.active && a_prob && !self.is_step_suppressed(Some(TrackId::Tb303), None, None, global) {
+                    let note = if follow_override {
+                        let tone = arp_tones[global % arp_tones.len().max(1)];
+                        (bass_root + 12 + (tone % 12)).clamp(36, 76)
+                    } else {
+                        st.note
+                    };
+                    if st.motion.any_locked() {
+                        self.acid.set_motion_locks(st.motion);
+                    } else {
+                        self.acid.clear_motion_locks();
                     }
+                    if !st.slide {
+                        if let Some(prev) = self.last_acid_note.take() {
+                            self.acid.note_off(prev);
+                        }
+                    }
+                    let vel = (st.velocity * phrase_vel_mul(global, seed, 611)).clamp(0.15, 1.0);
+                    self.acid.note_on(note, vel, st.accent, st.slide);
+                    self.last_acid_note = Some(note);
+                    self.gate_acid = base_step_samples * a_gscale * st.gate.clamp(0.15, 4.0);
                 }
-                let vel = (st.velocity * phrase_vel_mul(global, seed, 611)).clamp(0.15, 1.0);
-                self.acid
-                    .note_on(note, vel, st.accent, st.slide);
-                self.last_acid_note = Some(note);
-                self.gate_acid = base_step_samples * st.gate.clamp(0.15, 4.0);
+            }
+            if let Some(s_idx) = a_sub {
+                let st2 = seq.steps[s_idx];
+                if st2.active
+                    && !self.is_step_suppressed(Some(TrackId::Tb303), None, None, global)
+                    && (st2.probability >= 0.999 || hash_f32(seed, global * 2 + 1, 612) <= st2.probability)
+                {
+                    let note = if follow_override {
+                        let tone = arp_tones[(global * 2 + 1) % arp_tones.len().max(1)];
+                        (bass_root + 12 + (tone % 12)).clamp(36, 76)
+                    } else {
+                        st2.note
+                    };
+                    self.pending_triggers.push((
+                        base_step_samples * 0.5,
+                        PendingTrigger::Melodic32 {
+                            target: ArpTarget::Core(TrackId::Tb303),
+                            note,
+                            vel: st2.velocity.clamp(0.15, 1.0),
+                            accent: st2.accent,
+                            slide: st2.slide,
+                            chord: st2.chord,
+                            motion: st2.motion,
+                            gate_samples: base_step_samples * 0.5 * st2.gate.clamp(0.15, 4.0),
+                            dj_root,
+                        },
+                    ));
+                }
             }
         }
 
         // --- 6. SAMPLER / 8-PART VOLCA BANK (bit 5) ---
         if (section_mask & 0b100000) != 0 {
             let seq = if p.party_mode { &self.party_melodic.4 } else { &pat.sampler };
-            let st = seq.steps[global % seq.step_count.as_usize()];
-            if st.active && !self.is_step_suppressed(Some(TrackId::Sampler), None, None, global) {
-                let note = if follow_override {
-                    (48 + (dj_root + active_slot.offset) % 12).clamp(48, 66)
-                } else {
-                    st.note
-                };
-                if st.motion.any_locked() {
-                    self.sampler.set_motion_locks(st.motion);
-                } else {
-                    self.sampler.clear_motion_locks();
+            let s_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
+            let (s_prim, s_sub, s_gscale) = clock_div_indices(s_div, global, seq.step_count.as_usize());
+            if let Some(s_idx) = s_prim {
+                let st = seq.steps[s_idx];
+                let s_prob = p.party_mode || st.probability >= 0.999 || hash_f32(seed, global, 712) <= st.probability;
+                if st.active && s_prob && !self.is_step_suppressed(Some(TrackId::Sampler), None, None, global) {
+                    let note = if follow_override {
+                        (48 + (dj_root + active_slot.offset) % 12).clamp(48, 66)
+                    } else {
+                        st.note
+                    };
+                    if st.motion.any_locked() {
+                        self.sampler.set_motion_locks(st.motion);
+                    } else {
+                        self.sampler.clear_motion_locks();
+                    }
+                    let samp_p = if use_rig {
+                        self.party_rig.as_ref().map(|r| &r.sampler).unwrap_or(&p.sampler)
+                    } else {
+                        &p.sampler
+                    };
+                    let vel = (st.velocity * phrase_vel_mul(global, seed, 711)).clamp(0.15, 1.0);
+                    self.sampler.note_on(note, vel, samp_p);
+                    self.gate_sampler = base_step_samples * s_gscale * st.gate.clamp(0.25, 16.0);
                 }
-                let samp_p = if use_rig {
-                    self.party_rig.as_ref().map(|r| &r.sampler).unwrap_or(&p.sampler)
-                } else {
-                    &p.sampler
-                };
-                let vel = (st.velocity * phrase_vel_mul(global, seed, 711)).clamp(0.15, 1.0);
-                self.sampler.note_on(note, vel, samp_p);
-                self.gate_sampler = base_step_samples * st.gate.clamp(0.25, 16.0);
+            }
+            if let Some(sub_i) = s_sub {
+                let st2 = seq.steps[sub_i];
+                if st2.active
+                    && !self.is_step_suppressed(Some(TrackId::Sampler), None, None, global)
+                    && (st2.probability >= 0.999 || hash_f32(seed, global * 2 + 1, 712) <= st2.probability)
+                {
+                    let note = if follow_override {
+                        (48 + (dj_root + active_slot.offset) % 12).clamp(48, 66)
+                    } else {
+                        st2.note
+                    };
+                    self.pending_triggers.push((
+                        base_step_samples * 0.5,
+                        PendingTrigger::Melodic32 {
+                            target: ArpTarget::Core(TrackId::Sampler),
+                            note,
+                            vel: st2.velocity.clamp(0.15, 1.0),
+                            accent: st2.accent,
+                            slide: st2.slide,
+                            chord: st2.chord,
+                            motion: st2.motion,
+                            gate_samples: base_step_samples * 0.5 * st2.gate.clamp(0.25, 16.0),
+                            dj_root,
+                        },
+                    ));
+                }
             }
 
             // 8-Part Volca Sample Lanes!
             for (part_idx, lane) in pat.sample_lanes.iter().take(8).enumerate() {
                 let len = lane.effective_len();
-                let dst = lane.steps[global % len];
-                if dst.active
-                    && !self.is_step_suppressed(Some(TrackId::Sampler), None, Some(part_idx), global)
-                    && (dst.probability >= 0.999
-                        || hash_f32(seed, global, 200 + part_idx as u32) <= dst.probability)
-                {
-                    let vel = (dst.velocity * if dst.accent { 1.15 } else { 1.0 }).clamp(0.1, 1.0);
-                    self.volca.trigger_part_with_step(part_idx, vel, &dst, &p.sample_parts);
-                    if dst.ratchet > 1 {
-                        let n = dst.ratchet.min(4) as usize;
-                        let sub_len = base_step_samples / n as f32;
-                        for r in 1..n {
-                            self.volca_ratchets.push(RatchetEvent {
-                                lane: part_idx,
-                                samples_left: sub_len * r as f32,
-                                vel: vel * (0.86 - r as f32 * 0.12).max(0.35),
-                                accent: false,
-                                tune_offset: 0.0,
-                            });
+                let v_div = if p.party_mode { ClockDiv::Sixteenth } else { lane.clock_div };
+                let (v_prim, v_sub, _) = clock_div_indices(v_div, global, len);
+                if let Some(v_idx) = v_prim {
+                    let dst = lane.steps[v_idx];
+                    if dst.active
+                        && !self.is_step_suppressed(Some(TrackId::Sampler), None, Some(part_idx), global)
+                        && (dst.probability >= 0.999
+                            || hash_f32(seed, global, 200 + part_idx as u32) <= dst.probability)
+                    {
+                        let vel = (dst.velocity * if dst.accent { 1.15 } else { 1.0 }).clamp(0.1, 1.0);
+                        self.volca.trigger_part_with_step(part_idx, vel, &dst, &p.sample_parts);
+                        if dst.ratchet > 1 {
+                            let n = dst.ratchet.min(4) as usize;
+                            let sub_len = base_step_samples / n as f32;
+                            for r in 1..n {
+                                self.volca_ratchets.push(RatchetEvent {
+                                    lane: part_idx,
+                                    samples_left: sub_len * r as f32,
+                                    vel: vel * (0.86 - r as f32 * 0.12).max(0.35),
+                                    accent: false,
+                                    tune_offset: 0.0,
+                                });
+                            }
                         }
+                    }
+                }
+                if let Some(vs_idx) = v_sub {
+                    let dst = lane.steps[vs_idx];
+                    if dst.active
+                        && !self.is_step_suppressed(Some(TrackId::Sampler), None, Some(part_idx), global)
+                        && (dst.probability >= 0.999
+                            || hash_f32(seed, global * 2 + 1, 200 + part_idx as u32) <= dst.probability)
+                    {
+                        self.pending_triggers.push((
+                            base_step_samples * 0.5,
+                            PendingTrigger::Volca32 {
+                                part_idx,
+                                step: dst,
+                            },
+                        ));
                     }
                 }
             }
@@ -3459,6 +3874,35 @@ impl Runtime {
                                 gate_samples,
                             );
                         }
+                        PendingTrigger::Melodic32 {
+                            target,
+                            note,
+                            vel,
+                            accent,
+                            slide,
+                            chord,
+                            motion,
+                            gate_samples,
+                            dj_root,
+                        } => {
+                            self.dispatch_melodic_32(
+                                p,
+                                use_rig_pending,
+                                target,
+                                note,
+                                vel,
+                                accent,
+                                slide,
+                                chord,
+                                motion,
+                                gate_samples,
+                                dj_root,
+                            );
+                        }
+                        PendingTrigger::Volca32 { part_idx, step } => {
+                            let vel = (step.velocity * if step.accent { 1.15 } else { 1.0 }).clamp(0.1, 1.0);
+                            self.volca.trigger_part_with_step(part_idx, vel, &step, &p.sample_parts);
+                        }
                     }
                 } else {
                     pi += 1;
@@ -3543,7 +3987,7 @@ impl Runtime {
         let mut mono_p;
         let mut acid_p;
         let drums_p;
-        let samp_p;
+        let mut samp_p;
         let mut sc_base = p.sidechain_amount;
         let mut enable_303_override = false;
         let mut enable_samp_override = false;
@@ -3592,6 +4036,18 @@ impl Runtime {
             acid_p = p.tb303.clone();
             drums_p = p.drums.clone();
             samp_p = p.sampler.clone();
+        }
+        if self.midi_bend_semi.abs() > 0.005 {
+            acid_p.tuning = (acid_p.tuning + self.midi_bend_semi).clamp(-12.0, 12.0);
+            mono_p.vco2_pitch = (mono_p.vco2_pitch + self.midi_bend_semi).clamp(-12.0, 12.0);
+            samp_p.tune_cents = (samp_p.tune_cents + self.midi_bend_semi * 100.0).clamp(-1200.0, 1200.0);
+        }
+        if self.midi_aftertouch > 0.005 {
+            let cut_mul = 1.0 + self.midi_aftertouch * 1.45;
+            moog_p.cutoff = (moog_p.cutoff * cut_mul).clamp(40.0, 16_000.0);
+            pad_p.cutoff = (pad_p.cutoff * cut_mul).clamp(60.0, 16_500.0);
+            mono_p.cutoff = (mono_p.cutoff * cut_mul).clamp(60.0, 17_500.0);
+            acid_p.cutoff = (acid_p.cutoff * cut_mul).clamp(80.0, 10_000.0);
         }
 
         // Smooth click-free sidechain ducking envelope (~2.5ms attack, ~145ms release)
@@ -3708,6 +4164,7 @@ impl Runtime {
         let (moog_l, moog_r) = self.moog.process_stereo(&moog_p);
         let moog_l = moog_l * duck_bass;
         let moog_r = moog_r * duck_bass;
+        self.track_peaks[0] *= 0.9990;
         if audible(ch[0].mute, ch[0].solo) {
             let (gl, gr) = pan_gains(ch[0].pan);
             let sl = moog_l * vol_bass * gl * 0.56;
@@ -3721,6 +4178,8 @@ impl Runtime {
                 &ch[0].filter,
                 self.sr,
             );
+            let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[0].width);
+            self.track_peaks[0] = self.track_peaks[0].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
             if ch[0].delay_enabled {
@@ -3739,6 +4198,7 @@ impl Runtime {
         let (wl, wr) = self
             .arp_chorus
             .process_stereo(mono_l * mono_duck, mono_r * mono_duck, chorus_amt * 0.65);
+        self.track_peaks[1] *= 0.9990;
         if audible(ch[1].mute, ch[1].solo) {
             let (gl, gr) = pan_gains(ch[1].pan);
             let sl_raw = wl * vol_lead * gl * 0.82;
@@ -3752,6 +4212,8 @@ impl Runtime {
                 &ch[1].filter,
                 self.sr,
             );
+            let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[1].width);
+            self.track_peaks[1] = self.track_peaks[1].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
             if ch[1].delay_enabled {
@@ -3767,6 +4229,7 @@ impl Runtime {
         // 2: Acid / 303 — present acid/funk counter-line + 110Hz HPF & 1.6kHz bite console strip
         let acid_s = self.acid.process_sample(&acid_p) * (0.55 + 0.45 * duck);
         let acid_mute = ch[2].mute && !enable_303_override;
+        self.track_peaks[2] *= 0.9990;
         if audible(acid_mute, ch[2].solo) {
             let (gl, gr) = pan_gains(ch[2].pan);
             let sl = acid_s * vol_303 * gl * 0.80;
@@ -3780,6 +4243,8 @@ impl Runtime {
                 &ch[2].filter,
                 self.sr,
             );
+            let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[2].width);
+            self.track_peaks[2] = self.track_peaks[2].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
             if ch[2].delay_enabled {
@@ -3794,9 +4259,11 @@ impl Runtime {
 
         // 3: Drums — TRUE STEREO preserved, punchy studio snap!
         let (dl, dr) = self.drums.process_sample(&drums_p);
+        self.track_peaks[3] *= 0.9990;
         if audible(ch[3].mute, ch[3].solo) {
-            let sl = dl * vol_drums * 0.62;
-            let sr_v = dr * vol_drums * 0.62;
+            let (gl, gr) = pan_gains(ch[3].pan);
+            let sl = dl * vol_drums * gl * 0.62;
+            let sr_v = dr * vol_drums * gr * 0.62;
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[3].0,
                 &mut self.track_filters[3].1,
@@ -3805,6 +4272,8 @@ impl Runtime {
                 &ch[3].filter,
                 self.sr,
             );
+            let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[3].width);
+            self.track_peaks[3] = self.track_peaks[3].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
             if ch[3].delay_enabled {
@@ -3832,6 +4301,7 @@ impl Runtime {
                 .process_stereo(&p.sample_parts, iso_b, iso_t);
         let v_duck = 0.55 + 0.45 * duck;
         let samp_mute = ch[4].mute && !enable_samp_override;
+        self.track_peaks[4] *= 0.9990;
         if audible(samp_mute, ch[4].solo) {
             let (gl, gr) = pan_gains(ch[4].pan);
             let sl_raw = (swl * gl * 0.82 + vl * v_duck * 0.80) * vol_samp;
@@ -3845,6 +4315,8 @@ impl Runtime {
                 &ch[4].filter,
                 self.sr,
             );
+            let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[4].width);
+            self.track_peaks[4] = self.track_peaks[4].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
             if ch[4].delay_enabled {
@@ -3863,6 +4335,7 @@ impl Runtime {
         let (pwl, pwr) = self
             .pad_chorus
             .process_stereo(pad_l * pad_duck, pad_r * pad_duck, chorus_amt.max(0.32));
+        self.track_peaks[5] *= 0.9990;
         if audible(p.mixer.moog_pad_mute, p.mixer.moog_pad_solo) {
             let sl_raw = pwl * vol_pad * 0.88;
             let sr_raw = pwr * vol_pad * 0.88;
@@ -3875,6 +4348,8 @@ impl Runtime {
                 &p.mixer.moog_pad_filter,
                 self.sr,
             );
+            let (sl, sr_v) = apply_stereo_width(sl, sr_v, p.mixer.moog_pad_width);
+            self.track_peaks[5] = self.track_peaks[5].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
             if p.mixer.moog_pad_delay_enabled {
@@ -3887,7 +4362,7 @@ impl Runtime {
             }
         }
 
-        // 6+: Extra Dynamic Synth Tracks (tracks 7..=16) + true stereo + per-instrument filter
+        // 6+: Extra Dynamic Synth Tracks (tracks 7..=16) + true stereo + per-instrument filter + width
         let extra_duck = 0.52 + 0.48 * duck;
         for (ei, tr) in p.extra_tracks.iter().take(MAX_EXTRA_TRACKS).enumerate() {
             let (esl, esr) = self.extra_synths[ei].process_stereo(&tr.synth);
@@ -3906,6 +4381,7 @@ impl Runtime {
                     &tr.filter,
                     self.sr,
                 );
+                let (sl, sr_v) = apply_stereo_width(sl, sr_v, tr.width);
                 mix_l += sl;
                 mix_r += sr_v;
                 del_l += sl * tr.delay_send;
@@ -3913,6 +4389,15 @@ impl Runtime {
                 rev_l += sl * tr.reverb_send;
                 rev_r += sr_v * tr.reverb_send;
             }
+        }
+
+        if p.mixer.mono_sub {
+            let mid = 0.5 * (mix_l + mix_r);
+            let side = 0.5 * (mix_l - mix_r);
+            let low_side = self.mono_sub_lpf.process_lp(side, 120.0, 0.05);
+            let tight_side = side - low_side;
+            mix_l = mid + tight_side;
+            mix_r = mid - tight_side;
         }
 
         // Apply Motion Automation & Party DJ FX modulation cleanly on a stack copy of FxParams
@@ -4048,6 +4533,7 @@ impl Runtime {
         self.peak_r = (self.peak_r * 0.9992).max(out_r.abs());
         telemetry.peak_l = self.peak_l;
         telemetry.peak_r = self.peak_r;
+        telemetry.track_peaks = self.track_peaks;
         telemetry.sampler_playhead = self
             .volca
             .playhead_norm(selected_part)
@@ -6801,5 +7287,148 @@ mod tests {
                 assert!(peak > 0.04, "Drum model {model:?} voice {v:?} too quiet: {peak}");
             }
         }
+    }
+
+    #[test]
+    fn clock_div_and_melodic_probability_shape_step_timing() {
+        let mut base = Project::default();
+        base.bpm = 120.0;
+        base.auto_beat_mode = false;
+        base.party_mode = false;
+        base.song_mode = false;
+        base.current_pattern_mut().moog.clear_active();
+        for ch in &mut base.mixer.channels {
+            ch.mute = true;
+            ch.solo = false;
+        }
+        base.mixer.moog_pad_mute = true;
+        base.mixer.moog_pad_solo = false;
+        // Monitor TB-303 only
+        base.mixer.channels[TrackId::Tb303.index()].mute = false;
+        base.mixer.channels[TrackId::Tb303.index()].solo = true;
+
+        // 1) Eighth clock_div stretches notes at half rate vs ThirtySecond
+        let mut p_eighth = base.clone();
+        p_eighth.current_pattern_mut().tb303.clock_div = ClockDiv::Eighth;
+        for i in 0..16 {
+            p_eighth.current_pattern_mut().tb303.steps[i] = MelodicStep {
+                active: i == 0,
+                note: 48,
+                velocity: 0.9,
+                gate: 0.5,
+                ..Default::default()
+            };
+        }
+        let mut rt_8 = Runtime::new(44_100.0);
+        let mut tel_8 = EngineTelemetry::default();
+        // Global tick 0 triggers step 0; global tick 1 should NOT re-trigger even if step 1 were active
+        p_eighth.current_pattern_mut().tb303.steps[1].active = true;
+        rt_8.trigger_step(&p_eighth, false, false, &mut tel_8);
+        assert!(rt_8.last_acid_note == Some(48));
+        rt_8.last_acid_note = None;
+        rt_8.step = 1;
+        rt_8.trigger_step(&p_eighth, false, false, &mut tel_8);
+        assert_eq!(rt_8.last_acid_note, None, "Odd global tick under 1/8 div must skip");
+
+        // 2) ThirtySecond clock_div queues sub-step trigger
+        let mut p_32 = base.clone();
+        p_32.current_pattern_mut().tb303.clock_div = ClockDiv::ThirtySecond;
+        p_32.current_pattern_mut().tb303.steps[0].active = true;
+        p_32.current_pattern_mut().tb303.steps[1] = MelodicStep {
+            active: true,
+            note: 55,
+            velocity: 0.92,
+            gate: 0.5,
+            ..Default::default()
+        };
+        let mut rt_32 = Runtime::new(44_100.0);
+        let mut tel_32 = EngineTelemetry::default();
+        rt_32.trigger_step(&p_32, false, false, &mut tel_32);
+        assert!(
+            !rt_32.pending_triggers.is_empty(),
+            "Expected 1/32 division to schedule second half-step trigger"
+        );
+
+        // 3) MelodicStep probability = 0.0 suppresses firing
+        let mut p_zero = base;
+        p_zero.current_pattern_mut().tb303.steps[0] = MelodicStep {
+            active: true,
+            note: 48,
+            velocity: 0.9,
+            gate: 0.5,
+            probability: 0.0,
+            ..Default::default()
+        };
+        let mut rt_z = Runtime::new(44_100.0);
+        let mut tel_z = EngineTelemetry::default();
+        rt_z.trigger_step(&p_zero, false, false, &mut tel_z);
+        assert_eq!(rt_z.last_acid_note, None, "Zero probability step must not trigger");
+    }
+
+    #[test]
+    fn standard_midi_export_and_stereo_width_mono_sub_track_peaks_work() {
+        use crate::midi::export_project_midi_bytes;
+        use crate::model::{Scale, SongSection};
+
+        // 1) Standard Format-1 MIDI export for both pattern and arranged song
+        let mut p = Project::default();
+        p.song_mode = true;
+        p.song_sections = vec![
+            SongSection {
+                name: "Intro".into(),
+                pattern: 0,
+                bars: 2,
+                ..Default::default()
+            },
+            SongSection {
+                name: "Drop".into(),
+                pattern: 1,
+                bars: 2,
+                ..Default::default()
+            },
+        ];
+        let root = p.root_note;
+        p.current_pattern_mut().moog.fill_euclidean(5, 1, root, Scale::Minor, 2, 77);
+        p.current_pattern_mut().moog.transpose(2, root, Scale::Minor, true);
+        p.current_pattern_mut().moog.humanize_velocities(88, 0.12);
+        let bytes = export_project_midi_bytes(&p).expect("export SMF midi bytes");
+        assert!(bytes.len() > 64);
+        assert_eq!(&bytes[0..4], b"MThd");
+        assert_eq!(u16::from_be_bytes([bytes[8], bytes[9]]), 1, "Format-1 MIDI expected");
+        assert!(u16::from_be_bytes([bytes[10], bytes[11]]) >= 2, "Expected conductor + instrument tracks");
+        assert_eq!(u16::from_be_bytes([bytes[12], bytes[13]]), 480, "480 PPQ expected");
+
+        // 2) Width = 0.0 folds stereo channel cleanly to mono & populates track_peaks
+        let mut pm = Project::default();
+        pm.current_pattern_mut().moog_pad.steps[0] = MelodicStep {
+            active: true,
+            note: 60,
+            velocity: 0.9,
+            gate: 4.0,
+            chord: crate::model::ChordType::Minor,
+            ..Default::default()
+        };
+        for ch in &mut pm.mixer.channels {
+            ch.solo = false;
+            ch.mute = true;
+        }
+        pm.mixer.moog_pad_mute = false;
+        pm.mixer.moog_pad_solo = true;
+        pm.mixer.moog_pad_width = 0.0;
+        pm.mixer.moog_pad_delay_enabled = false;
+        pm.mixer.moog_pad_reverb_enabled = false;
+        pm.fx.delay_enabled = false;
+        pm.fx.reverb_enabled = false;
+        pm.fx.stereo_chorus = 0.0;
+        pm.mixer.mono_sub = true;
+        let mut rt = Runtime::new(44_100.0);
+        let mut tel = EngineTelemetry::default();
+        let mut max_side = 0.0_f32;
+        for _ in 0..4096 {
+            let (l, r) = rt.process_sample(&pm, true, false, false, 0, &mut tel);
+            max_side = max_side.max((l - r).abs());
+        }
+        assert!(max_side < 0.01, "Width 0.0 should collapse stereo side diff, got {max_side}");
+        assert!(tel.track_peaks[5] > 0.01, "Expected track_peaks[5] (MoogPad) > 0, got {}", tel.track_peaks[5]);
     }
 }

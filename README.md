@@ -195,7 +195,9 @@ Every audio sample is rendered in real time by the lock-minimal stereo engine in
 - **Real Swing:** Even/odd 16th steps stretch symmetrically (`50%–72%`) while preserving rock-solid tempo.
 - **Proper Gate, Legato & Slides:** Per-voice sample-accurate gate timers let 5-note 9th chords sustain across full bars and allow smooth TB-303 & Monologue pitch slides without unwanted retriggering.
 - **Kick-Triggered Sidechain Ducking:** Every kick hit smoothly ducks the Bass, Chords, Arp, 303, and Sampler buses by your **Sidechain** macro for instant electronic bounce and headroom.
-- **Offline Stereo WAV Export:** Clicking **`Export WAV`** renders 16 bars (or your full Song Arrangement) offline through the exact same stereo DSP and mastering chain to a 44.1 kHz 16-bit stereo `.wav` file.
+- **Offline Stereo WAV, Stems & Standard MIDI (`.mid`) Export:** Export stereo 44.1 kHz `.wav` mixes, per-track `.wav` stems, or multi-track Format-1 `.mid` files (with Tempo, Ch 10 GM Drums, Bass, Chord voicings, Lead, Acid, Sampler, and Extra tracks).
+- **Hardware MIDI & CC Learn:** Plug in USB MIDI controllers for Note Input, Velocity, Pitch Bend, Channel Aftertouch, and click-to-assign **MIDI CC Learn** mappings.
+- **Per-Lane Clocks, Probability & Mastering Console:** Independent `1/8`, `1/16`, `1/32` track/drum clock divisions, per-step probability, Euclidean generators, interactive velocity strip, Drive/Shape P-locks, per-track stereo width (`0%–180%`), `Mono Sub <120Hz`, and live channel/master peak meters.
 
 </details>
 

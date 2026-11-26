@@ -144,6 +144,10 @@ impl MotionLocks {
     }
 }
 
+fn default_step_probability() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MelodicStep {
@@ -155,6 +159,8 @@ pub struct MelodicStep {
     pub slide: bool,
     pub chord: ChordType,
     pub motion: MotionLocks,
+    #[serde(default = "default_step_probability")]
+    pub probability: f32,
 }
 
 impl Default for MelodicStep {
@@ -168,6 +174,7 @@ impl Default for MelodicStep {
             slide: false,
             chord: ChordType::Single,
             motion: MotionLocks::default(),
+            probability: 1.0,
         }
     }
 }
@@ -226,6 +233,7 @@ impl MelodicTrackSeq {
             st.note = st.note.clamp(12, 108);
             st.velocity = st.velocity.clamp(0.05, 1.0);
             st.gate = st.gate.clamp(0.05, 16.0);
+            st.probability = st.probability.clamp(0.0, 1.0);
         }
     }
 
@@ -273,6 +281,64 @@ impl MelodicTrackSeq {
 
     pub fn shift(&mut self, delta: isize) {
         rotate_slice(&mut self.steps[..self.step_count.as_usize()], delta);
+    }
+
+    pub fn transpose(&mut self, semitones: i32, root: u8, scale: Scale, quantize_to_scale: bool) {
+        let len = self.step_count.as_usize().min(self.steps.len());
+        for st in &mut self.steps[..len] {
+            let shifted = (st.note as i32 + semitones).clamp(24, 96) as u8;
+            st.note = if quantize_to_scale {
+                scale.quantize(root, shifted).clamp(24, 96)
+            } else {
+                shifted
+            };
+        }
+    }
+
+    pub fn humanize_velocities(&mut self, seed: u32, amount: f32) {
+        let mut rng = SeqRng(seed.max(1));
+        let len = self.step_count.as_usize().min(self.steps.len());
+        let span = amount.clamp(0.02, 0.35);
+        for (i, st) in self.steps[..len].iter_mut().enumerate() {
+            if st.active {
+                let delta = (rng.next_f32() * 2.0 - 1.0) * span;
+                let downbeat_lift = if i % 4 == 0 { 0.04 } else { -0.02 };
+                st.velocity = (st.velocity + delta + downbeat_lift).clamp(0.20, 1.0);
+            }
+        }
+    }
+
+    pub fn fill_euclidean(
+        &mut self,
+        pulses: usize,
+        rotation: usize,
+        root: u8,
+        scale: Scale,
+        base_octave: u8,
+        seed: u32,
+    ) {
+        let len = self.step_count.as_usize().min(self.steps.len());
+        let pattern = euclidean_rhythm(len, pulses, rotation);
+        let low = (root % 12) + base_octave * 12;
+        let high = (low + 19).min(96);
+        let pool = scale.notes_in_range(root, low, high);
+        let mut rng = SeqRng(seed.max(1));
+        for (i, hit) in pattern.into_iter().enumerate() {
+            let st = &mut self.steps[i];
+            st.active = hit;
+            if hit {
+                let p_idx = if i % 4 == 0 {
+                    0
+                } else {
+                    (rng.next_u32() as usize) % pool.len()
+                };
+                st.note = pool[p_idx];
+                st.velocity = if i % 4 == 0 { 0.90 } else { 0.74 };
+                st.gate = 0.72;
+                st.accent = i % 8 == 0;
+                st.probability = 1.0;
+            }
+        }
     }
 
     pub fn clear_active(&mut self) {
@@ -540,6 +606,7 @@ pub struct DrumLane {
     pub step_count: StepCount,
     /// Per-lane Active Steps override (`0` = inherit `step_count`; `1..=64` = Volca-style polymeter length).
     pub active_steps: u8,
+    pub clock_div: ClockDiv,
     pub steps: Vec<DrumStep>,
 }
 
@@ -548,6 +615,7 @@ impl Default for DrumLane {
         Self {
             step_count: StepCount::Steps16,
             active_steps: 0,
+            clock_div: ClockDiv::Sixteenth,
             steps: vec![DrumStep::default(); MAX_STEPS],
         }
     }
@@ -635,6 +703,19 @@ impl DrumLane {
         for (i, hit) in pattern.into_iter().enumerate() {
             self.steps[i].active = hit;
             self.steps[i].velocity = if i % 4 == 0 { 0.92 } else { 0.78 };
+        }
+    }
+
+    pub fn humanize_velocities(&mut self, seed: u32, amount: f32) {
+        let mut rng = SeqRng(seed.max(1));
+        let len = self.effective_len().min(self.steps.len());
+        let span = amount.clamp(0.02, 0.35);
+        for (i, st) in self.steps[..len].iter_mut().enumerate() {
+            if st.active {
+                let delta = (rng.next_f32() * 2.0 - 1.0) * span;
+                let beat_lift = if i % 4 == 0 { 0.03 } else { -0.02 };
+                st.velocity = (st.velocity + delta + beat_lift).clamp(0.18, 1.0);
+            }
         }
     }
 }
