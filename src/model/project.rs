@@ -47,6 +47,10 @@ impl Default for ExtraTrack {
     }
 }
 
+fn default_extra_mask() -> u16 {
+    0x03FF
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SongSection {
@@ -58,6 +62,9 @@ pub struct SongSection {
     /// Bitmask of active studio tracks:
     /// bit 0=Drums, 1=Bass(Moog), 2=Chords(MoogPad), 3=Arp(Monologue), 4=Lead/303, 5=Sampler
     pub track_mask: u8,
+    /// Bitmask of active dynamic extra tracks (`0..MAX_EXTRA_TRACKS`).
+    #[serde(default = "default_extra_mask")]
+    pub extra_mask: u16,
 }
 impl Default for SongSection {
     fn default() -> Self {
@@ -68,6 +75,7 @@ impl Default for SongSection {
             bass_drop: false,
             fill: false,
             track_mask: 0b111111,
+            extra_mask: 0x03FF,
         }
     }
 }
@@ -105,6 +113,94 @@ impl MoogWave {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum SynthEngine {
+    #[default]
+    Analog,
+    FmDx7,
+    Wavetable,
+    PhilharmoniaD50,
+    SoundFont,
+}
+
+impl SynthEngine {
+    pub const ALL: [SynthEngine; 5] = [
+        SynthEngine::Analog,
+        SynthEngine::FmDx7,
+        SynthEngine::Wavetable,
+        SynthEngine::PhilharmoniaD50,
+        SynthEngine::SoundFont,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            SynthEngine::Analog => "Analog",
+            SynthEngine::FmDx7 => "FM-DX7",
+            SynthEngine::Wavetable => "Wavetable",
+            SynthEngine::PhilharmoniaD50 => "Philharmonia",
+            SynthEngine::SoundFont => "SoundFont",
+        }
+    }
+
+    pub const fn bank_names(self) -> &'static [&'static str] {
+        match self {
+            SynthEngine::Analog => &[
+                "Minimoog / Prophet",
+                "OB-Xa Unison",
+                "Juno Chorus",
+                "Acid Ladder",
+                "Warm Sub",
+                "Vintage Brass",
+            ],
+            SynthEngine::FmDx7 => &[
+                "DX7 Rhodes EP",
+                "Glass Bell",
+                "Woody Marimba",
+                "FM Slap Bass",
+                "Digitone Brass",
+                "Crystal Pad",
+            ],
+            SynthEngine::Wavetable => &[
+                "Virus 7x HyperSaw",
+                "PPG Digital Glass",
+                "Vocal Choir",
+                "Waldorf Bell",
+                "Juno PWM Strings",
+                "Acid Morph",
+            ],
+            SynthEngine::PhilharmoniaD50 => &[
+                "Strings Ensemble",
+                "Cinematic Brass",
+                "Real Guitar",
+                "D-50 Fantasia",
+                "Jazz Sax & Winds",
+                "Plucked Chamber",
+                "Solo Violin",
+                "Solo Viola",
+                "Solo Cello",
+                "Double Bass",
+                "Pizzicato Strings",
+                "Banjo",
+                "Mandolin",
+                "Solo Trumpet",
+                "French Horn",
+                "Trombone",
+                "Tuba",
+                "Concert Flute",
+                "Oboe",
+                "Clarinet",
+                "Bass Clarinet",
+                "Cor Anglais",
+                "Bassoon",
+                "Contrabassoon",
+                "Saxophone",
+                "Philharmonia Percussion Kit",
+            ],
+            SynthEngine::SoundFont => &["SF2 Bank"],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MoogParams {
@@ -137,6 +233,20 @@ pub struct MoogParams {
     pub lfo_rate: f32,      // Hz
     pub lfo_to_pitch: f32,  // 0..1
     pub lfo_to_filter: f32, // 0..1
+    #[serde(default)]
+    pub engine: SynthEngine,
+    #[serde(default)]
+    pub engine_bank: u8,
+    #[serde(default = "default_engine_morph")]
+    pub engine_morph: f32,
+    #[serde(default)]
+    pub phaser_mix: f32,
+    #[serde(default)]
+    pub amp_cab: f32,
+}
+
+fn default_engine_morph() -> f32 {
+    0.45
 }
 
 impl Default for MoogParams {
@@ -171,6 +281,11 @@ impl Default for MoogParams {
             lfo_rate: 2.8,
             lfo_to_pitch: 0.04,
             lfo_to_filter: 0.10,
+            engine: SynthEngine::Analog,
+            engine_bank: 0,
+            engine_morph: default_engine_morph(),
+            phaser_mix: 0.0,
+            amp_cab: 0.0,
         }
     }
 }
@@ -326,6 +441,16 @@ pub struct MonologueParams {
     pub lfo_rate: f32, // 0..1
     pub lfo_int: f32,  // -1..=1
     pub lfo_target: LfoTarget,
+    #[serde(default)]
+    pub engine: SynthEngine,
+    #[serde(default)]
+    pub engine_bank: u8,
+    #[serde(default = "default_engine_morph")]
+    pub engine_morph: f32,
+    #[serde(default)]
+    pub phaser_mix: f32,
+    #[serde(default)]
+    pub amp_cab: f32,
 }
 
 impl Default for MonologueParams {
@@ -354,6 +479,11 @@ impl Default for MonologueParams {
             lfo_rate: 0.32,
             lfo_int: 0.15,
             lfo_target: LfoTarget::Shape,
+            engine: SynthEngine::Analog,
+            engine_bank: 0,
+            engine_morph: default_engine_morph(),
+            phaser_mix: 0.0,
+            amp_cab: 0.0,
         }
     }
 }
@@ -407,13 +537,33 @@ pub enum DrumModel {
     #[default]
     Tr808,
     Tr909,
+    Acoustic,
+    Linn80s,
 }
 
 impl DrumModel {
+    pub const ALL: [DrumModel; 4] = [
+        DrumModel::Tr808,
+        DrumModel::Tr909,
+        DrumModel::Acoustic,
+        DrumModel::Linn80s,
+    ];
+
     pub const fn name(self) -> &'static str {
         match self {
             DrumModel::Tr808 => "808",
             DrumModel::Tr909 => "909",
+            DrumModel::Acoustic => "Acoustic",
+            DrumModel::Linn80s => "Linn",
+        }
+    }
+
+    pub const fn short_name(self) -> &'static str {
+        match self {
+            DrumModel::Tr808 => "808",
+            DrumModel::Tr909 => "909",
+            DrumModel::Acoustic => "Acou",
+            DrumModel::Linn80s => "Linn",
         }
     }
 }
@@ -422,7 +572,7 @@ impl DrumModel {
 #[serde(default)]
 pub struct DrumVoiceParams {
     pub model: DrumModel,
-    pub tune: f32,   // -1..=1
+    pub tune: f32,   // -12..=12 semitones
     pub decay: f32,  // 0..1
     pub tone: f32,   // 0..1
     pub snappy: f32, // 0..1
@@ -469,7 +619,7 @@ impl Default for DrumKitParams {
         }; // Kick
         voices[1] = DrumVoiceParams {
             model: DrumModel::Tr909,
-            tune: 0.05,
+            tune: 0.5,
             decay: 0.22,
             tone: 0.55,
             snappy: 0.68,
@@ -519,7 +669,7 @@ impl Default for DrumKitParams {
         }; // OH
         voices[6] = DrumVoiceParams {
             model: DrumModel::Tr808,
-            tune: -0.1,
+            tune: -1.0,
             decay: 0.55,
             tone: 0.5,
             snappy: 0.3,
@@ -619,6 +769,7 @@ pub struct SamplerParams {
     pub start: f32,     // 0..1
     pub end: f32,       // 0..1
     pub bit_crush: f32, // 0..1 extra grit
+    pub filter_enabled: bool,
     pub filter_mode: GlobalFilterMode,
     pub cutoff: f32,    // 150..18000 Hz
     pub resonance: f32, // 0..0.9
@@ -626,6 +777,16 @@ pub struct SamplerParams {
     pub decay: f32,
     pub sustain: f32,
     pub release: f32,
+}
+
+impl SamplerParams {
+    /// Resets the sampler filter to pure transparent passthrough.
+    pub fn set_filter_passthrough(&mut self) {
+        self.filter_enabled = false;
+        self.filter_mode = GlobalFilterMode::LowPass;
+        self.cutoff = 18_000.0;
+        self.resonance = 0.0;
+    }
 }
 
 impl Default for SamplerParams {
@@ -642,6 +803,7 @@ impl Default for SamplerParams {
             start: 0.0,
             end: 1.0,
             bit_crush: 0.15,
+            filter_enabled: true,
             filter_mode: GlobalFilterMode::LowPass,
             cutoff: 7200.0,
             resonance: 0.18,
@@ -660,6 +822,9 @@ pub struct SavedSample {
     pub sample_rate: u32,
     pub pcm_i16_b64: String,
     pub builtin_id: Option<u8>,
+    /// `0` or `1` = mono, `2` = interleaved stereo `[L0, R0, L1, R1, ...]`.
+    #[serde(default)]
+    pub channels: u8,
 }
 
 impl Default for SavedSample {
@@ -669,6 +834,7 @@ impl Default for SavedSample {
             sample_rate: 48_000,
             pcm_i16_b64: String::new(),
             builtin_id: Some(0),
+            channels: 1,
         }
     }
 }
@@ -690,6 +856,57 @@ impl SavedSample {
             sample_rate,
             pcm_i16_b64: b64_encode(&bytes),
             builtin_id,
+            channels: 1,
+        }
+    }
+
+    pub fn from_stereo_pcm(
+        name: impl Into<String>,
+        sample_rate: u32,
+        left: &[f32],
+        right: &[f32],
+        builtin_id: Option<u8>,
+    ) -> Self {
+        let frames = left.len().min(right.len());
+        let mut bytes = Vec::with_capacity(frames * 4);
+        for i in 0..frames {
+            let vl = (left[i].clamp(-1.0, 1.0) * 32767.0).round() as i16;
+            let vr = (right[i].clamp(-1.0, 1.0) * 32767.0).round() as i16;
+            bytes.extend_from_slice(&vl.to_le_bytes());
+            bytes.extend_from_slice(&vr.to_le_bytes());
+        }
+        Self {
+            name: name.into(),
+            sample_rate,
+            pcm_i16_b64: b64_encode(&bytes),
+            builtin_id,
+            channels: 2,
+        }
+    }
+
+    pub fn decode_stereo_pcm(&self) -> Option<(Vec<f32>, Vec<f32>)> {
+        if self.pcm_i16_b64.is_empty() {
+            return None;
+        }
+        let bytes = b64_decode(&self.pcm_i16_b64).ok()?;
+        if self.channels == 2 {
+            let frames = bytes.len() / 4;
+            let mut left = Vec::with_capacity(frames);
+            let mut right = Vec::with_capacity(frames);
+            for chunk in bytes.chunks_exact(4) {
+                let vl = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
+                let vr = i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0;
+                left.push(vl);
+                right.push(vr);
+            }
+            Some((left, right))
+        } else {
+            let mut mono = Vec::with_capacity(bytes.len() / 2);
+            for chunk in bytes.chunks_exact(2) {
+                let v = i16::from_le_bytes([chunk[0], chunk[1]]);
+                mono.push(v as f32 / 32768.0);
+            }
+            Some((mono.clone(), mono))
         }
     }
 
@@ -698,12 +915,22 @@ impl SavedSample {
             return None;
         }
         let bytes = b64_decode(&self.pcm_i16_b64).ok()?;
-        let mut out = Vec::with_capacity(bytes.len() / 2);
-        for chunk in bytes.chunks_exact(2) {
-            let v = i16::from_le_bytes([chunk[0], chunk[1]]);
-            out.push(v as f32 / 32768.0);
+        if self.channels == 2 {
+            let mut out = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                let vl = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0;
+                let vr = i16::from_le_bytes([chunk[2], chunk[3]]) as f32 / 32768.0;
+                out.push((vl + vr) * 0.5);
+            }
+            Some(out)
+        } else {
+            let mut out = Vec::with_capacity(bytes.len() / 2);
+            for chunk in bytes.chunks_exact(2) {
+                let v = i16::from_le_bytes([chunk[0], chunk[1]]);
+                out.push(v as f32 / 32768.0);
+            }
+            Some(out)
         }
-        Some(out)
     }
 }
 
@@ -722,6 +949,7 @@ pub struct SamplePart {
     pub loop_mode: LoopMode,
     pub mode: SamplerMode,
     pub bit_crush: f32,
+    pub filter_enabled: bool,
     pub filter_mode: GlobalFilterMode,
     pub cutoff: f32,
     pub resonance: f32,
@@ -751,6 +979,7 @@ impl Default for SamplePart {
             loop_mode: LoopMode::OneShot,
             mode: SamplerMode::HiFi,
             bit_crush: 0.0,
+            filter_enabled: true,
             filter_mode: GlobalFilterMode::LowPass,
             cutoff: 16_000.0,
             resonance: 0.12,
@@ -768,6 +997,14 @@ impl Default for SamplePart {
 }
 
 impl SamplePart {
+    /// Resets this pad's filter to pure transparent passthrough.
+    pub fn set_filter_passthrough(&mut self) {
+        self.filter_enabled = false;
+        self.filter_mode = GlobalFilterMode::LowPass;
+        self.cutoff = 18_000.0;
+        self.resonance = 0.0;
+    }
+
     pub fn to_sampler_params(&self) -> SamplerParams {
         SamplerParams {
             mode: self.mode,
@@ -781,6 +1018,7 @@ impl SamplePart {
             start: self.start,
             end: self.end,
             bit_crush: self.bit_crush,
+            filter_enabled: self.filter_enabled,
             filter_mode: self.filter_mode,
             cutoff: self.cutoff,
             resonance: self.resonance,
@@ -811,6 +1049,7 @@ impl SamplePart {
                     sample_rate: 48_000,
                     pcm_i16_b64: String::new(),
                     builtin_id: Some(bid),
+                    channels: 1,
                 },
                 generation: (i as u64) + 1,
                 transpose: trans,
@@ -885,10 +1124,10 @@ impl Default for MixerParams {
             filter: TrackFilterParams::default(),
         }; // Moog
         channels[1] = TrackMixerChannel {
-            volume: 0.75,
+            volume: 0.78,
             pan: 0.12,
-            delay_send: 0.30,
-            reverb_send: 0.10,
+            delay_send: 0.42,
+            reverb_send: 0.36,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -898,8 +1137,8 @@ impl Default for MixerParams {
         channels[2] = TrackMixerChannel {
             volume: 0.82,
             pan: 0.0,
-            delay_send: 0.25,
-            reverb_send: 0.04,
+            delay_send: 0.34,
+            reverb_send: 0.18,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -907,10 +1146,10 @@ impl Default for MixerParams {
             filter: TrackFilterParams::default(),
         }; // 303
         channels[3] = TrackMixerChannel {
-            volume: 0.56,
+            volume: 0.58,
             pan: 0.0,
             delay_send: 0.06,
-            reverb_send: 0.025,
+            reverb_send: 0.14,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -920,8 +1159,8 @@ impl Default for MixerParams {
         channels[4] = TrackMixerChannel {
             volume: 0.80,
             pan: -0.14,
-            delay_send: 0.28,
-            reverb_send: 0.14,
+            delay_send: 0.34,
+            reverb_send: 0.36,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -942,9 +1181,9 @@ impl Default for MixerParams {
         Self {
             channels,
             master_volume: 0.88,
-            moog_pad_volume: 0.78,
-            moog_pad_reverb_send: 0.28,
-            moog_pad_delay_send: 0.10,
+            moog_pad_volume: 0.80,
+            moog_pad_reverb_send: 0.56,
+            moog_pad_delay_send: 0.24,
             moog_pad_delay_enabled: true,
             moog_pad_reverb_enabled: true,
             moog_pad_mute: false,
@@ -1119,9 +1358,15 @@ pub struct FxParams {
     pub reverb_size: f32,
     pub reverb_damp: f32,
     pub reverb_mix: f32,
+    #[serde(default = "default_reverb_shimmer")]
+    pub reverb_shimmer: f32,
     pub analog_warmth: f32,
     #[serde(default = "default_master_crisp")]
     pub master_crisp: f32,
+    #[serde(default = "default_stereo_chorus")]
+    pub stereo_chorus: f32,
+    #[serde(default = "default_club_punch")]
+    pub club_punch: f32,
     pub global_filter_mode: GlobalFilterMode,
     pub global_filter_cutoff: f32,
     pub global_filter_resonance: f32,
@@ -1146,14 +1391,17 @@ impl Default for FxParams {
             reverb_enabled: true,
             global_filter_enabled: true,
             delay_div: DelayDivision::DottedEighth,
-            delay_feedback: 0.28,
-            delay_tone: 0.58,
-            delay_mix: 0.20,
-            reverb_size: 0.42,
-            reverb_damp: 0.62,
-            reverb_mix: 0.16,
-            analog_warmth: 0.05,
+            delay_feedback: 0.36,
+            delay_tone: 0.62,
+            delay_mix: 0.36,
+            reverb_size: 0.62,
+            reverb_damp: 0.48,
+            reverb_mix: 0.42,
+            reverb_shimmer: default_reverb_shimmer(),
+            analog_warmth: 0.14,
             master_crisp: default_master_crisp(),
+            stereo_chorus: default_stereo_chorus(),
+            club_punch: default_club_punch(),
             global_filter_mode: GlobalFilterMode::LowPass,
             global_filter_cutoff: 18000.0,
             global_filter_resonance: 0.08,
@@ -1167,6 +1415,10 @@ impl Default for FxParams {
             circuit_bend: 0.0,
         }
     }
+}
+
+fn default_reverb_shimmer() -> f32 {
+    0.28
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1192,21 +1444,36 @@ pub enum PartyMixMode {
     SingleVibe,
     #[default]
     RelatedVibes,
+    ClubCrate,
+    ChillCrate,
+    RetroCrate,
+    BassCrate,
+    CustomCrate,
     AllVibes,
 }
 
 impl PartyMixMode {
-    pub const ALL: [PartyMixMode; 3] = [
+    pub const ALL: [PartyMixMode; 8] = [
         PartyMixMode::SingleVibe,
         PartyMixMode::RelatedVibes,
+        PartyMixMode::ClubCrate,
+        PartyMixMode::ChillCrate,
+        PartyMixMode::RetroCrate,
+        PartyMixMode::BassCrate,
+        PartyMixMode::CustomCrate,
         PartyMixMode::AllVibes,
     ];
 
     pub const fn name(self) -> &'static str {
         match self {
             PartyMixMode::SingleVibe => "Same Vibe",
-            PartyMixMode::RelatedVibes => "Related Vibes",
-            PartyMixMode::AllVibes => "All Vibes",
+            PartyMixMode::RelatedVibes => "Related",
+            PartyMixMode::ClubCrate => "Club 4x4",
+            PartyMixMode::ChillCrate => "Chill / Lo-Fi",
+            PartyMixMode::RetroCrate => "80s / Synth",
+            PartyMixMode::BassCrate => "Heavy Bass",
+            PartyMixMode::CustomCrate => "Custom Crate",
+            PartyMixMode::AllVibes => "All 24",
         }
     }
 }
@@ -1239,8 +1506,116 @@ fn default_master_crisp() -> f32 {
     0.38
 }
 
+fn default_stereo_chorus() -> f32 {
+    0.48
+}
+
+fn default_club_punch() -> f32 {
+    0.65
+}
+
 fn default_true() -> bool {
     true
+}
+
+fn default_party_crate_mask() -> u32 {
+    0x00FF_FFFF
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ArpMode {
+    #[default]
+    Up,
+    Down,
+    UpDown,
+    Random,
+    AsPlayed,
+}
+
+impl ArpMode {
+    pub const ALL: [ArpMode; 5] = [
+        ArpMode::Up,
+        ArpMode::Down,
+        ArpMode::UpDown,
+        ArpMode::Random,
+        ArpMode::AsPlayed,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            ArpMode::Up => "Up",
+            ArpMode::Down => "Down",
+            ArpMode::UpDown => "Up/Dn",
+            ArpMode::Random => "Rand",
+            ArpMode::AsPlayed => "Played",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum ArpRate {
+    Quarter,
+    Eighth,
+    EighthTriplet,
+    #[default]
+    Sixteenth,
+    ThirtySecond,
+}
+
+impl ArpRate {
+    pub const ALL: [ArpRate; 5] = [
+        ArpRate::Quarter,
+        ArpRate::Eighth,
+        ArpRate::EighthTriplet,
+        ArpRate::Sixteenth,
+        ArpRate::ThirtySecond,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            ArpRate::Quarter => "1/4",
+            ArpRate::Eighth => "1/8",
+            ArpRate::EighthTriplet => "1/8T",
+            ArpRate::Sixteenth => "1/16",
+            ArpRate::ThirtySecond => "1/32",
+        }
+    }
+
+    pub const fn step_beats(self) -> f32 {
+        match self {
+            ArpRate::Quarter => 1.0,
+            ArpRate::Eighth => 0.5,
+            ArpRate::EighthTriplet => 1.0 / 3.0,
+            ArpRate::Sixteenth => 0.25,
+            ArpRate::ThirtySecond => 0.125,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArpParams {
+    pub enabled: bool,
+    pub latch: bool,
+    pub mode: ArpMode,
+    pub rate: ArpRate,
+    pub octaves: u8,
+    pub gate: f32,
+    pub swing: bool,
+}
+
+impl Default for ArpParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            latch: false,
+            mode: ArpMode::Up,
+            rate: ArpRate::Sixteenth,
+            octaves: 2,
+            gate: 0.55,
+            swing: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1264,6 +1639,8 @@ pub struct Project {
     pub party_auto_evolve: bool,
     #[serde(default)]
     pub party_mix_mode: PartyMixMode,
+    #[serde(default = "default_party_crate_mask")]
+    pub party_crate_mask: u32,
     #[serde(default)]
     pub party_pace: PartyPace,
     #[serde(default = "default_true")]
@@ -1287,6 +1664,8 @@ pub struct Project {
     pub mixer: MixerParams,
     pub fx: FxParams,
     #[serde(default)]
+    pub arp: ArpParams,
+    #[serde(default)]
     pub drop_macro: DropMacroConfig,
     pub midi: MidiSettings,
     pub patterns: Vec<Pattern>,
@@ -1295,6 +1674,10 @@ pub struct Project {
     pub song_sections: Vec<SongSection>,
     pub party_mode: bool,
     pub party_seed: u32,
+    #[serde(default)]
+    pub soundfont_path: Option<String>,
+    #[serde(default)]
+    pub soundfont_preset: usize,
 }
 
 fn default_active_tracks() -> [bool; 6] {
@@ -1475,6 +1858,23 @@ impl Project {
         self.fx.global_filter_env_attack = self.fx.global_filter_env_attack.clamp(0.002, 1.5);
         self.fx.global_filter_env_decay = self.fx.global_filter_env_decay.clamp(0.04, 3.0);
         self.fx.master_crisp = self.fx.master_crisp.clamp(0.0, 1.0);
+        self.fx.stereo_chorus = self.fx.stereo_chorus.clamp(0.0, 1.0);
+        self.fx.club_punch = self.fx.club_punch.clamp(0.0, 1.0);
+        self.fx.reverb_shimmer = self.fx.reverb_shimmer.clamp(0.0, 1.0);
+        self.moog.engine_morph = self.moog.engine_morph.clamp(0.0, 1.0);
+        self.moog.phaser_mix = self.moog.phaser_mix.clamp(0.0, 1.0);
+        self.moog.amp_cab = self.moog.amp_cab.clamp(0.0, 1.0);
+        self.moog_pad.engine_morph = self.moog_pad.engine_morph.clamp(0.0, 1.0);
+        self.moog_pad.phaser_mix = self.moog_pad.phaser_mix.clamp(0.0, 1.0);
+        self.moog_pad.amp_cab = self.moog_pad.amp_cab.clamp(0.0, 1.0);
+        self.monologue.engine_morph = self.monologue.engine_morph.clamp(0.0, 1.0);
+        self.monologue.phaser_mix = self.monologue.phaser_mix.clamp(0.0, 1.0);
+        self.monologue.amp_cab = self.monologue.amp_cab.clamp(0.0, 1.0);
+        for v in &mut self.drums.voices {
+            v.tune = v.tune.clamp(-12.0, 12.0);
+        }
+        self.arp.octaves = self.arp.octaves.clamp(1, 3);
+        self.arp.gate = self.arp.gate.clamp(0.15, 0.95);
         self.drop_macro.normalize();
     }
 
@@ -1495,8 +1895,9 @@ impl Project {
                 p.name = preset.name().into();
                 p.bpm = 116.0;
                 p.root_note = 2;
-                p.fx.delay_mix = 0.10;
-                p.fx.reverb_mix = 0.16;
+                p.fx.delay_mix = 0.36;
+                p.fx.reverb_mix = 0.44;
+                p.fx.reverb_shimmer = 0.34;
                 p.moog.cutoff = 980.0;
                 p.moog_pad.cutoff = 3100.0;
                 p.patterns[0].name = "Night Drive".into();
@@ -1507,8 +1908,9 @@ impl Project {
                 p.name = preset.name().into();
                 p.bpm = 106.0;
                 p.root_note = 7;
-                p.fx.delay_mix = 0.08;
-                p.fx.reverb_mix = 0.12;
+                p.fx.delay_mix = 0.32;
+                p.fx.reverb_mix = 0.38;
+                p.fx.reverb_shimmer = 0.22;
                 p.moog.cutoff = 1800.0;
                 p.patterns[0].name = "Neon Soul".into();
                 return p;
@@ -1520,8 +1922,9 @@ impl Project {
                 p.root_note = 9;
                 p.tb303.cutoff = 720.0;
                 p.tb303.resonance = 0.34;
-                p.fx.delay_mix = 0.08;
-                p.fx.reverb_mix = 0.14;
+                p.fx.delay_mix = 0.34;
+                p.fx.reverb_mix = 0.40;
+                p.fx.reverb_shimmer = 0.24;
                 p.patterns[0].name = "Warm House".into();
                 return p;
             }
@@ -1629,6 +2032,7 @@ impl Project {
             party_energy: 0.70,
             party_auto_evolve: true,
             party_mix_mode: PartyMixMode::RelatedVibes,
+            party_crate_mask: 0x00FF_FFFF,
             party_pace: PartyPace::Normal,
             party_sound_morph: true,
             voice_presets: [0; 6],
@@ -1647,6 +2051,7 @@ impl Project {
             sampler_iso_treble: 1.0,
             mixer: MixerParams::default(),
             fx: FxParams::default(),
+            arp: ArpParams::default(),
             drop_macro: DropMacroConfig::default(),
             midi: MidiSettings::default(),
             patterns: Vec::new(),
@@ -1659,9 +2064,12 @@ impl Project {
                 bass_drop: false,
                 fill: false,
                 track_mask: 0b111111,
+                extra_mask: 0x03FF,
             }],
             party_mode: false,
             party_seed: 0xF00D_5EED,
+            soundfont_path: None,
+            soundfont_preset: 0,
         };
 
         match preset {
@@ -1708,12 +2116,14 @@ impl Project {
                     lfo_rate: 0.35,
                     lfo_int: 0.20,
                     lfo_target: LfoTarget::Shape,
+                    ..MonologueParams::default()
                 };
                 p.sample_data = SavedSample {
                     name: "SK-1 Minor9 Rhodes".to_string(),
                     sample_rate: 48_000,
                     pcm_i16_b64: String::new(),
                     builtin_id: Some(3),
+                    channels: 1,
                 };
 
                 let pat = &mut patterns[0];
@@ -1882,6 +2292,7 @@ impl Project {
                     sample_rate: 48_000,
                     pcm_i16_b64: String::new(),
                     builtin_id: Some(0),
+                    channels: 1,
                 };
 
                 let pat = &mut patterns[0];
@@ -1961,6 +2372,7 @@ impl Project {
                     sample_rate: 48_000,
                     pcm_i16_b64: String::new(),
                     builtin_id: Some(2),
+                    channels: 1,
                 };
 
                 let pat = &mut patterns[0];

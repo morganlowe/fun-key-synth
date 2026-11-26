@@ -412,10 +412,16 @@ impl DrumVoiceId {
         match (self, model) {
             (DrumVoiceId::Kick, super::DrumModel::Tr808) => "808 KICK",
             (DrumVoiceId::Kick, super::DrumModel::Tr909) => "909 KICK",
+            (DrumVoiceId::Kick, super::DrumModel::Acoustic) => "ACOU KICK",
+            (DrumVoiceId::Kick, super::DrumModel::Linn80s) => "LINN KICK",
             (DrumVoiceId::CowbellRim, super::DrumModel::Tr808) => "COWBELL",
             (DrumVoiceId::CowbellRim, super::DrumModel::Tr909) => "RIMSHOT",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Acoustic) => "X-STICK",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Linn80s) => "LINN RIM",
             (DrumVoiceId::Cymbal, super::DrumModel::Tr808) => "808 CYM",
             (DrumVoiceId::Cymbal, super::DrumModel::Tr909) => "CRASH",
+            (DrumVoiceId::Cymbal, super::DrumModel::Acoustic) => "RIDE/CR",
+            (DrumVoiceId::Cymbal, super::DrumModel::Linn80s) => "LINN CYM",
             _ => self.short_name(),
         }
     }
@@ -437,20 +443,36 @@ impl DrumVoiceId {
         match (self, model) {
             (DrumVoiceId::Kick, super::DrumModel::Tr808) => "TR-808 Bass Drum",
             (DrumVoiceId::Kick, super::DrumModel::Tr909) => "TR-909 Bass Drum",
+            (DrumVoiceId::Kick, super::DrumModel::Acoustic) => "Acoustic Birch Bass Drum",
+            (DrumVoiceId::Kick, super::DrumModel::Linn80s) => "LinnDrum 80s Kick",
             (DrumVoiceId::Snare, super::DrumModel::Tr808) => "TR-808 Snare Drum",
             (DrumVoiceId::Snare, super::DrumModel::Tr909) => "TR-909 Snare Drum",
+            (DrumVoiceId::Snare, super::DrumModel::Acoustic) => "Acoustic Maple Snare",
+            (DrumVoiceId::Snare, super::DrumModel::Linn80s) => "LinnDrum 80s Gated Snare",
             (DrumVoiceId::Clap, super::DrumModel::Tr808) => "TR-808 Hand Clap",
             (DrumVoiceId::Clap, super::DrumModel::Tr909) => "TR-909 Hand Clap",
+            (DrumVoiceId::Clap, super::DrumModel::Acoustic) => "Studio Room Hand Clap",
+            (DrumVoiceId::Clap, super::DrumModel::Linn80s) => "LinnDrum 80s Clap",
             (DrumVoiceId::CowbellRim, super::DrumModel::Tr808) => "TR-808 Cowbell",
             (DrumVoiceId::CowbellRim, super::DrumModel::Tr909) => "TR-909 Rimshot",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Acoustic) => "Acoustic Cross-Stick",
+            (DrumVoiceId::CowbellRim, super::DrumModel::Linn80s) => "LinnDrum Sidestick",
             (DrumVoiceId::ClosedHat, super::DrumModel::Tr808) => "TR-808 Closed Hi-Hat",
             (DrumVoiceId::ClosedHat, super::DrumModel::Tr909) => "TR-909 Closed Hi-Hat",
+            (DrumVoiceId::ClosedHat, super::DrumModel::Acoustic) => "Acoustic Bronze Closed Hat",
+            (DrumVoiceId::ClosedHat, super::DrumModel::Linn80s) => "LinnDrum 12-Bit Closed Hat",
             (DrumVoiceId::OpenHat, super::DrumModel::Tr808) => "TR-808 Open Hi-Hat",
             (DrumVoiceId::OpenHat, super::DrumModel::Tr909) => "TR-909 Open Hi-Hat",
+            (DrumVoiceId::OpenHat, super::DrumModel::Acoustic) => "Acoustic Bronze Open Hat",
+            (DrumVoiceId::OpenHat, super::DrumModel::Linn80s) => "LinnDrum 12-Bit Open Hat",
             (DrumVoiceId::Tom, super::DrumModel::Tr808) => "TR-808 Conga / Tom",
             (DrumVoiceId::Tom, super::DrumModel::Tr909) => "TR-909 Low / Mid Tom",
+            (DrumVoiceId::Tom, super::DrumModel::Acoustic) => "Acoustic Studio Rack Tom",
+            (DrumVoiceId::Tom, super::DrumModel::Linn80s) => "LinnDrum / Simmons Tom",
             (DrumVoiceId::Cymbal, super::DrumModel::Tr808) => "TR-808 Cymbal",
             (DrumVoiceId::Cymbal, super::DrumModel::Tr909) => "TR-909 Crash / Ride",
+            (DrumVoiceId::Cymbal, super::DrumModel::Acoustic) => "Acoustic Hammered Crash",
+            (DrumVoiceId::Cymbal, super::DrumModel::Linn80s) => "LinnDrum 12-Bit Crash",
         }
     }
 }
@@ -516,6 +538,8 @@ impl DrumStep {
 #[serde(default)]
 pub struct DrumLane {
     pub step_count: StepCount,
+    /// Per-lane Active Steps override (`0` = inherit `step_count`; `1..=64` = Volca-style polymeter length).
+    pub active_steps: u8,
     pub steps: Vec<DrumStep>,
 }
 
@@ -523,12 +547,32 @@ impl Default for DrumLane {
     fn default() -> Self {
         Self {
             step_count: StepCount::Steps16,
+            active_steps: 0,
             steps: vec![DrumStep::default(); MAX_STEPS],
         }
     }
 }
 
 impl DrumLane {
+    pub fn effective_len(&self) -> usize {
+        if self.active_steps > 0 {
+            (self.active_steps as usize).clamp(1, MAX_STEPS)
+        } else {
+            self.step_count.as_usize()
+        }
+    }
+
+    pub fn shift(&mut self, delta: isize) {
+        let len = self.effective_len();
+        rotate_slice(&mut self.steps[..len], delta);
+    }
+
+    pub fn clear_motion(&mut self) {
+        for st in &mut self.steps {
+            st.clear_step_fx();
+        }
+    }
+
     pub fn clear(&mut self) {
         for st in &mut self.steps {
             *st = DrumStep::default();
@@ -586,7 +630,7 @@ impl DrumLane {
     }
 
     pub fn fill_euclidean(&mut self, pulses: usize, rotation: usize) {
-        let len = self.step_count.as_usize();
+        let len = self.effective_len();
         let pattern = euclidean_rhythm(len, pulses, rotation);
         for (i, hit) in pattern.into_iter().enumerate() {
             self.steps[i].active = hit;

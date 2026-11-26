@@ -32,8 +32,8 @@ Most DAWs and grooveboxes bury beginners under empty timelines, raw MIDI numbers
 
 - **Start in a Vibe, Not a Blank Screen:** Pick one of **24 curated musical vibes** (*Deep House, Heavy Electro Funk, Lo-Fi Chill, Electro-Soul, Night Drive, Acid Club, Ambient Dub, Eurobeat, Imperial Bass, Euphoric Trance, Future Bass*, and more) and press **`Space`**. You immediately have a balanced, true-stereo, sidechained groove playing in real time.
 - **Impossible to Hit a Wrong Note:** Turn on **Auto-Chord** and press any key from **`A` to `K`** to play lush, voice-led 7th/9th/11th chords in key — and with **Band Follow**, the Bass and Arp automatically lock to the chords you play live.
-- **100% Local & Real-Time:** Every synth voice, drum hit, reverb tail, sample chop, and **Party Mode** song arrangement is synthesized locally on your CPU with zero cloud APIs, zero subscriptions, and zero latency bloat.
-- **Beginner-Friendly on Top, Deep Hardware Under the Hood:** Stay on the main **Studio** screen for 1-click presets and Vibe Macros, or dive into the **8-Part Volca Sampler** and **Sound Lab** whenever you want to sculpt 3-oscillator Moog patches, sync/ring-mod Monologue leads, 303 acid lines, or individual 808/909 drum voices.
+- **100% Local & Real-Time:** Every synth voice, drum hit, reverb tail, sample chop, and **Party DJ Mode** song arrangement is synthesized locally on your CPU with zero cloud APIs, zero subscriptions, and zero latency bloat.
+- **5 Synth Engines, 4 Drum Models & 156+ Presets:** Stay on the main **Studio** screen for 1-click presets and Vibe Macros, add up to **10 dynamic Extra Synth/Orchestral Tracks**, or dive into the **8-Part Volca Sampler** and **Sound Lab** (`Analog`, `FM-DX7`, `Mipmapped Wavetable`, `26-Bank Philharmonia Orchestra`, `SF2 SoundFont`, `808 / 909 / Acoustic / 80s Linn` drums, searchable preset browser, favorites & custom User Patch saving, plus `Ctrl+Z` / `Ctrl+Y` Undo/Redo).
 
 ---
 
@@ -81,13 +81,13 @@ Everything you need to build a track on one screen: pick a **Vibe**, switch chor
 ![Volca 8-Part Performance Sampler](docs/screenshots/sampler.png)
 Inspired by the **Korg Volca Sample 2**: load **MP3, WAV, FLAC, or OGG** files onto any of 8 independent pads — or hit **Load & Auto-Chop** to slice a track evenly across all 8 pads with Choke Groups — then sequence all 8 lanes (`P1`–`P8`), drag **Start / End** handles on the live waveform, adjust **Speed (`0.25x–2.0x`)**, and perform live with the **Bass / Treble Analog Isolator**.
 
-### 3. Arrange & Party — Local Song Generator & Section Arranger
+### 3. Arrange & Party — Local DJ Mixer, Up-Next Deck & Full Song Arranger
 ![Arrange and Party Mode](docs/screenshots/arrange-party.png)
-Flip on **Party Mode** to let Fun Key Synth act as a local live DJ/producer — automatically evolving your Vibe through *Intro → Groove → Build → Drop 1 → Break → Drop 2* with filter sweeps, snare builds, and key-locked bass drops — or customize your own section-by-section **Song Arranger** with simple track checkboxes.
+Flip on **Party DJ Mode** to let Fun Key Synth act as a local live DJ/producer — mixing smoothly across **Genre Crates** (*Club 4x4, Chill / Lo-Fi, 80s / Synth, Heavy Bass, Related, Custom Crate, All 24*) with **Smart Tempo Bridging**, an **Up Next** preview & queue deck, and **Capture Song → Studio** to save any generated banger into your editable arrangement — or hit **Auto-Arrange Loop → Song** to turn your Studio groove into a multi-pattern, multi-section track ready for WAV or **Stereo Stem Export**.
 
-### 4. Sound Lab — Full Hardware Synth & Stereo FX Rack
+### 4. Sound Lab — Multi-Engine Hardware Synths, Preset Browser & Stereo FX Rack
 ![Sound Lab View](docs/screenshots/sound-lab.png)
-Dive under the hood for full analog synthesis controls on every instrument (3-osc Moog, dual-VCO Monologue, TB-303 acid bass, per-voice 808/909 drum tuning), a hands-free **`TEST NOTE` (`1/4` | `1/8` | `Drone`)** auto-repeater, and the **Stereo FX & Mixer** rack.
+Dive under the hood for full synthesis controls across **5 Engines** (`Analog`, `FM-DX7`, `Mipmapped Wavetable`, `26-Bank Philharmonia Orchestra`, `SF2 SoundFont`), **4 Drum Models** (`TR-808`, `TR-909`, `Acoustic`, `80s Linn`), **156+ Categorized Presets** with search, **★ Favorites**, and **User Patch Saving**, a hands-free **`TEST NOTE` (`1/4` | `1/8` | `Drone`)** auto-repeater, and the **Stereo FX & Mixer** rack.
 
 ---
 
@@ -236,6 +236,7 @@ Every audio sample is rendered in real time by the lock-minimal stereo engine in
 | Input | Action |
 | :--- | :--- |
 | **`Space`** | Play / Stop transport |
+| **`Ctrl+Z` / `Ctrl+Y`** | Undo / Redo up to 32 project edits |
 | **`A S D F G H J K`** | Play 8 in-key **Auto-Chords**, **Scale-Locked Lead** notes, or white keys in **Chromatic Keys** (`W E T Y U O P` black keys, `A`–`'`) |
 | **`Z` / `X`** or **`[` / `]`** | Shift keyboard octave down / up in Lead, Keys, or Sampler Chromatic mode |
 | **Track `R` / `● REC`** | Arm a specific instrument for Monologue-style **Step Recording** (stopped) or **Live Real-Time Recording** (playing) |

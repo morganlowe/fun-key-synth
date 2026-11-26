@@ -1,15 +1,27 @@
 use crate::{
     dsp::sampler::{
-        generate_builtin_sample, load_audio_to_mono_f32, normalize_peak,
-        trim_silence_and_normalize, BUILTIN_SAMPLE_NAMES,
+        apply_philharmonia_sample_to_part, generate_builtin_sample,
+        generate_builtin_sample_stereo, load_audio_to_stereo_f32, load_volca_kit,
+        normalize_stereo_peak, trim_silence_and_normalize_stereo, BUILTIN_SAMPLE_NAMES,
+        VOLCA_KIT_NAMES, VOLCA_PHIL_CHOP_ITEMS, VOLCA_PHIL_PERC_ITEMS,
     },
     engine::{render_resample_mono, AudioEngine, EngineTelemetry, LiveEvent},
     mic::MicRecorder,
-    model::{GlobalFilterMode, LoopMode, Project, SamplerMode, SavedSample, StepCount, TrackId},
+    model::{
+        DrumLane, GlobalFilterMode, LoopMode, Project, SamplerMode, SavedSample, StepCount,
+        TrackFilterParams, TrackId,
+    },
     settings::StudioTheme,
 };
 use eframe::egui::{self, Color32, RichText, Rounding, Sense, Stroke, Vec2};
 use std::sync::atomic::Ordering;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VolcaPlayMode {
+    #[default]
+    Pads8,
+    Chromatic,
+}
 
 pub struct VolcaUiState {
     pub selected_part: usize,
@@ -19,6 +31,10 @@ pub struct VolcaUiState {
     pub duration_secs: f32,
     pub cached_gen: (usize, u64),
     pub drag_handle: Option<u8>,
+    pub play_mode: VolcaPlayMode,
+    pub drag_paint_state: Option<bool>,
+    pub euclid_hits: usize,
+    pub euclid_rot: usize,
 }
 
 impl Default for VolcaUiState {
@@ -31,6 +47,10 @@ impl Default for VolcaUiState {
             duration_secs: 0.0,
             cached_gen: (usize::MAX, u64::MAX),
             drag_handle: None,
+            play_mode: VolcaPlayMode::Pads8,
+            drag_paint_state: None,
+            euclid_hits: 4,
+            euclid_rot: 0,
         }
     }
 }
@@ -59,18 +79,18 @@ impl VolcaUiState {
         let path = rfd::FileDialog::new()
             .add_filter("Audio (MP3, WAV, FLAC, OGG)", &["mp3", "wav", "flac", "ogg"])
             .pick_file()?;
-        match load_audio_to_mono_f32(&path, 48_000) {
-            Ok(pcm) => {
+        match load_audio_to_stereo_f32(&path, 48_000) {
+            Ok((pcm_l, pcm_r)) => {
                 let sname = path
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("Sample")
                     .to_string();
                 let short = sname.trim_end_matches(".mp3").trim_end_matches(".wav").to_string();
-                let secs = pcm.len() as f32 / 48_000.0;
+                let secs = pcm_l.len() as f32 / 48_000.0;
                 if let Some(part) = proj.sample_parts.get_mut(part_idx) {
                     part.name = short.chars().take(16).collect();
-                    part.sample = SavedSample::from_f32_pcm(sname.clone(), 48_000, &pcm, None);
+                    part.sample = SavedSample::from_stereo_pcm(sname.clone(), 48_000, &pcm_l, &pcm_r, None);
                     part.start = 0.0;
                     part.end = 1.0;
                     part.speed = 1.0;
@@ -78,7 +98,7 @@ impl VolcaUiState {
                     part.tune_cents = 0.0;
                     part.reverse = false;
                     part.mode = SamplerMode::HiFi;
-                    part.cutoff = 16_000.0;
+                    part.set_filter_passthrough();
                     part.mute = false;
                     part.generation = part.generation.wrapping_add(1);
                 }
@@ -93,8 +113,8 @@ impl VolcaUiState {
         let path = rfd::FileDialog::new()
             .add_filter("Audio (MP3, WAV, FLAC, OGG)", &["mp3", "wav", "flac", "ogg"])
             .pick_file()?;
-        match load_audio_to_mono_f32(&path, 48_000) {
-            Ok(pcm) => {
+        match load_audio_to_stereo_f32(&path, 48_000) {
+            Ok((pcm_l, pcm_r)) => {
                 let sname = path
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -106,8 +126,8 @@ impl VolcaUiState {
                     .chars()
                     .take(10)
                     .collect::<String>();
-                let secs = pcm.len() as f32 / 48_000.0;
-                let saved = SavedSample::from_f32_pcm(sname.clone(), 48_000, &pcm, None);
+                let secs = pcm_l.len() as f32 / 48_000.0;
+                let saved = SavedSample::from_stereo_pcm(sname.clone(), 48_000, &pcm_l, &pcm_r, None);
                 for (i, part) in proj.sample_parts.iter_mut().take(8).enumerate() {
                     part.name = format!("{} #{}", base, i + 1);
                     part.sample = saved.clone();
@@ -119,7 +139,7 @@ impl VolcaUiState {
                     part.reverse = false;
                     part.loop_mode = LoopMode::OneShot;
                     part.mode = SamplerMode::HiFi;
-                    part.cutoff = 16_000.0;
+                    part.set_filter_passthrough();
                     part.choke_group = 1; // MPC / Volca chop choke group!
                     part.mute = false;
                     part.generation = part.generation.wrapping_add(1);
@@ -175,20 +195,101 @@ pub fn render_volca_sampler(
     let samp_color = Color32::from_rgb(255, 198, 72);
 
     // 1. TOP VOLCA PERFORMANCE BAR + ANALOG ISOLATOR
+    let mut clear_pad_locks = false;
     card(ui, theme, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(
-                RichText::new("VOLCA 8-PART PERFORMANCE SAMPLER")
+                RichText::new("VOLCA 8-PART SAMPLER")
                     .strong()
                     .size(14.0)
                     .color(samp_color),
             );
             ui.separator();
 
+            ui.selectable_value(&mut state.play_mode, VolcaPlayMode::Pads8, "Pads (1-8 / A-K)")
+                .on_hover_text("Keys 1-8 and A-K directly trigger & finger-drum Pads 1-8");
+            ui.selectable_value(&mut state.play_mode, VolcaPlayMode::Chromatic, "Chromatic")
+                .on_hover_text("Play the selected Pad melodically across the QWERTY keyboard");
+
+            ui.menu_button("Kit ▾", |ui| {
+                for (kid, kname) in VOLCA_KIT_NAMES.iter().enumerate() {
+                    if ui.button(*kname).clicked() {
+                        let msg = load_volca_kit(&mut proj.sample_parts, kid, 44_100);
+                        proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                        toast_msg = Some(msg);
+                        ui.close_menu();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Load an instant 8-pad Philharmonia Percussion, Chop, or Vintage Kit");
+
+            ui.menu_button("Groove ▾", |ui| {
+                for (gid, gname) in [
+                    (0usize, "House 4x4"),
+                    (1, "Boom Bap"),
+                    (2, "Breakbeat"),
+                    (3, "Afro / Polyrhythm"),
+                    (4, "Auto-Chop Cycle"),
+                ] {
+                    if ui.button(gname).clicked() {
+                        toast_msg = Some(apply_volca_groove_preset(proj, gid));
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear All 8 Lanes").clicked() {
+                    for l in &mut proj.current_pattern_mut().sample_lanes {
+                        l.clear();
+                        l.active_steps = 0;
+                    }
+                    toast_msg = Some("Cleared all 8 sample pattern lanes".into());
+                    ui.close_menu();
+                }
+            })
+            .response
+            .on_hover_text("Populate instant Volca step grooves across all 8 sample lanes");
+
+            ui.separator();
+            let ch = &mut proj.mixer.channels[TrackId::Sampler.index()];
+            let m_btn = egui::Button::new(
+                RichText::new(if ch.mute { "MUTED" } else { "ACTIVE" })
+                    .strong()
+                    .size(11.0)
+                    .color(Color32::WHITE),
+            )
+            .fill(if ch.mute {
+                Color32::from_rgb(200, 62, 74)
+            } else {
+                Color32::from_rgb(46, 132, 92)
+            });
+            if ui.add(m_btn).clicked() {
+                ch.mute = !ch.mute;
+            }
+            ui.add(
+                egui::DragValue::new(&mut ch.volume)
+                    .range(0.0..=1.15)
+                    .speed(0.01)
+                    .prefix("Vol ")
+                    .max_decimals(2),
+            );
+            ui.add(
+                egui::DragValue::new(&mut proj.swing)
+                    .range(0.0..=0.75)
+                    .speed(0.01)
+                    .prefix("Swing ")
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+            )
+            .on_hover_text("Volca swing groove amount applied to even 16th steps");
+        });
+
+        ui.add_space(4.0);
+
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add(
                     egui::Button::new(
-                        RichText::new("CHOP MP3/WAV -> 8 PADS")
+                        RichText::new("CHOP -> 8 PADS")
                             .strong()
                             .color(Color32::from_rgb(12, 14, 20)),
                     )
@@ -241,7 +342,7 @@ pub fn render_volca_sampler(
                             p.end = 1.0;
                             p.speed = 1.0;
                             p.mode = SamplerMode::HiFi;
-                            p.cutoff = 16_000.0;
+                            p.set_filter_passthrough();
                             p.mute = false;
                             p.generation = p.generation.wrapping_add(1);
                             proj.mixer.channels[TrackId::Sampler.index()].mute = false;
@@ -269,7 +370,7 @@ pub fn render_volca_sampler(
                 p.end = 1.0;
                 p.speed = 1.0;
                 p.mode = SamplerMode::HiFi;
-                p.cutoff = 16_000.0;
+                p.set_filter_passthrough();
                 p.mute = false;
                 p.generation = p.generation.wrapping_add(1);
                 proj.mixer.channels[TrackId::Sampler.index()].mute = false;
@@ -299,27 +400,6 @@ pub fn render_volca_sampler(
                     *test_repeat_next_t = ctx.input(|i| i.time);
                 }
             }
-
-            ui.separator();
-            let ch = &mut proj.mixer.channels[TrackId::Sampler.index()];
-            let m_btn = egui::Button::new(
-                RichText::new(if ch.mute { "MUTED" } else { "ACTIVE" })
-                    .strong()
-                    .size(11.0)
-                    .color(Color32::WHITE),
-            )
-            .fill(if ch.mute {
-                Color32::from_rgb(200, 62, 74)
-            } else {
-                Color32::from_rgb(46, 132, 92)
-            });
-            if ui.add(m_btn).clicked() {
-                ch.mute = !ch.mute;
-            }
-            ui.scope(|ui| {
-                ui.spacing_mut().slider_width = 96.0;
-                ui.add(egui::Slider::new(&mut ch.volume, 0.0..=1.15).text("Bus Vol").max_decimals(2));
-            });
         });
 
         ui.add_space(6.0);
@@ -369,6 +449,28 @@ pub fn render_volca_sampler(
                 proj.sampler_iso_bass = 1.0;
                 proj.sampler_iso_treble = 1.0;
             }
+            if ui
+                .small_button("Clear All Filters (Thru)")
+                .on_hover_text("Bypass all pad filters, sampler channel filter, isolator EQ, and step filter locks for clean passthrough")
+                .clicked()
+            {
+                proj.sampler_iso_bass = 1.0;
+                proj.sampler_iso_treble = 1.0;
+                proj.sampler.set_filter_passthrough();
+                proj.mixer.channels[TrackId::Sampler.index()].filter = TrackFilterParams::default();
+                for part in &mut proj.sample_parts {
+                    part.set_filter_passthrough();
+                }
+                let pat = proj.current_pattern_mut();
+                pat.motion.iso_bass.fill(None);
+                pat.motion.iso_treble.fill(None);
+                for lane in &mut pat.sample_lanes {
+                    for st in &mut lane.steps {
+                        st.cutoff_lock = None;
+                    }
+                }
+                toast_msg = Some("All sampler filters cleared -> passthrough".to_string());
+            }
             ui.separator();
             let rm_btn = egui::Button::new(
                 RichText::new(if *rec_motion { "REC MOTION ON" } else { "REC MOTION" })
@@ -381,7 +483,11 @@ pub fn render_volca_sampler(
             } else {
                 Color32::from_rgb(36, 42, 58)
             });
-            if ui.add(rm_btn).clicked() {
+            if ui
+                .add(rm_btn)
+                .on_hover_text("Record Pitch, Speed, Filter Cutoff, Pan, and Isolator sweeps per step during playback")
+                .clicked()
+            {
                 *rec_motion = !*rec_motion;
             }
         });
@@ -389,181 +495,282 @@ pub fn render_volca_sampler(
 
     ui.add_space(8.0);
 
-    // 2. 8 LARGE PERFORMANCE PADS (Click/Hold to Trigger & Select, Right-Click for Pad Menu!)
+    // 2. 8 LARGE PERFORMANCE PADS (Click/Hold or Keys 1-8 / A-K to Trigger, M/S under each Pad)
     card(ui, theme, |ui| {
         ui.horizontal(|ui| {
             let avail = ui.available_width();
             let pad_w = ((avail - 7.0 * 6.0) / 8.0).clamp(52.0, 220.0);
-            let pad_h = 66.0;
+            let pad_h = 58.0;
             ui.spacing_mut().item_spacing.x = 6.0;
 
             let mut solo_pad: Option<usize> = None;
             let mut unmute_all = false;
             let mut load_for_pad: Option<usize> = None;
             let active_pat = proj.active_pattern;
+            let all_other_muted = |idx: usize, parts: &[crate::model::SamplePart]| -> bool {
+                !parts[idx].mute
+                    && parts
+                        .iter()
+                        .enumerate()
+                        .take(8)
+                        .all(|(j, p)| j == idx || p.mute)
+            };
+            const PAD_KEY_HINTS: [&str; 8] = ["1/A", "2/S", "3/D", "4/F", "5/G", "6/H", "7/J", "8/K"];
 
             for i in 0..8 {
                 let pc = PAD_COLORS[i];
                 let is_sel = sel == i;
                 let is_held = state.held_pad == Some(i);
+                let is_live = (tel.volca_active_mask & (1u8 << i)) != 0;
                 let is_muted = proj.sample_parts[i].mute;
+                let is_soloed = all_other_muted(i, &proj.sample_parts);
                 let part_name = proj.sample_parts[i].name.clone();
                 let is_rev = proj.sample_parts[i].reverse;
                 let is_loop = proj.sample_parts[i].loop_mode != LoopMode::OneShot;
                 let choke = proj.sample_parts[i].choke_group;
+                let step_hits = {
+                    let lane = &proj.patterns[active_pat].sample_lanes[i];
+                    let elen = lane.effective_len();
+                    lane.steps[..elen].iter().filter(|s| s.active).count()
+                };
 
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(pad_w, pad_h), Sense::click_and_drag());
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(3.0, 3.0);
+                    let (rect, resp) =
+                        ui.allocate_exact_size(Vec2::new(pad_w, pad_h), Sense::click_and_drag());
 
-                if resp.is_pointer_button_down_on() && state.held_pad != Some(i) {
-                    state.selected_part = i;
-                    state.held_pad = Some(i);
-                    proj.mixer.channels[TrackId::Sampler.index()].mute = false;
-                    engine.send_live(LiveEvent::TriggerSamplePart {
-                        part: i,
-                        velocity: 0.92,
-                    });
-                    if *sampler_armed {
-                        if rec_replace && !*rec_take_cleared {
-                            proj.patterns[active_pat].sampler.clear();
-                            for l in &mut proj.patterns[active_pat].sample_lanes {
-                                l.clear();
+                    if resp.is_pointer_button_down_on() && state.held_pad != Some(i) {
+                        state.selected_part = i;
+                        state.held_pad = Some(i);
+                        proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                        engine.send_live(LiveEvent::TriggerSamplePart {
+                            part: i,
+                            velocity: 0.92,
+                        });
+                        if *sampler_armed {
+                            if rec_replace && !*rec_take_cleared {
+                                proj.patterns[active_pat].sampler.clear();
+                                for l in &mut proj.patterns[active_pat].sample_lanes {
+                                    l.clear();
+                                }
+                                *rec_take_cleared = true;
                             }
-                            *rec_take_cleared = true;
-                        }
-                        let lane = &mut proj.patterns[active_pat].sample_lanes[i];
-                        let lane_len = lane.step_count.as_usize();
-                        if playing {
-                            let q_global = if step_phase >= 0.65 {
-                                cur_step + 1
+                            let lane = &mut proj.patterns[active_pat].sample_lanes[i];
+                            let lane_len = lane.effective_len();
+                            if playing {
+                                let q_global = if step_phase >= 0.65 {
+                                    cur_step + 1
+                                } else {
+                                    cur_step
+                                };
+                                let s_idx = q_global % lane_len;
+                                lane.steps[s_idx].active = true;
+                                lane.steps[s_idx].velocity = 0.90;
+                                if q_global > cur_step {
+                                    engine.send_live(LiveEvent::SuppressTrackStep {
+                                        track: Some(TrackId::Sampler),
+                                        extra_idx: None,
+                                        lane: Some(i),
+                                        global_step: q_global,
+                                    });
+                                }
                             } else {
-                                cur_step
-                            };
-                            let s_idx = q_global % lane_len;
-                            lane.steps[s_idx].active = true;
-                            lane.steps[s_idx].velocity = 0.90;
-                            if q_global > cur_step {
-                                engine.send_live(LiveEvent::SuppressTrackStep {
-                                    track: Some(TrackId::Sampler),
-                                    extra_idx: None,
-                                    lane: Some(i),
-                                    global_step: q_global,
-                                });
+                                let s_idx = *step_rec_cursor % lane_len;
+                                lane.steps[s_idx].active = true;
+                                lane.steps[s_idx].velocity = 0.90;
+                                *step_rec_cursor = (s_idx + 1) % lane_len;
+                                *bar_page = *step_rec_cursor / 16;
                             }
-                        } else {
-                            let s_idx = *step_rec_cursor % lane_len;
-                            lane.steps[s_idx].active = true;
-                            lane.steps[s_idx].velocity = 0.90;
-                            *step_rec_cursor = (s_idx + 1) % lane_len;
-                            *bar_page = *step_rec_cursor / 16;
                         }
+                    } else if !resp.is_pointer_button_down_on() && state.held_pad == Some(i) {
+                        if proj.sample_parts[i].loop_mode != LoopMode::OneShot {
+                            engine.send_live(LiveEvent::ReleaseSamplePart { part: i });
+                        }
+                        state.held_pad = None;
                     }
-                } else if !resp.is_pointer_button_down_on() && state.held_pad == Some(i) {
-                    if proj.sample_parts[i].loop_mode != LoopMode::OneShot {
-                        engine.send_live(LiveEvent::ReleaseSamplePart { part: i });
-                    }
-                    state.held_pad = None;
-                }
 
-                resp.context_menu(|ui| {
-                    ui.label(RichText::new(format!("PAD {} — {}", i + 1, part_name)).strong().color(pc));
-                    ui.separator();
-                    if ui.button("Load MP3 / WAV...").clicked() {
-                        load_for_pad = Some(i);
-                        ui.close_menu();
-                    }
-                    if ui.button(if proj.sample_parts[i].mute { "Unmute Pad" } else { "Mute Pad" }).clicked() {
-                        proj.sample_parts[i].mute = !proj.sample_parts[i].mute;
-                        ui.close_menu();
-                    }
-                    if ui.button("Solo Pad").clicked() {
-                        solo_pad = Some(i);
-                        ui.close_menu();
-                    }
-                    if ui.button("All Pads On").clicked() {
-                        unmute_all = true;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    ui.checkbox(&mut proj.sample_parts[i].reverse, "Reverse");
-                    if ui.button("Clear Pad Steps").clicked() {
-                        proj.patterns[active_pat].sample_lanes[i].clear();
-                        ui.close_menu();
-                    }
-                });
+                    resp.context_menu(|ui| {
+                        ui.label(RichText::new(format!("PAD {} — {}", i + 1, part_name)).strong().color(pc));
+                        ui.separator();
+                        if ui.button("Load MP3 / WAV...").clicked() {
+                            load_for_pad = Some(i);
+                            ui.close_menu();
+                        }
+                        if ui.button(if proj.sample_parts[i].mute { "Unmute Pad" } else { "Mute Pad" }).clicked() {
+                            proj.sample_parts[i].mute = !proj.sample_parts[i].mute;
+                            ui.close_menu();
+                        }
+                        if ui.button("Solo Pad").clicked() {
+                            solo_pad = Some(i);
+                            ui.close_menu();
+                        }
+                        if ui.button("All Pads On").clicked() {
+                            unmute_all = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut proj.sample_parts[i].reverse, "Reverse");
+                        if ui.button("Clear Pad Steps").clicked() {
+                            proj.patterns[active_pat].sample_lanes[i].clear();
+                            ui.close_menu();
+                        }
+                    });
 
-                let bg = if is_held {
-                    pc
-                } else if is_muted {
-                    Color32::from_rgb(26, 20, 26)
-                } else if is_sel {
-                    Color32::from_rgb(34, 42, 62)
-                } else {
-                    Color32::from_rgb(22, 27, 38)
-                };
+                    let bg = if is_held {
+                        pc
+                    } else if is_muted {
+                        Color32::from_rgb(26, 20, 26)
+                    } else if is_live {
+                        pc.gamma_multiply(0.32)
+                    } else if is_sel {
+                        Color32::from_rgb(34, 42, 62)
+                    } else {
+                        Color32::from_rgb(22, 27, 38)
+                    };
 
-                let painter = ui.painter();
-                painter.rect_filled(rect, Rounding::same(8.0), bg);
-                painter.rect_stroke(
-                    rect,
-                    Rounding::same(8.0),
-                    Stroke::new(
-                        if is_sel || is_held { 2.0_f32 } else { 1.0_f32 },
-                        if is_held {
-                            Color32::WHITE
-                        } else if is_sel {
-                            pc
-                        } else {
-                            pc.gamma_multiply(0.35)
-                        },
-                    ),
-                );
-                let fg = if is_held {
-                    Color32::from_rgb(12, 14, 20)
-                } else if is_muted {
-                    Color32::from_rgb(110, 115, 132)
-                } else {
-                    Color32::from_rgb(235, 240, 250)
-                };
-
-                painter.text(
-                    rect.left_top() + Vec2::new(7.0, 5.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("P{}", i + 1),
-                    egui::FontId::proportional(11.0),
-                    if is_held { Color32::from_rgb(14, 18, 24) } else { pc },
-                );
-
-                let mut badges = String::new();
-                if is_muted {
-                    badges.push_str("M ");
-                }
-                if is_rev {
-                    badges.push_str("R ");
-                }
-                if is_loop {
-                    badges.push_str("L ");
-                }
-                if choke > 0 {
-                    badges.push_str(&format!("C{choke}"));
-                }
-                if !badges.is_empty() {
-                    painter.text(
-                        rect.right_top() + Vec2::new(-6.0, 5.0),
-                        egui::Align2::RIGHT_TOP,
-                        badges.trim(),
-                        egui::FontId::proportional(9.5),
-                        if is_held { Color32::from_rgb(14, 18, 24) } else { Color32::from_rgb(175, 188, 212) },
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, Rounding::same(8.0), bg);
+                    painter.rect_stroke(
+                        rect,
+                        Rounding::same(8.0),
+                        Stroke::new(
+                            if is_sel || is_held || is_live { 2.0_f32 } else { 1.0_f32 },
+                            if is_held {
+                                Color32::WHITE
+                            } else if is_live || is_sel {
+                                pc
+                            } else {
+                                pc.gamma_multiply(0.35)
+                            },
+                        ),
                     );
-                }
+                    let fg = if is_held {
+                        Color32::from_rgb(12, 14, 20)
+                    } else if is_muted {
+                        Color32::from_rgb(110, 115, 132)
+                    } else {
+                        Color32::from_rgb(235, 240, 250)
+                    };
 
-                painter.text(
-                    rect.center() + Vec2::new(0.0, 7.0),
-                    egui::Align2::CENTER_CENTER,
-                    part_name,
-                    egui::FontId::proportional(11.5),
-                    fg,
-                );
+                    let top_tag = if state.play_mode == VolcaPlayMode::Pads8 {
+                        PAD_KEY_HINTS[i].to_string()
+                    } else {
+                        format!("P{}", i + 1)
+                    };
+                    painter.text(
+                        rect.left_top() + Vec2::new(6.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        top_tag,
+                        egui::FontId::proportional(10.0),
+                        if is_held { Color32::from_rgb(14, 18, 24) } else { pc },
+                    );
+
+                    let mut badges = String::new();
+                    if is_muted {
+                        badges.push_str("M ");
+                    }
+                    if is_rev {
+                        badges.push_str("R ");
+                    }
+                    if is_loop {
+                        badges.push_str("L ");
+                    }
+                    if choke > 0 {
+                        badges.push_str(&format!("C{choke}"));
+                    }
+                    if !badges.is_empty() {
+                        painter.text(
+                            rect.right_top() + Vec2::new(-6.0, 4.0),
+                            egui::Align2::RIGHT_TOP,
+                            badges.trim(),
+                            egui::FontId::proportional(9.5),
+                            if is_held { Color32::from_rgb(14, 18, 24) } else { Color32::from_rgb(175, 188, 212) },
+                        );
+                    }
+
+                    painter.text(
+                        rect.center() + Vec2::new(0.0, 3.0),
+                        egui::Align2::CENTER_CENTER,
+                        part_name,
+                        egui::FontId::proportional(11.0),
+                        fg,
+                    );
+
+                    // Live Trigger LED (bottom-left) & Step Hit Count (bottom-right)
+                    let led_col = if is_held {
+                        Color32::WHITE
+                    } else if is_live {
+                        pc
+                    } else {
+                        Color32::from_rgb(44, 52, 68)
+                    };
+                    painter.circle_filled(rect.left_bottom() + Vec2::new(9.0, -7.0), 3.5, led_col);
+                    if step_hits > 0 {
+                        painter.text(
+                            rect.right_bottom() + Vec2::new(-6.0, -4.0),
+                            egui::Align2::RIGHT_BOTTOM,
+                            format!("{step_hits}st"),
+                            egui::FontId::proportional(9.0),
+                            if is_held { Color32::from_rgb(14, 18, 24) } else { Color32::from_rgb(150, 165, 192) },
+                        );
+                    }
+
+                    // Dedicated M / S micro-row directly below each Pad (no overlapping hitboxes!)
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        let sub_w = ((pad_w - 3.0) * 0.5).max(20.0);
+                        let m_fill = if is_muted {
+                            Color32::from_rgb(190, 58, 70)
+                        } else {
+                            Color32::from_rgb(28, 34, 48)
+                        };
+                        let s_fill = if is_soloed {
+                            Color32::from_rgb(230, 178, 52)
+                        } else {
+                            Color32::from_rgb(28, 34, 48)
+                        };
+                        if ui
+                            .add_sized(
+                                Vec2::new(sub_w, 17.0),
+                                egui::Button::new(
+                                    RichText::new("M")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(if is_muted { Color32::WHITE } else { Color32::from_rgb(175, 188, 210) }),
+                                )
+                                .fill(m_fill),
+                            )
+                            .on_hover_text(format!("Mute / Unmute Pad {}", i + 1))
+                            .clicked()
+                        {
+                            proj.sample_parts[i].mute = !proj.sample_parts[i].mute;
+                        }
+                        if ui
+                            .add_sized(
+                                Vec2::new(sub_w, 17.0),
+                                egui::Button::new(
+                                    RichText::new("S")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(if is_soloed {
+                                            Color32::from_rgb(12, 14, 20)
+                                        } else {
+                                            Color32::from_rgb(175, 188, 210)
+                                        }),
+                                )
+                                .fill(s_fill),
+                            )
+                            .on_hover_text(format!("Solo Pad {} (click again for All On)", i + 1))
+                            .clicked()
+                        {
+                            if is_soloed {
+                                unmute_all = true;
+                            } else {
+                                solo_pad = Some(i);
+                            }
+                        }
+                    });
+                });
             }
 
             if let Some(s_i) = solo_pad {
@@ -700,14 +907,21 @@ pub fn render_volca_sampler(
                     }
                 });
                 ui.label(
-                    RichText::new("Click P1-P8 = Mute  |  Click step = Toggle & Select  |  Right-click step = Reverse / Pitch / Speed / Filter / Ratchet")
+                    RichText::new("Click Name = Select & Audition  |  Click/Drag Steps = Paint  |  Shift+Click = Accent  |  Right-Click = Step FX")
                         .size(10.5)
                         .weak(),
                 );
                 ui.add_space(4.0);
 
+                if !ui.input(|i| i.pointer.primary_down()) {
+                    state.drag_paint_state = None;
+                }
+                let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+                let primary_down = ui.input(|i| i.pointer.primary_down());
+                let shift_held = ui.input(|i| i.modifiers.shift);
+
                 let page_start = (*bar_page) * 16;
-                let cell_w = ((ui.available_width() - 68.0 - 15.0 * 3.0) / 16.0).clamp(16.0, 44.0);
+                let cell_w = ((ui.available_width() - 70.0 - 15.0 * 3.0) / 16.0).clamp(16.0, 44.0);
                 let cell_h = 22.0;
 
                 for part_idx in 0..8 {
@@ -717,25 +931,21 @@ pub fn render_volca_sampler(
                     let short_name: String = proj.sample_parts[part_idx]
                         .name
                         .chars()
-                        .take(7)
+                        .take(5)
                         .collect();
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 3.0;
                         let lbl = egui::Button::new(
-                            RichText::new(if is_muted {
-                                format!("X {short_name}")
-                            } else {
-                                short_name.clone()
-                            })
-                            .size(10.0)
-                            .strong()
-                            .color(if is_muted {
-                                Color32::from_rgb(115, 122, 140)
-                            } else if is_sel {
-                                pc
-                            } else {
-                                Color32::from_rgb(225, 232, 245)
-                            }),
+                            RichText::new(format!("{}:{short_name}", part_idx + 1))
+                                .size(9.5)
+                                .strong()
+                                .color(if is_muted {
+                                    Color32::from_rgb(115, 122, 140)
+                                } else if is_sel {
+                                    pc
+                                } else {
+                                    Color32::from_rgb(225, 232, 245)
+                                }),
                         )
                         .fill(if is_muted {
                             Color32::from_rgb(38, 22, 28)
@@ -744,12 +954,18 @@ pub fn render_volca_sampler(
                         } else {
                             Color32::from_rgb(24, 29, 42)
                         })
-                        .min_size(Vec2::new(60.0, cell_h));
+                        .min_size(Vec2::new(46.0, cell_h));
 
-                        let lresp = ui.add(lbl);
+                        let lresp = ui
+                            .add(lbl)
+                            .on_hover_text("Click to select & audition Pad (Right-click for quick fills)");
                         if lresp.clicked() {
-                            proj.sample_parts[part_idx].mute = !proj.sample_parts[part_idx].mute;
                             state.selected_part = part_idx;
+                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                            engine.send_live(LiveEvent::TriggerSamplePart {
+                                part: part_idx,
+                                velocity: 0.88,
+                            });
                         }
                         lresp.context_menu(|ui| {
                             let lane = &mut proj.patterns[active_pat].sample_lanes[part_idx];
@@ -759,15 +975,15 @@ pub fn render_volca_sampler(
                                 engine.send_live(LiveEvent::TriggerSamplePart { part: part_idx, velocity: 0.92 });
                             }
                             if ui.button("Fill 4x4 (1,5,9,13)").clicked() {
-                                for c in [0, 4, 8, 12] {
-                                    lane.steps[(page_start + c) % 64].active = true;
-                                }
+                                apply_lane_pattern_preset(lane, "4x4", cur_step as u32);
+                                ui.close_menu();
+                            }
+                            if ui.button("Fill Backbeat (5,13)").clicked() {
+                                apply_lane_pattern_preset(lane, "backbeat", cur_step as u32);
                                 ui.close_menu();
                             }
                             if ui.button("Fill Offbeats").clicked() {
-                                for c in [2, 6, 10, 14] {
-                                    lane.steps[(page_start + c) % 64].active = true;
-                                }
+                                apply_lane_pattern_preset(lane, "offbeat", cur_step as u32);
                                 ui.close_menu();
                             }
                             if ui.button("Clear Lane").clicked() {
@@ -776,21 +992,44 @@ pub fn render_volca_sampler(
                             }
                         });
 
+                        let m_btn = egui::Button::new(
+                            RichText::new("M")
+                                .size(9.5)
+                                .strong()
+                                .color(if is_muted { Color32::WHITE } else { Color32::from_rgb(155, 168, 192) }),
+                        )
+                        .fill(if is_muted {
+                            Color32::from_rgb(190, 58, 70)
+                        } else {
+                            Color32::from_rgb(26, 32, 46)
+                        })
+                        .min_size(Vec2::new(17.0, cell_h));
+                        if ui.add(m_btn).on_hover_text(format!("Mute / Unmute P{}", part_idx + 1)).clicked() {
+                            proj.sample_parts[part_idx].mute = !proj.sample_parts[part_idx].mute;
+                        }
+
                         let lane = &mut proj.patterns[active_pat].sample_lanes[part_idx];
-                        let lane_len = lane.step_count.as_usize();
+                        let eff_len = lane.effective_len();
                         for col in 0..16 {
-                            let idx = (page_start + col) % lane_len;
+                            let raw_step = page_start + col;
+                            let in_active_range = raw_step < eff_len;
+                            let idx = raw_step.min(63);
                             let st = &mut lane.steps[idx];
-                            let is_play = playing && (cur_step % lane_len) == (page_start + col);
-                            let is_rec_col = *sampler_armed && !playing && (*step_rec_cursor % lane_len) == (page_start + col);
-                            let beat_tint = if (col / 4) % 2 == 0 {
+                            let is_play = playing && (cur_step % eff_len) == raw_step;
+                            let is_rec_col =
+                                *sampler_armed && !playing && (*step_rec_cursor % eff_len) == raw_step;
+                            let beat_tint = if !in_active_range {
+                                Color32::from_rgb(14, 16, 22)
+                            } else if (col / 4) % 2 == 0 {
                                 Color32::from_rgb(26, 31, 44)
                             } else {
                                 Color32::from_rgb(20, 24, 35)
                             };
                             let is_sel_step = state.selected_step == (part_idx, idx);
                             let fill = if st.active {
-                                if is_muted {
+                                if !in_active_range {
+                                    Color32::from_rgb(44, 48, 60)
+                                } else if is_muted {
                                     Color32::from_rgb(70, 56, 60)
                                 } else if is_play {
                                     Color32::WHITE
@@ -798,6 +1037,8 @@ pub fn render_volca_sampler(
                                     Color32::from_rgb(64, 218, 255)
                                 } else if st.ratchet > 1 {
                                     Color32::from_rgb(255, 118, 192)
+                                } else if st.accent {
+                                    pc
                                 } else {
                                     pc.gamma_multiply(0.84)
                                 }
@@ -806,17 +1047,42 @@ pub fn render_volca_sampler(
                             } else {
                                 beat_tint
                             };
-                            let (rect, resp) =
-                                ui.allocate_exact_size(Vec2::new(cell_w, cell_h), Sense::click());
-                            if resp.clicked() {
-                                st.active = !st.active;
+                            let (rect, resp) = ui.allocate_exact_size(
+                                Vec2::new(cell_w, cell_h),
+                                Sense::click_and_drag(),
+                            );
+                            let is_hovered = resp.hovered();
+                            if is_hovered && primary_pressed {
+                                if shift_held {
+                                    st.accent = !st.accent;
+                                    if st.accent {
+                                        st.active = true;
+                                        st.velocity = 1.0;
+                                    }
+                                    state.drag_paint_state = None;
+                                } else {
+                                    st.active = !st.active;
+                                    state.drag_paint_state = Some(st.active);
+                                    if st.active {
+                                        st.velocity = 0.88;
+                                        proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                                    }
+                                }
+                                state.selected_part = part_idx;
                                 state.selected_step = (part_idx, idx);
                                 if *sampler_armed && !playing {
                                     *step_rec_cursor = idx;
                                 }
-                                if st.active {
-                                    st.velocity = 0.88;
-                                    proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                            } else if is_hovered && primary_down {
+                                if let Some(paint_val) = state.drag_paint_state {
+                                    if st.active != paint_val {
+                                        st.active = paint_val;
+                                        if st.active {
+                                            st.velocity = 0.88;
+                                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                                        }
+                                    }
+                                    state.selected_step = (part_idx, idx);
                                 }
                             }
                             resp.context_menu(|ui| {
@@ -911,8 +1177,90 @@ pub fn render_volca_sampler(
                     });
                 }
 
-                // Inline Per-Step FX (P-Lock) Inspector for Selected Step!
+                // Selected-Sample Pattern Toolbar + Polymeter Active Steps!
                 ui.add_space(6.0);
+                ui.separator();
+                {
+                    let lane = &mut proj.patterns[active_pat].sample_lanes[sel];
+                    let sel_color = PAD_COLORS[sel];
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("LANE P{}:", sel + 1))
+                                .strong()
+                                .size(11.0)
+                                .color(sel_color),
+                        );
+                        for (preset_id, lbl) in [
+                            ("4x4", "4x4"),
+                            ("backbeat", "Back"),
+                            ("offbeat", "Off"),
+                            ("8ths", "8ths"),
+                            ("sync", "Sync"),
+                            ("rand", "Rand"),
+                        ] {
+                            if ui.small_button(lbl).clicked() {
+                                apply_lane_pattern_preset(
+                                    lane,
+                                    preset_id,
+                                    (cur_step as u32).wrapping_add(sel as u32 * 31).wrapping_add(1),
+                                );
+                                proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                            }
+                        }
+                        if ui.small_button("◀").on_hover_text("Rotate lane steps left by 1").clicked() {
+                            lane.shift(-1);
+                        }
+                        if ui.small_button("▶").on_hover_text("Rotate lane steps right by 1").clicked() {
+                            lane.shift(1);
+                        }
+                        if ui.small_button("Clr").on_hover_text("Clear active steps on this lane").clicked() {
+                            lane.clear();
+                        }
+                        if ui.small_button("Clr FX").on_hover_text("Clear Motion/P-locks on this lane").clicked() {
+                            lane.clear_motion();
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let max_e = lane.effective_len().min(32).max(1);
+                        state.euclid_hits = state.euclid_hits.clamp(1, max_e);
+                        state.euclid_rot = state.euclid_rot.min(max_e.saturating_sub(1));
+                        ui.label(RichText::new("Euclid:").size(11.0).weak());
+                        ui.add(egui::DragValue::new(&mut state.euclid_hits).range(1..=max_e).prefix("H:"));
+                        ui.add(egui::DragValue::new(&mut state.euclid_rot).range(0..=max_e.saturating_sub(1)).prefix("R:"));
+                        if ui.small_button("Fill Euclid").on_hover_text("Spread hits evenly across this lane's Active Steps").clicked() {
+                            lane.fill_euclidean(state.euclid_hits, state.euclid_rot);
+                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                        }
+                        ui.separator();
+                        ui.label(RichText::new("Active Steps:").size(11.0).weak());
+                        let mut a_steps = lane.active_steps;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut a_steps)
+                                    .range(0..=64)
+                                    .custom_formatter(|v, _| {
+                                        if v <= 0.5 {
+                                            "Full".to_string()
+                                        } else {
+                                            format!("{:.0}", v)
+                                        }
+                                    }),
+                            )
+                            .on_hover_text("Per-lane Active Steps for Volca polymeter (0 = Full track length)")
+                            .changed()
+                        {
+                            lane.active_steps = a_steps;
+                        }
+                        for (val, lbl) in [(0u8, "Full"), (8, "8"), (12, "12"), (16, "16")] {
+                            if ui.selectable_label(lane.active_steps == val, lbl).clicked() {
+                                lane.active_steps = val;
+                            }
+                        }
+                    });
+                }
+
+                // Inline Per-Step FX (P-Lock) Inspector for Selected Step!
+                ui.add_space(4.0);
                 ui.separator();
                 let (sp_part, sp_step) = state.selected_step;
                 let sp_part = sp_part.min(7);
@@ -950,31 +1298,6 @@ pub fn render_volca_sampler(
                         st.ratchet = 1;
                     }
                 });
-
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.small_button("Auto-Chop Groove").on_hover_text("Create a groovy rhythmic chop pattern across Pads 1–8").clicked() {
-                        let pat = &mut proj.patterns[active_pat];
-                        for l in &mut pat.sample_lanes {
-                            l.clear();
-                        }
-                        for bar in 0..4 {
-                            let base = bar * 16;
-                            for (step, pad_i) in [(0, 0), (3, 1), (6, 2), (8, 3), (10, 4), (12, 5), (14, 6), (15, 7)] {
-                                let p = (pad_i + bar) % 8;
-                                let s = &mut pat.sample_lanes[p].steps[base + step];
-                                s.active = true;
-                                s.velocity = if step % 4 == 0 { 0.92 } else { 0.78 };
-                            }
-                        }
-                        proj.mixer.channels[TrackId::Sampler.index()].mute = false;
-                    }
-                    if ui.small_button("Clear All 8 Lanes").clicked() {
-                        for l in &mut proj.patterns[active_pat].sample_lanes {
-                            l.clear();
-                        }
-                    }
-                });
             });
         });
 
@@ -990,7 +1313,7 @@ pub fn render_volca_sampler(
                             .color(pc),
                     );
                     egui::ComboBox::from_id_salt("volca_builtin")
-                        .width(135.0)
+                        .width(125.0)
                         .selected_text(&proj.sample_parts[sel].sample.name)
                         .show_ui(ui, |ui| {
                             for (bi, &bname) in BUILTIN_SAMPLE_NAMES.iter().enumerate() {
@@ -1006,18 +1329,80 @@ pub fn render_volca_sampler(
                                     p.start = 0.0;
                                     p.end = 1.0;
                                     p.speed = 1.0;
+                                    p.set_filter_passthrough();
                                     p.generation = p.generation.wrapping_add(1);
                                 }
                             }
                         });
+                    ui.menu_button("Philharmonia ▾", |ui| {
+                        ui.menu_button("Percussion", |ui| {
+                            for &(label, folder) in VOLCA_PHIL_PERC_ITEMS {
+                                if ui.button(label).clicked() {
+                                    match apply_philharmonia_sample_to_part(
+                                        &mut proj.sample_parts[sel],
+                                        label,
+                                        folder,
+                                        false,
+                                        1.45,
+                                        44_100,
+                                    ) {
+                                        Ok(()) => {
+                                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                                            engine.send_live(LiveEvent::TriggerSamplePart {
+                                                part: sel,
+                                                velocity: 0.90,
+                                            });
+                                            toast_msg = Some(format!("Loaded {label} -> Pad {}", sel + 1));
+                                        }
+                                        Err(e) => toast_msg = Some(e),
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.menu_button("Acoustic Chops", |ui| {
+                            for &(label, folder) in VOLCA_PHIL_CHOP_ITEMS {
+                                let pizz = folder == "violin" || folder == "cello";
+                                if ui.button(label).clicked() {
+                                    match apply_philharmonia_sample_to_part(
+                                        &mut proj.sample_parts[sel],
+                                        label,
+                                        folder,
+                                        pizz,
+                                        1.70,
+                                        44_100,
+                                    ) {
+                                        Ok(()) => {
+                                            proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+                                            engine.send_live(LiveEvent::TriggerSamplePart {
+                                                part: sel,
+                                                velocity: 0.90,
+                                            });
+                                            toast_msg = Some(format!("Loaded {label} -> Pad {}", sel + 1));
+                                        }
+                                        Err(e) => toast_msg = Some(e),
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    })
+                    .response
+                    .on_hover_text("Load any Philharmonia Orchestra percussion hit or acoustic instrument onto this Pad");
                     if ui.small_button("Trim").clicked() {
                         let p = &mut proj.sample_parts[sel];
                         let sr = p.sample.sample_rate.max(8_000);
-                        let pcm = p.sample.decode_f32_pcm().unwrap_or_else(|| {
-                            generate_builtin_sample(p.sample.builtin_id.unwrap_or(3), sr)
+                        let (pcm_l, pcm_r) = p.sample.decode_stereo_pcm().unwrap_or_else(|| {
+                            generate_builtin_sample_stereo(p.sample.builtin_id.unwrap_or(3), sr)
                         });
-                        let trimmed = trim_silence_and_normalize(&pcm, sr);
-                        p.sample = SavedSample::from_f32_pcm(p.sample.name.clone(), sr, &trimmed, None);
+                        let (trim_l, trim_r) = trim_silence_and_normalize_stereo(&pcm_l, &pcm_r, sr);
+                        p.sample = SavedSample::from_stereo_pcm(
+                            p.sample.name.clone(),
+                            sr,
+                            &trim_l,
+                            &trim_r,
+                            None,
+                        );
                         p.start = 0.0;
                         p.end = 1.0;
                         p.generation = p.generation.wrapping_add(1);
@@ -1025,11 +1410,17 @@ pub fn render_volca_sampler(
                     if ui.small_button("Norm").clicked() {
                         let p = &mut proj.sample_parts[sel];
                         let sr = p.sample.sample_rate.max(8_000);
-                        let pcm = p.sample.decode_f32_pcm().unwrap_or_else(|| {
-                            generate_builtin_sample(p.sample.builtin_id.unwrap_or(3), sr)
+                        let (pcm_l, pcm_r) = p.sample.decode_stereo_pcm().unwrap_or_else(|| {
+                            generate_builtin_sample_stereo(p.sample.builtin_id.unwrap_or(3), sr)
                         });
-                        let norm = normalize_peak(&pcm);
-                        p.sample = SavedSample::from_f32_pcm(p.sample.name.clone(), sr, &norm, None);
+                        let (norm_l, norm_r) = normalize_stereo_peak(&pcm_l, &pcm_r);
+                        p.sample = SavedSample::from_stereo_pcm(
+                            p.sample.name.clone(),
+                            sr,
+                            &norm_l,
+                            &norm_r,
+                            None,
+                        );
                         p.generation = p.generation.wrapping_add(1);
                     }
                 });
@@ -1037,6 +1428,7 @@ pub fn render_volca_sampler(
                 ui.add_space(4.0);
 
                 // Interactive Waveform Canvas for Selected Pad
+                let right_active_pat = proj.active_pattern;
                 let part = &mut proj.sample_parts[sel];
                 let wf_w = ui.available_width().max(260.0);
                 let wf_h = 104.0;
@@ -1124,12 +1516,48 @@ pub fn render_volca_sampler(
 
                 ui.add_space(6.0);
 
-                // Volca Pad Parameters
-                ui.add(egui::Slider::new(&mut part.speed, 0.25..=2.0).suffix("x").max_decimals(2).text("Speed"));
+                // Volca Pad Parameters (+ Live Motion Recording onto active step when REC MOTION & playing!)
+                let motion_live = *rec_motion && playing;
+                let mut motion_write: Option<(Option<f32>, Option<i8>, Option<f32>, Option<f32>)> = None;
+                let (m_cur_spd, m_cur_pitch, m_cur_cutoff, m_cur_pan, m_step_num) = if motion_live {
+                    let lane = &proj.patterns[right_active_pat].sample_lanes[sel];
+                    let elen = lane.effective_len();
+                    let ms = cur_step % elen;
+                    let st = lane.steps[ms];
+                    (st.speed_mult, st.pitch_offset, st.cutoff_lock, st.pan_lock, ms + 1)
+                } else {
+                    (1.0, 0, None, None, 1)
+                };
+                if motion_live {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("● MOTION REC -> P{} Step {m_step_num} (Speed / Pitch / Cutoff / Pan)", sel + 1))
+                                .strong()
+                                .size(11.0)
+                                .color(Color32::from_rgb(255, 110, 120)),
+                        );
+                    });
+                }
+
+                if motion_live {
+                    let mut spd = m_cur_spd;
+                    if ui
+                        .add(egui::Slider::new(&mut spd, 0.25..=2.0).suffix("x").max_decimals(2).text("Speed [Motion]"))
+                        .changed()
+                    {
+                        motion_write.get_or_insert((None, None, None, None)).0 = Some(spd);
+                    }
+                } else {
+                    ui.add(egui::Slider::new(&mut part.speed, 0.25..=2.0).suffix("x").max_decimals(2).text("Speed"));
+                }
                 ui.horizontal_wrapped(|ui| {
                     for &(spd, lbl) in &[(0.5, "0.5x"), (1.0, "1.0x"), (1.5, "1.5x"), (2.0, "2.0x")] {
                         if ui.selectable_label((part.speed - spd).abs() < 0.01, lbl).clicked() {
-                            part.speed = spd;
+                            if motion_live {
+                                motion_write.get_or_insert((None, None, None, None)).0 = Some(spd);
+                            } else {
+                                part.speed = spd;
+                            }
                         }
                     }
                     ui.separator();
@@ -1138,7 +1566,17 @@ pub fn render_volca_sampler(
                     ui.selectable_value(&mut part.loop_mode, LoopMode::Loop, "Loop");
                     ui.selectable_value(&mut part.loop_mode, LoopMode::PingPong, "Ping");
                 });
-                ui.add(egui::Slider::new(&mut part.transpose, -24..=24).suffix(" st").text("Pitch"));
+                if motion_live {
+                    let mut pitch = m_cur_pitch;
+                    if ui
+                        .add(egui::Slider::new(&mut pitch, -24..=24).suffix(" st").text("Pitch [Motion]"))
+                        .changed()
+                    {
+                        motion_write.get_or_insert((None, None, None, None)).1 = Some(pitch);
+                    }
+                } else {
+                    ui.add(egui::Slider::new(&mut part.transpose, -24..=24).suffix(" st").text("Pitch"));
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Choke:");
                     ui.selectable_value(&mut part.choke_group, 0, "Off");
@@ -1151,21 +1589,103 @@ pub fn render_volca_sampler(
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Filter:");
-                    ui.selectable_value(&mut part.filter_mode, GlobalFilterMode::LowPass, "LP");
-                    ui.selectable_value(&mut part.filter_mode, GlobalFilterMode::BandPass, "BP");
-                    ui.selectable_value(&mut part.filter_mode, GlobalFilterMode::HighPass, "HP");
+                    if ui
+                        .selectable_label(!part.filter_enabled, "Thru (Off)")
+                        .on_hover_text("Bypass this pad's filter completely (clean passthrough)")
+                        .clicked()
+                    {
+                        part.set_filter_passthrough();
+                    }
+                    for &(mode, lbl) in &[
+                        (GlobalFilterMode::LowPass, "LP"),
+                        (GlobalFilterMode::BandPass, "BP"),
+                        (GlobalFilterMode::HighPass, "HP"),
+                    ] {
+                        if ui
+                            .selectable_label(part.filter_enabled && part.filter_mode == mode, lbl)
+                            .clicked()
+                        {
+                            part.filter_enabled = true;
+                            part.filter_mode = mode;
+                        }
+                    }
+                    if ui
+                        .small_button("Clear")
+                        .on_hover_text("Reset pad filter to passthrough & clear its step cutoff locks")
+                        .clicked()
+                    {
+                        part.set_filter_passthrough();
+                        clear_pad_locks = true;
+                    }
                 });
-                ui.add(egui::Slider::new(&mut part.cutoff, 120.0..=18_000.0).logarithmic(true).suffix(" Hz").text("Cutoff"));
-                ui.add(egui::Slider::new(&mut part.resonance, 0.0..=0.85).text("Resonance"));
+                if motion_live {
+                    let mut c_hz = m_cur_cutoff
+                        .map(|n| 120.0 * (18_000.0_f32 / 120.0).powf(n.clamp(0.0, 1.0)))
+                        .unwrap_or(part.cutoff.clamp(120.0, 18_000.0));
+                    if ui
+                        .add(egui::Slider::new(&mut c_hz, 120.0..=18_000.0).logarithmic(true).suffix(" Hz").text("Cutoff [Motion]"))
+                        .changed()
+                    {
+                        let norm = ((c_hz / 120.0).ln() / (18_000.0_f32 / 120.0).ln()).clamp(0.0, 1.0);
+                        motion_write.get_or_insert((None, None, None, None)).2 = Some(norm);
+                    }
+                } else if ui
+                    .add(egui::Slider::new(&mut part.cutoff, 120.0..=18_000.0).logarithmic(true).suffix(" Hz").text("Cutoff"))
+                    .changed()
+                {
+                    part.filter_enabled = true;
+                }
+                if ui
+                    .add(egui::Slider::new(&mut part.resonance, 0.0..=0.85).text("Resonance"))
+                    .changed()
+                {
+                    part.filter_enabled = true;
+                }
                 ui.add(egui::Slider::new(&mut part.attack, 0.001..=0.6).suffix(" s").text("Attack"));
                 ui.add(egui::Slider::new(&mut part.decay, 0.02..=2.5).suffix(" s").text("Decay"));
                 ui.add(egui::Slider::new(&mut part.release, 0.01..=2.0).suffix(" s").text("Release"));
                 ui.add(egui::Slider::new(&mut part.level, 0.0..=1.2).text("Level"));
-                ui.add(egui::Slider::new(&mut part.pan, -1.0..=1.0).text("Pan"));
+                if motion_live {
+                    let mut pan_v = m_cur_pan.unwrap_or(part.pan);
+                    if ui
+                        .add(egui::Slider::new(&mut pan_v, -1.0..=1.0).text("Pan [Motion]"))
+                        .changed()
+                    {
+                        motion_write.get_or_insert((None, None, None, None)).3 = Some(pan_v);
+                    }
+                } else {
+                    ui.add(egui::Slider::new(&mut part.pan, -1.0..=1.0).text("Pan"));
+                }
                 ui.add(egui::Slider::new(&mut part.reverb_send, 0.0..=1.0).text("Reverb Send"));
+
+                if let Some((spd_opt, pitch_opt, cut_opt, pan_opt)) = motion_write {
+                    let lane = &mut proj.patterns[right_active_pat].sample_lanes[sel];
+                    let elen = lane.effective_len();
+                    let st = &mut lane.steps[cur_step % elen];
+                    if let Some(v) = spd_opt {
+                        st.speed_mult = v;
+                    }
+                    if let Some(v) = pitch_opt {
+                        st.pitch_offset = v;
+                    }
+                    if let Some(v) = cut_opt {
+                        st.cutoff_lock = Some(v);
+                    }
+                    if let Some(v) = pan_opt {
+                        st.pan_lock = Some(v);
+                    }
+                }
             });
         });
     });
+    if clear_pad_locks {
+        if let Some(lane) = proj.current_pattern_mut().sample_lanes.get_mut(sel) {
+            for st in &mut lane.steps {
+                st.cutoff_lock = None;
+            }
+        }
+        toast_msg = Some(format!("Pad {} filter cleared -> passthrough", sel + 1));
+    }
 
     toast_msg
 }
@@ -1204,4 +1724,149 @@ fn compute_peaks(pcm: &[f32], bins: usize) -> Vec<(f32, f32)> {
         out.push((mn, mx));
     }
     out
+}
+
+pub fn apply_lane_pattern_preset(lane: &mut DrumLane, preset: &str, seed: u32) {
+    let len = lane.effective_len();
+    for st in &mut lane.steps[..len] {
+        st.active = false;
+        st.accent = false;
+    }
+    match preset {
+        "4x4" => {
+            for i in (0..len).step_by(4) {
+                lane.steps[i].active = true;
+                lane.steps[i].velocity = 0.94;
+                lane.steps[i].accent = i % 16 == 0;
+            }
+        }
+        "backbeat" => {
+            for i in 0..len {
+                if i % 16 == 4 || i % 16 == 12 {
+                    lane.steps[i].active = true;
+                    lane.steps[i].velocity = 0.92;
+                }
+            }
+        }
+        "offbeat" => {
+            for i in 0..len {
+                if i % 4 == 2 {
+                    lane.steps[i].active = true;
+                    lane.steps[i].velocity = 0.86;
+                }
+            }
+        }
+        "8ths" => {
+            for i in (0..len).step_by(2) {
+                lane.steps[i].active = true;
+                lane.steps[i].velocity = if i % 4 == 0 { 0.88 } else { 0.72 };
+            }
+        }
+        "sync" => {
+            for i in 0..len {
+                if matches!(i % 16, 0 | 3 | 6 | 10 | 14) {
+                    lane.steps[i].active = true;
+                    lane.steps[i].velocity = if i % 4 == 0 { 0.90 } else { 0.78 };
+                }
+            }
+        }
+        _ => {
+            let mut s = seed.max(1);
+            for i in 0..len {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                let r = (s & 0xFFFF) as f32 / 65536.0;
+                let p = if i % 4 == 0 { 0.50 } else { 0.24 };
+                if r < p {
+                    lane.steps[i].active = true;
+                    lane.steps[i].velocity = 0.68 + r * 0.30;
+                    lane.steps[i].accent = i % 8 == 0;
+                }
+            }
+        }
+    }
+}
+
+pub fn apply_volca_groove_preset(proj: &mut Project, groove_idx: usize) -> String {
+    let pat = proj.current_pattern_mut();
+    for l in &mut pat.sample_lanes {
+        l.clear();
+        l.active_steps = 0;
+    }
+    let label = match groove_idx {
+        0 => {
+            apply_lane_pattern_preset(&mut pat.sample_lanes[0], "4x4", 1);
+            apply_lane_pattern_preset(&mut pat.sample_lanes[1], "backbeat", 2);
+            pat.sample_lanes[2].steps[14].active = true;
+            apply_lane_pattern_preset(&mut pat.sample_lanes[4], "offbeat", 3);
+            apply_lane_pattern_preset(&mut pat.sample_lanes[5], "sync", 4);
+            for i in (0..64).step_by(16) {
+                for off in [3usize, 11, 15] {
+                    pat.sample_lanes[6].steps[i + off].active = true;
+                }
+            }
+            apply_lane_pattern_preset(&mut pat.sample_lanes[7], "8ths", 5);
+            "Applied Volca House 4x4 groove"
+        }
+        1 => {
+            for bar in 0..4 {
+                let b = bar * 16;
+                for s in [0usize, 7, 10] {
+                    pat.sample_lanes[0].steps[b + s].active = true;
+                }
+                for s in [3usize, 9, 15] {
+                    pat.sample_lanes[3].steps[b + s].active = true;
+                }
+                pat.sample_lanes[5].steps[b].active = true;
+                pat.sample_lanes[5].steps[b + 6].active = true;
+                pat.sample_lanes[6].steps[b + 12].active = true;
+            }
+            apply_lane_pattern_preset(&mut pat.sample_lanes[1], "backbeat", 11);
+            apply_lane_pattern_preset(&mut pat.sample_lanes[4], "8ths", 12);
+            "Applied Volca Boom Bap groove"
+        }
+        2 => {
+            for bar in 0..4 {
+                let b = bar * 16;
+                for s in [0usize, 6, 10] {
+                    pat.sample_lanes[0].steps[b + s].active = true;
+                }
+                for s in [4usize, 12, 15] {
+                    pat.sample_lanes[1].steps[b + s].active = true;
+                }
+                pat.sample_lanes[2].steps[b + 14].active = true;
+            }
+            apply_lane_pattern_preset(&mut pat.sample_lanes[4], "8ths", 21);
+            apply_lane_pattern_preset(&mut pat.sample_lanes[7], "sync", 22);
+            "Applied Volca Breakbeat groove"
+        }
+        3 => {
+            pat.sample_lanes[0].active_steps = 16;
+            pat.sample_lanes[0].fill_euclidean(5, 0);
+            pat.sample_lanes[3].active_steps = 12;
+            pat.sample_lanes[3].fill_euclidean(5, 1);
+            pat.sample_lanes[4].active_steps = 16;
+            pat.sample_lanes[4].fill_euclidean(7, 0);
+            pat.sample_lanes[6].active_steps = 12;
+            pat.sample_lanes[6].fill_euclidean(3, 2);
+            pat.sample_lanes[7].active_steps = 16;
+            apply_lane_pattern_preset(&mut pat.sample_lanes[7], "offbeat", 31);
+            "Applied Afro / Polyrhythm (16 vs 12) groove"
+        }
+        _ => {
+            for bar in 0..4 {
+                let base = bar * 16;
+                for (step, pad_i) in [(0, 0), (3, 1), (6, 2), (8, 3), (10, 4), (12, 5), (14, 6), (15, 7)] {
+                    let p = (pad_i + bar) % 8;
+                    let s = &mut pat.sample_lanes[p].steps[base + step];
+                    s.active = true;
+                    s.velocity = if step % 4 == 0 { 0.92 } else { 0.78 };
+                }
+            }
+            "Applied Auto-Chop Cycle groove"
+        }
+    };
+    proj.mixer.channels[TrackId::Sampler.index()].mute = false;
+    label.to_string()
 }

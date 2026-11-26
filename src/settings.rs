@@ -1,3 +1,4 @@
+use crate::model::{DrumKitParams, MonologueParams, MoogParams, SamplerParams, Tb303Params};
 use eframe::egui::{self, Color32};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -135,6 +136,8 @@ pub struct AppSettings {
     pub theme: StudioTheme,
     pub use_vibe_accent: bool,
     pub custom_accent: [u8; 3],
+    #[serde(default)]
+    pub favorite_presets: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -144,7 +147,43 @@ impl Default for AppSettings {
             theme: StudioTheme::Midnight,
             use_vibe_accent: true,
             custom_accent: [64, 196, 255],
+            favorite_presets: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UserPatchData {
+    Drums(DrumKitParams),
+    Moog(MoogParams),
+    Monologue(MonologueParams),
+    Tb303(Tb303Params),
+    Sampler(SamplerParams),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserPatch {
+    pub name: String,
+    pub track_role: String,
+    pub data: UserPatchData,
+}
+
+fn sanitize_patch_filename(name: &str) -> String {
+    let clean: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "custom_patch".to_string()
+    } else {
+        clean
     }
 }
 
@@ -181,6 +220,64 @@ impl AppSettings {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(path, json);
         }
+    }
+
+    pub fn presets_dir() -> Option<PathBuf> {
+        Self::config_path()
+            .and_then(|p| p.parent().map(|dir| dir.join("presets")))
+    }
+
+    pub fn is_favorite(&self, key: &str) -> bool {
+        self.favorite_presets.iter().any(|k| k == key)
+    }
+
+    pub fn toggle_favorite(&mut self, key: &str) {
+        if let Some(pos) = self.favorite_presets.iter().position(|k| k == key) {
+            self.favorite_presets.remove(pos);
+        } else {
+            self.favorite_presets.push(key.to_string());
+        }
+        self.save();
+    }
+
+    pub fn load_user_patches() -> Vec<UserPatch> {
+        let Some(dir) = Self::presets_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Ok(patch) = serde_json::from_str::<UserPatch>(&text) {
+                        out.push(patch);
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out
+    }
+
+    pub fn save_user_patch(patch: &UserPatch) -> Result<(), String> {
+        let dir = Self::presets_dir().ok_or_else(|| "No config directory found".to_string())?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let fname = format!("{}.json", sanitize_patch_filename(&patch.name));
+        let json = serde_json::to_string_pretty(patch).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(fname), json).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_user_patch(name: &str) -> Result<(), String> {
+        let dir = Self::presets_dir().ok_or_else(|| "No config directory found".to_string())?;
+        let fname = format!("{}.json", sanitize_patch_filename(name));
+        let path = dir.join(fname);
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn apply_to_egui(&self, ctx: &egui::Context) {

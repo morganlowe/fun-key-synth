@@ -1,6 +1,9 @@
 use crate::model::{midi_to_hz, MotionLocks, Tb303Params, Tb303Wave};
 
-use super::{osc_pulse, osc_saw, soft_tanh, DiodeLadder303Filter};
+use super::{
+    one_pole_coeff, osc_analog_pulse, osc_analog_saw, soft_ceiling, soft_tanh, AnalogDrift,
+    DiodeLadder303Filter, HalfBandDecim2x, HalfBandUp2x,
+};
 
 #[derive(Debug, Clone)]
 pub struct Tb303Synth {
@@ -13,6 +16,7 @@ pub struct Tb303Synth {
     accent_flag: bool,
     phase: f32,
     vca_env: f32,
+    vca_attack_env: f32,
     vcf_env: f32,
     accent_env: f32,
     slide_active: bool,
@@ -22,6 +26,12 @@ pub struct Tb303Synth {
     slew_cutoff: f32,
     slew_res: f32,
     slew_drive: f32,
+    sub_lp: f32,
+    dc_state: f32,
+    sq_lp: f32,
+    od_up: HalfBandUp2x,
+    od_decim: HalfBandDecim2x,
+    thermal: AnalogDrift,
 }
 
 impl Tb303Synth {
@@ -37,6 +47,7 @@ impl Tb303Synth {
             accent_flag: false,
             phase: 0.0,
             vca_env: 0.0,
+            vca_attack_env: 0.0,
             vcf_env: 0.0,
             accent_env: 0.0,
             slide_active: false,
@@ -46,6 +57,12 @@ impl Tb303Synth {
             slew_cutoff: 420.0,
             slew_res: 0.72,
             slew_drive: 0.38,
+            sub_lp: 0.0,
+            dc_state: 0.0,
+            sq_lp: 0.0,
+            od_up: HalfBandUp2x::new(),
+            od_decim: HalfBandDecim2x::new(),
+            thermal: AnalogDrift::new(0x0303_AC1D),
         }
     }
 
@@ -74,10 +91,12 @@ impl Tb303Synth {
         if slide_from_prev && was_active {
             // Classic 303 slide: glides pitch smoothly and does NOT retrigger filter/amp envelopes!
             self.slide_active = true;
+            self.vca_attack_env = 1.0;
         } else {
             self.current_midi = note as f32;
             self.slide_active = false;
             self.vca_env = 1.0;
+            self.vca_attack_env = 0.0;
             self.vcf_env = 1.0;
             if accent {
                 // Accent capacitor builds up slightly when consecutive accented notes hit
@@ -113,15 +132,16 @@ impl Tb303Synth {
         let target_cutoff = self
             .motion_locks
             .cutoff
-            .map(|n| 40.0 * (8000.0_f32 / 40.0).powf(n.clamp(0.0, 1.0)))
+            .map(|n| 55.0 * (2200.0_f32 / 55.0).powf(n.clamp(0.0, 1.0)))
             .unwrap_or(params.cutoff);
         let target_res = self.motion_locks.resonance.unwrap_or(params.resonance);
         let target_drive = self.motion_locks.drive.unwrap_or(params.overdrive);
         let env_mod = self.motion_locks.shape.unwrap_or(params.env_mod);
 
-        self.slew_cutoff += 0.01 * (target_cutoff - self.slew_cutoff);
-        self.slew_res += 0.01 * (target_res - self.slew_res);
-        self.slew_drive += 0.01 * (target_drive - self.slew_drive);
+        let slew_c = one_pole_coeff(60.0, sr);
+        self.slew_cutoff += slew_c * (target_cutoff - self.slew_cutoff);
+        self.slew_res += slew_c * (target_res - self.slew_res);
+        self.slew_drive += slew_c * (target_drive - self.slew_drive);
 
         // 60ms 303 pitch slide exponential glide
         if self.slide_active {
@@ -131,7 +151,8 @@ impl Tb303Synth {
             self.current_midi = self.target_midi;
         }
 
-        // VCA decay (holds steady during gate, fast 14ms release after gate off, or long ring on accent)
+        // Smooth ~2ms analog VCA attack + decay
+        self.vca_attack_env += one_pole_coeff(220.0, sr) * (1.0 - self.vca_attack_env);
         if self.held {
             let hold_decay = (-1.0 / (1.8 * sr)).exp();
             self.vca_env *= hold_decay;
@@ -154,29 +175,47 @@ impl Tb303Synth {
             return 0.0;
         }
 
-        let freq = midi_to_hz(self.current_midi + params.tuning).clamp(20.0, sr * 0.42);
+        let therm = self.thermal.next(sr);
+        let freq = midi_to_hz(self.current_midi + params.tuning + therm * 0.013).clamp(20.0, sr * 0.42);
         let dt = freq / sr;
         self.phase = (self.phase + dt).fract();
 
         let raw_osc = match params.wave {
-            Tb303Wave::Saw => osc_saw(self.phase, dt),
-            // 303 square has asymmetric rounded pulse character
+            Tb303Wave::Saw => osc_analog_saw(self.phase, dt),
+            // 303 square has frequency-dependent asymmetric rounded pulse character
             Tb303Wave::Square => {
-                let p = osc_pulse(self.phase, dt, 0.52);
-                soft_tanh(p * 1.15 - 0.12 * (self.phase * std::f32::consts::TAU).sin())
+                let duty = 0.50 - 0.045 * ((freq - 55.0) / 300.0).clamp(0.0, 1.0) + therm * 0.012;
+                let p = osc_analog_pulse(self.phase, dt, duty);
+                let sq_alpha = one_pole_coeff(6200.0, sr);
+                self.sq_lp += sq_alpha * (p - self.sq_lp);
+                soft_tanh(self.sq_lp * 1.14 - 0.08 * (self.phase * std::f32::consts::TAU).sin())
             }
         };
 
         let acc_boost = self.accent_env * params.accent;
-        let mod_oct = env_mod * self.vcf_env * 4.4 + acc_boost * 2.1;
-        let cutoff = self.slew_cutoff * 2.0_f32.powf(mod_oct);
-        let filtered = self.filter.process(raw_osc * 0.9, cutoff, self.slew_res);
+        let mod_oct = env_mod * self.vcf_env * 4.2 + acc_boost * 2.0;
+        let cutoff = self.slew_cutoff * (1.0 + therm * 0.015) * 2.0_f32.powf(mod_oct);
+        let filtered = self.filter.process(raw_osc * 0.95, cutoff, self.slew_res);
 
-        // VCA + Accent gain + Overdrive pedal saturation
-        let vca_gain = self.vca_env * (self.velocity + acc_boost * 0.55);
-        let drive_gain = 1.0 + self.slew_drive * 6.5;
-        let driven = soft_tanh(filtered * vca_gain * drive_gain);
+        // VCA + Accent gain + half-band 2x-oversampled asymmetric Boss/Roland overdrive + clean sub floor retention
+        let vca_gain = self.vca_env * self.vca_attack_env * (self.velocity + acc_boost * 0.55);
+        let clean_vca = filtered * vca_gain;
+        let sub_alpha = one_pole_coeff(140.0, sr);
+        self.sub_lp += sub_alpha * (clean_vca - self.sub_lp);
 
-        driven * (0.68 / (1.0 + self.slew_drive * 0.45))
+        let drive_gain = 1.0 + self.slew_drive * 7.5;
+        let od_step = |x: f32| -> f32 {
+            let r = x * drive_gain;
+            let rc = r.clamp(-3.0, 3.0);
+            soft_tanh(r + 0.08 * rc * rc)
+        };
+        let up = self.od_up.process(clean_vca);
+        let od = self.od_decim.process(od_step(up[0]), od_step(up[1]));
+        let dc_alpha = one_pole_coeff(20.0, sr);
+        self.dc_state += dc_alpha * (od - self.dc_state);
+        let od_clean = od - self.dc_state;
+
+        let blend = od_clean * 0.80 + self.sub_lp * 0.42;
+        soft_ceiling(blend * (0.88 / (1.0 + self.slew_drive * 0.35)), 1.0, 0.35)
     }
 }

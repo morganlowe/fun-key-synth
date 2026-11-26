@@ -1,16 +1,19 @@
 use crate::{
     dsp::{
-        sampler::{generate_builtin_sample, VolcaSamplerBank},
-        DrumMachine, MasterFx, MonologueSynth, MoogSynth, Sk1Sampler, Svf12Filter, Tb303Synth,
-        Xorshift32,
+        one_pole_coeff,
+        sampler::{generate_builtin_sample_stereo, VolcaSamplerBank},
+        soundfont::discover_system_soundfonts,
+        AnalogStereoChorus, Biquad, DrumMachine, MasterFx, MonologueSynth, MoogSynth, Sk1Sampler,
+        SoundFontBank, Svf12Filter, Tb303Synth, Xorshift32,
     },
     model::{
         apply_voice_preset, arp_tones_for, bass_midi_for, build_party_song_rig_with_reroll,
         chord_symbol, generate_auto_beat, generate_melodic_tracks, party_palette_label,
-        party_song_title, pick_party_vibe, progression_at, vibe_progressions, voice_led_chord,
-        ChordSlot, DrumVoiceId, FactoryPreset, FilterEnvTrigger, GlobalFilterMode, MelodicStep,
-        MelodicTrackSeq, MotionLocks, PartyPace, PartySongRig, Project, TrackFilterParams, TrackId,
-        Vibe, MAX_EXTRA_TRACKS,
+        party_song_title, pick_party_vibe_crate, progression_at, vibe_progressions, voice_led_chord,
+        voice_led_chord_near, ChordSlot, DrumVoiceId, FactoryPreset, FilterEnvTrigger,
+        GlobalFilterMode, MelodicStep,
+        MelodicTrackSeq, MotionLocks, PartyPace, PartySongRig, Project, SongSection,
+        TrackFilterParams, TrackId, Vibe, ArpMode, ArpRate, MAX_EXTRA_TRACKS,
     },
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -108,6 +111,15 @@ pub enum LiveEvent {
         lane: Option<usize>,
         global_step: usize,
     },
+    LoadSoundFont {
+        bank: Option<Arc<SoundFontBank>>,
+        name: String,
+    },
+    JumpToSongSection {
+        section_idx: usize,
+    },
+    QueueNextPartyVibe(Option<Vibe>),
+    PrevPartySong,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,10 +134,22 @@ pub struct EngineTelemetry {
     pub party_voice_presets: [usize; 6],
     pub party_bpm: f32,
     pub party_vibe_name: String,
+    pub party_vibe: Vibe,
+    pub party_rig_reroll: u32,
+    pub party_template_idx: usize,
+    pub party_dj_root: u8,
+    pub party_prog_idx: usize,
+    pub party_rig_custom: bool,
+    pub party_next_title: String,
+    pub party_next_vibe: String,
+    pub party_next_bpm: f32,
+    pub party_queued_vibe: Option<Vibe>,
+    pub active_song_section: Option<usize>,
     pub peak_l: f32,
     pub peak_r: f32,
     pub sidechain_duck: f32,
     pub sampler_playhead: Option<f32>,
+    pub volca_active_mask: u8,
     pub global_filter_env_level: f32,
     pub drop_phase: String,
     pub drop_progress: f32,
@@ -138,6 +162,262 @@ struct RatchetEvent {
     vel: f32,
     accent: bool,
     tune_offset: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingTrigger {
+    Drum {
+        lane: usize,
+        vel: f32,
+        accent: bool,
+        flam: bool,
+        pitch_offset: i8,
+        pan_lock: Option<f32>,
+    },
+    PadNote {
+        note: u8,
+        vel: f32,
+        accent: bool,
+    },
+    MonoNote {
+        note: u8,
+        prev_note: Option<u8>,
+        vel: f32,
+        accent: bool,
+        slide: bool,
+        motion: MotionLocks,
+        party_rig_cut: bool,
+        gate_samples: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArpTarget {
+    Core(TrackId),
+    Extra(usize),
+    ChordPad,
+}
+
+#[derive(Debug, Clone)]
+struct LiveArpState {
+    target: ArpTarget,
+    held: Vec<(u8, f32)>,
+    latched: Vec<(u8, f32)>,
+    bass_latched: Option<u8>,
+    sounding: Option<(ArpTarget, u8)>,
+    tick_left: f32,
+    gate_left: f32,
+    step_idx: usize,
+    last_rand_idx: usize,
+    was_enabled: bool,
+    was_latch: bool,
+    rng: Xorshift32,
+}
+
+impl LiveArpState {
+    fn new() -> Self {
+        Self {
+            target: ArpTarget::Core(TrackId::Monologue),
+            held: Vec::with_capacity(16),
+            latched: Vec::with_capacity(16),
+            bass_latched: None,
+            sounding: None,
+            tick_left: 0.0,
+            gate_left: 0.0,
+            step_idx: 0,
+            last_rand_idx: usize::MAX,
+            was_enabled: false,
+            was_latch: false,
+            rng: Xorshift32::new(0xA490_1984),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BiquadPair {
+    l: Biquad,
+    r: Biquad,
+}
+
+impl BiquadPair {
+    fn new() -> Self {
+        Self {
+            l: Biquad::new(),
+            r: Biquad::new(),
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, (l, r): (f32, f32)) -> (f32, f32) {
+        (self.l.process(l), self.r.process(r))
+    }
+
+    fn set_highpass(&mut self, sr: f32, freq: f32, q: f32) {
+        self.l.set_highpass(sr, freq, q);
+        self.r.set_highpass(sr, freq, q);
+    }
+
+    fn set_peaking(&mut self, sr: f32, freq: f32, q: f32, gain_db: f32) {
+        self.l.set_peaking(sr, freq, q, gain_db);
+        self.r.set_peaking(sr, freq, q, gain_db);
+    }
+
+    fn set_high_shelf(&mut self, sr: f32, freq: f32, q: f32, gain_db: f32) {
+        self.l.set_high_shelf(sr, freq, q, gain_db);
+        self.r.set_high_shelf(sr, freq, q, gain_db);
+    }
+}
+
+/// Per-channel studio mixing console EQ strips for clean frequency separation & mix pocket.
+#[derive(Debug, Clone)]
+struct StudioChannelEq {
+    bass_sub: BiquadPair,
+    bass_mud: BiquadPair,
+    bass_pres: BiquadPair,
+    lead_hp: BiquadPair,
+    lead_body: BiquadPair,
+    lead_pres_cut: BiquadPair,
+    lead_shelf: BiquadPair,
+    acid_hp: BiquadPair,
+    acid_bite: BiquadPair,
+    samp_hp: BiquadPair,
+    samp_warmth: BiquadPair,
+    samp_air: BiquadPair,
+    pad_hp: BiquadPair,
+    pad_carve: BiquadPair,
+}
+
+impl StudioChannelEq {
+    fn new(sr: f32) -> Self {
+        let mut eq = Self {
+            bass_sub: BiquadPair::new(),
+            bass_mud: BiquadPair::new(),
+            bass_pres: BiquadPair::new(),
+            lead_hp: BiquadPair::new(),
+            lead_body: BiquadPair::new(),
+            lead_pres_cut: BiquadPair::new(),
+            lead_shelf: BiquadPair::new(),
+            acid_hp: BiquadPair::new(),
+            acid_bite: BiquadPair::new(),
+            samp_hp: BiquadPair::new(),
+            samp_warmth: BiquadPair::new(),
+            samp_air: BiquadPair::new(),
+            pad_hp: BiquadPair::new(),
+            pad_carve: BiquadPair::new(),
+        };
+        eq.configure(sr);
+        eq
+    }
+
+    fn configure(&mut self, sr: f32) {
+        self.bass_sub.set_peaking(sr, 65.0, 0.9, 0.9);
+        self.bass_mud.set_peaking(sr, 260.0, 1.3, -1.8);
+        self.bass_pres.set_peaking(sr, 1200.0, 1.1, 1.1);
+
+        self.lead_hp.set_highpass(sr, 130.0, 0.7071);
+        self.lead_body.set_peaking(sr, 480.0, 1.0, 1.2);
+        self.lead_pres_cut.set_peaking(sr, 3400.0, 1.6, -1.6);
+        self.lead_shelf.set_high_shelf(sr, 8500.0, 0.7071, -1.6);
+
+        self.acid_hp.set_highpass(sr, 110.0, 0.7071);
+        self.acid_bite.set_peaking(sr, 1600.0, 1.2, 1.1);
+
+        self.samp_hp.set_highpass(sr, 90.0, 0.7071);
+        self.samp_warmth.set_peaking(sr, 240.0, 1.0, 0.8);
+        self.samp_air.set_peaking(sr, 7500.0, 0.9, 0.8);
+
+        self.pad_hp.set_highpass(sr, 120.0, 0.7071);
+        self.pad_carve.set_peaking(sr, 1800.0, 1.1, -1.8);
+    }
+
+    #[inline]
+    fn process_bass(&mut self, s: (f32, f32)) -> (f32, f32) {
+        let s = self.bass_sub.process(s);
+        let s = self.bass_mud.process(s);
+        self.bass_pres.process(s)
+    }
+
+    #[inline]
+    fn process_lead(&mut self, s: (f32, f32)) -> (f32, f32) {
+        let s = self.lead_hp.process(s);
+        let s = self.lead_body.process(s);
+        let s = self.lead_pres_cut.process(s);
+        self.lead_shelf.process(s)
+    }
+
+    #[inline]
+    fn process_acid(&mut self, s: (f32, f32)) -> (f32, f32) {
+        let s = self.acid_hp.process(s);
+        self.acid_bite.process(s)
+    }
+
+    #[inline]
+    fn process_sampler(&mut self, s: (f32, f32)) -> (f32, f32) {
+        let s = self.samp_hp.process(s);
+        let s = self.samp_warmth.process(s);
+        self.samp_air.process(s)
+    }
+
+    #[inline]
+    fn process_pad(&mut self, s: (f32, f32)) -> (f32, f32) {
+        let s = self.pad_hp.process(s);
+        let (l, r) = self.pad_carve.process(s);
+        let mid = (l + r) * 0.5;
+        let side = (l - r) * 0.5 * 1.10;
+        (mid + side, mid - side)
+    }
+}
+
+#[inline]
+fn groove_pocket_scale(vibe: Vibe) -> f32 {
+    match vibe {
+        Vibe::DetroitTechno
+        | Vibe::Eurobeat
+        | Vibe::EuphoricTrance
+        | Vibe::BigRoomEdm
+        | Vibe::ImperialBass => 0.45,
+        Vibe::Arena80s | Vibe::Synthwave | Vibe::ItaloCosmic | Vibe::Disco70s | Vibe::Dubstep => {
+            0.75
+        }
+        _ => 1.0,
+    }
+}
+
+#[inline]
+fn phrase_vel_mul(global: usize, seed: u32, salt: u32) -> f32 {
+    let beat_shape = if global % 4 == 0 {
+        1.03
+    } else if global % 2 == 0 {
+        0.98
+    } else {
+        0.93
+    };
+    let jitter = (hash_f32(seed, global, salt) - 0.5) * 0.10;
+    beat_shape * (1.0 + jitter)
+}
+
+#[inline]
+fn trigger_drum_with_lock(
+    drums: &mut DrumMachine,
+    base_kit: &crate::model::DrumKitParams,
+    lane: usize,
+    voice: DrumVoiceId,
+    vel: f32,
+    accent: bool,
+    flam: bool,
+    pitch_offset: i8,
+    pan_lock: Option<f32>,
+) {
+    if pitch_offset != 0 || pan_lock.is_some() {
+        let mut dk = base_kit.clone();
+        dk.voices[lane].tune = (dk.voices[lane].tune + pitch_offset as f32).clamp(-12.0, 12.0);
+        if let Some(pan) = pan_lock {
+            dk.voices[lane].pan = pan.clamp(-1.0, 1.0);
+        }
+        drums.trigger(voice, vel, accent, flam, &dk);
+    } else {
+        drums.trigger(voice, vel, accent, flam, base_kit);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,36 +453,6 @@ fn apply_track_filter(
         GlobalFilterMode::LowPass => (lp_l, lp_r),
         GlobalFilterMode::HighPass => (hp_l, hp_r),
         GlobalFilterMode::BandPass => (bp_l, bp_r),
-    }
-}
-
-/// Simple stereo Haas micro-delay widener so pads and arps bloom wide while
-/// kick/snare/bass stay focused in the center.
-struct StereoWidener {
-    buf: Vec<f32>,
-    pos: usize,
-    delay_samples: usize,
-}
-
-impl StereoWidener {
-    fn new(sr: f32, ms: f32) -> Self {
-        let d = ((sr * ms * 0.001).round() as usize).clamp(1, 2048);
-        Self {
-            buf: vec![0.0; d + 2],
-            pos: 0,
-            delay_samples: d,
-        }
-    }
-
-    #[inline]
-    fn process(&mut self, mono: f32, width: f32) -> (f32, f32) {
-        let idx = (self.pos + self.buf.len() - self.delay_samples) % self.buf.len();
-        let delayed = self.buf[idx];
-        self.buf[self.pos] = mono;
-        self.pos = (self.pos + 1) % self.buf.len();
-        let l = mono;
-        let r = mono * (1.0 - width) + delayed * width;
-        (l, r)
     }
 }
 
@@ -249,12 +499,12 @@ struct PartySectionDef {
     turnaround_fx: bool,
 }
 
-// Template 0: Club Journey (20 bars at Normal pace)
+// Template 0: Club Journey (20 bars at Normal pace — progressive space & contrast)
 const PARTY_TMPL_CLUB: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "INTRO",
         bars: 2,
-        mask: 0b101101,
+        mask: 0b000101,
         filter_sweep: PartyFilterSweep::LowPassOpen,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -268,7 +518,7 @@ const PARTY_TMPL_CLUB: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "GROOVE",
         bars: 4,
-        mask: 0b101111,
+        mask: 0b001111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -296,7 +546,7 @@ const PARTY_TMPL_CLUB: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "DROP 1",
         bars: 4,
-        mask: 0b111111,
+        mask: 0b011111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: true,
@@ -338,7 +588,7 @@ const PARTY_TMPL_CLUB: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "OUTRO MIX",
         bars: 2,
-        mask: 0b101011,
+        mask: 0b000111,
         filter_sweep: PartyFilterSweep::LowPassClose,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -351,12 +601,12 @@ const PARTY_TMPL_CLUB: [PartySectionDef; 7] = [
     },
 ];
 
-// Template 1: Instant Groove & Acid Solo (20 bars at Normal pace)
+// Template 1: Instant Groove & Solo Spotlight (20 bars at Normal pace)
 const PARTY_TMPL_GROOVE_SOLO: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "LOCK IN",
         bars: 4,
-        mask: 0b101111,
+        mask: 0b000111,
         filter_sweep: PartyFilterSweep::LowPassOpen,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -384,7 +634,7 @@ const PARTY_TMPL_GROOVE_SOLO: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "ACID SOLO",
         bars: 4,
-        mask: 0b011011,
+        mask: 0b011111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -398,7 +648,7 @@ const PARTY_TMPL_GROOVE_SOLO: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "STRIP BREAK",
         bars: 2,
-        mask: 0b110100,
+        mask: 0b101100,
         filter_sweep: PartyFilterSweep::AtmosBreath,
         snare_build_last_bar: true,
         drop_on_start: false,
@@ -412,7 +662,7 @@ const PARTY_TMPL_GROOVE_SOLO: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "PEAK DROP",
         bars: 4,
-        mask: 0b111111,
+        mask: 0b011111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: true,
@@ -426,7 +676,7 @@ const PARTY_TMPL_GROOVE_SOLO: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "DJ MIX",
         bars: 2,
-        mask: 0b001011,
+        mask: 0b000111,
         filter_sweep: PartyFilterSweep::LowPassClose,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -444,7 +694,7 @@ const PARTY_TMPL_HYPNOTIC: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "ATMOS INTRO",
         bars: 2,
-        mask: 0b101100,
+        mask: 0b100100,
         filter_sweep: PartyFilterSweep::AtmosBreath,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -458,7 +708,7 @@ const PARTY_TMPL_HYPNOTIC: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "BASS ENTER",
         bars: 4,
-        mask: 0b001111,
+        mask: 0b000111,
         filter_sweep: PartyFilterSweep::LowPassOpen,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -486,7 +736,7 @@ const PARTY_TMPL_HYPNOTIC: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "MAIN DROP",
         bars: 4,
-        mask: 0b111111,
+        mask: 0b011111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: true,
@@ -500,7 +750,7 @@ const PARTY_TMPL_HYPNOTIC: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "PERC BREAK",
         bars: 2,
-        mask: 0b111100,
+        mask: 0b101100,
         filter_sweep: PartyFilterSweep::AtmosBreath,
         snare_build_last_bar: true,
         drop_on_start: false,
@@ -514,7 +764,7 @@ const PARTY_TMPL_HYPNOTIC: [PartySectionDef; 7] = [
     PartySectionDef {
         name: "CLIMAX",
         bars: 4,
-        mask: 0b111111,
+        mask: 0b011111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: true,
@@ -546,7 +796,7 @@ const PARTY_TMPL_VERSE_HOOK: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "HOOK 1",
         bars: 4,
-        mask: 0b101111,
+        mask: 0b001111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -560,7 +810,7 @@ const PARTY_TMPL_VERSE_HOOK: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "VERSE 1",
         bars: 4,
-        mask: 0b101111,
+        mask: 0b100111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: false,
@@ -588,7 +838,7 @@ const PARTY_TMPL_VERSE_HOOK: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "HOOK 2",
         bars: 4,
-        mask: 0b111111,
+        mask: 0b011111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: true,
@@ -602,7 +852,7 @@ const PARTY_TMPL_VERSE_HOOK: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "BRIDGE",
         bars: 2,
-        mask: 0b111100,
+        mask: 0b101100,
         filter_sweep: PartyFilterSweep::AtmosBreath,
         snare_build_last_bar: true,
         drop_on_start: false,
@@ -616,7 +866,7 @@ const PARTY_TMPL_VERSE_HOOK: [PartySectionDef; 6] = [
     PartySectionDef {
         name: "FINALE DROP",
         bars: 4,
-        mask: 0b111111,
+        mask: 0b011111,
         filter_sweep: PartyFilterSweep::None,
         snare_build_last_bar: false,
         drop_on_start: true,
@@ -645,6 +895,36 @@ fn scaled_section_bars(base_bars: usize, pace: PartyPace) -> usize {
     }
 }
 
+pub fn party_template_to_sections(template_idx: usize, pace: PartyPace) -> Vec<SongSection> {
+    let tmpl = PARTY_TEMPLATES[template_idx % PARTY_TEMPLATES.len()];
+    tmpl.iter()
+        .map(|sec| {
+            let pat = if sec.energy_mul < 0.65 {
+                0
+            } else if sec.snare_build_last_bar {
+                2
+            } else if sec.drop_on_start || sec.energy_mul >= 1.0 {
+                3
+            } else {
+                1
+            };
+            SongSection {
+                name: sec.name.to_string(),
+                pattern: pat,
+                bars: scaled_section_bars(sec.bars, pace).clamp(1, 16) as u8,
+                bass_drop: sec.drop_on_start,
+                fill: sec.snare_build_last_bar || sec.turnaround_fx,
+                track_mask: sec.mask,
+                extra_mask: if (sec.mask & 0b000100) != 0 && sec.energy_mul >= 0.65 {
+                    0x03FF
+                } else {
+                    0
+                },
+            }
+        })
+        .collect()
+}
+
 struct Runtime {
     sr: f32,
     moog: MoogSynth,
@@ -655,9 +935,11 @@ struct Runtime {
     sampler: Sk1Sampler,
     volca: VolcaSamplerBank,
     fx: MasterFx,
-    pad_widener: StereoWidener,
-    arp_widener: StereoWidener,
-    sampler_widener: StereoWidener,
+    pad_chorus: AnalogStereoChorus,
+    arp_chorus: AnalogStereoChorus,
+    sampler_chorus: AnalogStereoChorus,
+    // Studio channel-strip console EQs & unmasking HPFs
+    channel_eq: StudioChannelEq,
     // Per-instrument channel strip stereo filters
     track_filters: [(Svf12Filter, Svf12Filter); 6],
     pad_filter: (Svf12Filter, Svf12Filter),
@@ -682,7 +964,9 @@ struct Runtime {
     last_moog_note: Option<u8>,
     last_mono_note: Option<u8>,
     last_acid_note: Option<u8>,
+    last_pad_notes: Vec<u8>,
     // Sidechain ducking envelope
+    sidechain_peak: f32,
     sidechain_env: f32,
     sidechain_decay: f32,
     // Sub bass dive & multi-stage Bass Drop Macro!
@@ -706,13 +990,15 @@ struct Runtime {
     drop_whoosh_filter: Svf12Filter,
     drop_filter_slam: f32,
     drop_rng: Xorshift32,
-    // Drum & Volca ratchets & fills
+    // Drum & Volca ratchets, groove micro-timing queue & fills
     ratchets: Vec<RatchetEvent>,
     volca_ratchets: Vec<RatchetEvent>,
+    pending_triggers: Vec<(f32, PendingTrigger)>,
     force_fill_steps: usize,
     // Live chord override
     live_chord_held: bool,
     live_slot: Option<ChordSlot>,
+    live_arp: LiveArpState,
     // Sampler sync
     loaded_sample_gen: u64,
     // Party mode state
@@ -722,13 +1008,15 @@ struct Runtime {
     party_evolution: u32,
     party_template_idx: usize,
     party_rig: Option<PartySongRig>,
-    party_rig_sig: (u8, u8, u32, u32, bool, u32),
+    party_rig_sig: (u8, u8, u32, u32, u32, bool, u32, Option<u8>),
     party_rig_reroll: u32,
     party_rig_custom: bool,
+    party_queued_vibe: Option<Vibe>,
+    party_forced_vibe: Option<(u32, Vibe)>,
     party_live_bpm: f32,
     last_base_vibe: Option<Vibe>,
     was_party_mode: bool,
-    builtin_sample_cache: [Option<Arc<Vec<f32>>>; 9],
+    builtin_sample_cache: [Option<(Arc<Vec<f32>>, Arc<Vec<f32>>)>; 20],
     active_party_sample_id: Option<u8>,
     party_filter_hz: f32,
     party_filter_target_hz: f32,
@@ -783,9 +1071,10 @@ impl Runtime {
             sampler: Sk1Sampler::new(sr),
             volca: VolcaSamplerBank::new(sr),
             fx: MasterFx::new(sr),
-            pad_widener: StereoWidener::new(sr, 11.5),
-            arp_widener: StereoWidener::new(sr, 7.2),
-            sampler_widener: StereoWidener::new(sr, 9.0),
+            pad_chorus: AnalogStereoChorus::new(sr),
+            arp_chorus: AnalogStereoChorus::new(sr),
+            sampler_chorus: AnalogStereoChorus::new(sr),
+            channel_eq: StudioChannelEq::new(sr),
             track_filters: std::array::from_fn(|_| (Svf12Filter::new(sr), Svf12Filter::new(sr))),
             pad_filter: (Svf12Filter::new(sr), Svf12Filter::new(sr)),
             extra_filters: (0..MAX_EXTRA_TRACKS)
@@ -808,6 +1097,8 @@ impl Runtime {
             last_moog_note: None,
             last_mono_note: None,
             last_acid_note: None,
+            last_pad_notes: Vec::with_capacity(8),
+            sidechain_peak: 0.0,
             sidechain_env: 0.0,
             sidechain_decay,
             drop_phase: 0.0,
@@ -832,9 +1123,11 @@ impl Runtime {
             drop_rng: Xorshift32::new(0xD00D_F00D),
             ratchets: Vec::with_capacity(16),
             volca_ratchets: Vec::with_capacity(16),
+            pending_triggers: Vec::with_capacity(64),
             force_fill_steps: 0,
             live_chord_held: false,
             live_slot: None,
+            live_arp: LiveArpState::new(),
             loaded_sample_gen: 0,
             party_section_idx: 0,
             party_bar_in_sec: 0,
@@ -842,9 +1135,11 @@ impl Runtime {
             party_evolution: 0,
             party_template_idx: 0,
             party_rig: None,
-            party_rig_sig: (255, 255, u32::MAX, 0, false, 0),
+            party_rig_sig: (255, 255, 0, u32::MAX, 0, false, 0, None),
             party_rig_reroll: 0,
             party_rig_custom: false,
+            party_queued_vibe: None,
+            party_forced_vibe: None,
             party_live_bpm: 0.0,
             last_base_vibe: None,
             was_party_mode: false,
@@ -892,17 +1187,21 @@ impl Runtime {
             return;
         }
         self.loaded_sample_gen = p.sample_generation;
-        if let Some(samples) = p.sample_data.decode_f32_pcm() {
-            if !samples.is_empty() {
-                let _ = self
-                    .sampler
-                    .swap_buffer(Arc::new(samples), p.sample_data.sample_rate.max(8_000));
+        if let Some((left, right)) = p.sample_data.decode_stereo_pcm() {
+            if !left.is_empty() {
+                let _ = self.sampler.swap_stereo_buffer(
+                    Arc::new(left),
+                    Arc::new(right),
+                    p.sample_data.sample_rate.max(8_000),
+                );
                 return;
             }
         }
         let builtin = p.sample_data.builtin_id.unwrap_or(3);
-        let buf = generate_builtin_sample(builtin, self.sr as u32);
-        let _ = self.sampler.swap_buffer(Arc::new(buf), self.sr as u32);
+        let (l, r) = generate_builtin_sample_stereo(builtin, self.sr as u32);
+        let _ = self
+            .sampler
+            .swap_stereo_buffer(Arc::new(l), Arc::new(r), self.sr as u32);
     }
 
     fn party_dj_root(&self, p: &Project) -> u8 {
@@ -920,11 +1219,15 @@ impl Runtime {
             if self.active_party_sample_id != Some(id) {
                 let slot = (id as usize) % self.builtin_sample_cache.len();
                 if self.builtin_sample_cache[slot].is_none() {
-                    let pcm = generate_builtin_sample(id, self.sr as u32);
-                    self.builtin_sample_cache[slot] = Some(Arc::new(pcm));
+                    let (l, r) = generate_builtin_sample_stereo(id, self.sr as u32);
+                    self.builtin_sample_cache[slot] = Some((Arc::new(l), Arc::new(r)));
                 }
-                if let Some(buf) = &self.builtin_sample_cache[slot] {
-                    let _ = self.sampler.swap_buffer(Arc::clone(buf), self.sr as u32);
+                if let Some((l, r)) = &self.builtin_sample_cache[slot] {
+                    let _ = self.sampler.swap_stereo_buffer(
+                        Arc::clone(l),
+                        Arc::clone(r),
+                        self.sr as u32,
+                    );
                     self.active_party_sample_id = Some(id);
                 }
             }
@@ -932,18 +1235,31 @@ impl Runtime {
     }
 
     fn ensure_party_rig(&mut self, p: &Project) {
+        let forced = self
+            .party_forced_vibe
+            .and_then(|(c, v)| if c == self.party_cycle { Some(v) } else { None });
         let sig = (
             p.vibe as u8,
             p.party_mix_mode as u8,
+            p.party_crate_mask,
             self.party_cycle,
             p.party_seed,
             p.party_sound_morph,
             self.party_rig_reroll,
+            forced.map(|v| v as u8),
         );
         if self.party_rig_sig == sig && self.party_rig.is_some() {
             return;
         }
-        let song_vibe = pick_party_vibe(p.vibe, p.party_mix_mode, self.party_cycle, p.party_seed);
+        let song_vibe = forced.unwrap_or_else(|| {
+            pick_party_vibe_crate(
+                p.vibe,
+                p.party_mix_mode,
+                p.party_crate_mask,
+                self.party_cycle,
+                p.party_seed,
+            )
+        });
         let rig = build_party_song_rig_with_reroll(
             p,
             song_vibe,
@@ -1037,7 +1353,7 @@ impl Runtime {
         self.drop_boom_phase = 0.0;
         self.drop_whoosh_env = inten;
         self.drop_filter_slam = 1.0;
-        self.sidechain_env = 1.0;
+        self.sidechain_peak = self.sidechain_peak.max(1.0);
         self.trigger_global_filter_env();
         if trigger_drums {
             self.drums
@@ -1060,82 +1376,184 @@ impl Runtime {
                 velocity,
                 slot,
             } => {
-                self.pad_moog.all_notes_off();
-                for &n in &notes {
-                    self.pad_moog
-                        .note_on(n, velocity, false, false, &p.moog_pad);
+                if p.arp.enabled {
+                    let incoming_len = notes.len().min(16);
+                    let same_chord = self.live_chord_held
+                        && self.live_arp.target == ArpTarget::ChordPad
+                        && self.live_arp.held.len() == incoming_len
+                        && self
+                            .live_arp
+                            .held
+                            .iter()
+                            .zip(notes.iter().take(16))
+                            .all(|(&(n, _), &m)| n == m);
+                    if same_chord {
+                        self.gate_moog = self.sr * 8.0;
+                    } else {
+                        self.stop_arp_sounding();
+                        if let Some(prev_b) = self.live_arp.bass_latched.take() {
+                            self.moog.note_off(prev_b);
+                        }
+                        self.pad_moog.all_notes_off();
+                        self.live_arp.target = ArpTarget::ChordPad;
+                        self.live_arp.held.clear();
+                        self.live_arp.latched.clear();
+                        for &n in notes.iter().take(16) {
+                            self.live_arp.held.push((n, velocity));
+                            self.live_arp.latched.push((n, velocity));
+                        }
+                        self.live_arp.tick_left = 0.0;
+                        self.live_arp.step_idx = 0;
+                        if let Some(b) = bass {
+                            self.moog.note_on(b, velocity * 0.9, false, false, &p.moog);
+                            self.last_moog_note = Some(b);
+                            self.live_arp.bass_latched = Some(b);
+                        }
+                        self.live_chord_held = true;
+                        self.live_slot = Some(slot);
+                        self.gate_moog = self.sr * 8.0;
+                    }
+                } else if self.live_chord_held && self.live_slot == Some(slot) {
+                    self.gate_pad = self.sr * 8.0;
+                    self.gate_moog = self.sr * 8.0;
+                } else {
+                    self.pad_moog.all_notes_off();
+                    for &n in &notes {
+                        self.pad_moog
+                            .note_on(n, velocity, false, false, &p.moog_pad);
+                    }
+                    if let Some(b) = bass {
+                        self.moog.note_on(b, velocity * 0.9, false, false, &p.moog);
+                        self.last_moog_note = Some(b);
+                    }
+                    self.live_chord_held = true;
+                    self.live_slot = Some(slot);
+                    // Keep live chord ringing while held
+                    self.gate_pad = self.sr * 8.0;
+                    self.gate_moog = self.sr * 8.0;
                 }
-                if let Some(b) = bass {
-                    self.moog.note_on(b, velocity * 0.9, false, false, &p.moog);
-                    self.last_moog_note = Some(b);
-                }
-                self.live_chord_held = true;
-                self.live_slot = Some(slot);
-                // Keep live chord ringing while held
-                self.gate_pad = self.sr * 8.0;
-                self.gate_moog = self.sr * 8.0;
             }
             LiveEvent::ReleaseChord => {
-                self.pad_moog.all_notes_off();
-                if let Some(b) = self.last_moog_note.take() {
-                    self.moog.note_off(b);
-                }
+                self.live_arp.held.clear();
                 self.live_chord_held = false;
-                self.gate_pad = 0.0;
-                self.gate_moog = 0.0;
+                if p.arp.enabled && self.live_arp.target == ArpTarget::ChordPad {
+                    if !p.arp.latch {
+                        self.live_arp.latched.clear();
+                        self.stop_arp_sounding();
+                        if let Some(b) = self.live_arp.bass_latched.take() {
+                            self.moog.note_off(b);
+                        }
+                        if let Some(b) = self.last_moog_note.take() {
+                            self.moog.note_off(b);
+                        }
+                        self.gate_moog = 0.0;
+                    }
+                } else {
+                    self.pad_moog.all_notes_off();
+                    if let Some(b) = self.last_moog_note.take() {
+                        self.moog.note_off(b);
+                    }
+                    self.gate_pad = 0.0;
+                    self.gate_moog = 0.0;
+                }
             }
             LiveEvent::PlayNote {
                 track,
                 note,
                 velocity,
-            } => match track {
-                TrackId::Moog => {
-                    self.moog.note_on(note, velocity, false, false, &p.moog);
-                    self.last_moog_note = Some(note);
-                    self.gate_moog = self.sr * 4.0;
-                }
-                TrackId::MoogPad => {
-                    self.pad_moog
-                        .note_on(note, velocity, false, false, &p.moog_pad);
-                    self.gate_pad = self.sr * 4.0;
-                }
-                TrackId::Monologue => {
-                    self.mono
-                        .note_on(note, velocity, false, false, &p.monologue);
-                    self.last_mono_note = Some(note);
-                    self.gate_mono = self.sr * 4.0;
-                }
-                TrackId::Tb303 => {
-                    self.acid.note_on(note, velocity, false, false);
-                    self.last_acid_note = Some(note);
-                    self.gate_acid = self.sr * 4.0;
-                }
-                TrackId::Sampler => {
-                    self.sampler.note_on(note, velocity, &p.sampler);
-                    self.gate_sampler = self.sr * 4.0;
-                }
-                TrackId::Drums => {
-                    let lane = (note as usize) % 8;
-                    if let Some(v) = DrumVoiceId::from_index(lane) {
-                        self.drums.trigger(v, velocity, false, false, &p.drums);
-                        if v == DrumVoiceId::Kick {
-                            self.sidechain_env = velocity;
-                            if p.fx.global_filter_env_trigger == FilterEnvTrigger::Kick {
-                                self.trigger_global_filter_env();
-                            }
+            } => {
+                if p.arp.enabled && !matches!(track, TrackId::Drums | TrackId::MidiOut) {
+                    let tgt = ArpTarget::Core(track);
+                    let already_held = self.live_arp.target == tgt
+                        && self.live_arp.held.iter().any(|&(n, _)| n == note);
+                    if self.live_arp.target != tgt
+                        || (p.arp.latch && self.live_arp.held.is_empty())
+                    {
+                        self.live_arp.latched.clear();
+                        self.stop_arp_sounding();
+                        if let Some(b) = self.live_arp.bass_latched.take() {
+                            self.moog.note_off(b);
                         }
                     }
+                    self.live_arp.target = tgt;
+                    if let Some(entry) = self.live_arp.held.iter_mut().find(|(n, _)| *n == note) {
+                        entry.1 = velocity;
+                    } else if self.live_arp.held.len() < 16 {
+                        self.live_arp.held.push((note, velocity));
+                    }
+                    if let Some(entry) = self.live_arp.latched.iter_mut().find(|(n, _)| *n == note)
+                    {
+                        entry.1 = velocity;
+                    } else if self.live_arp.latched.len() < 16 {
+                        self.live_arp.latched.push((note, velocity));
+                    }
+                    if !already_held && self.live_arp.latched.len() == 1 {
+                        self.live_arp.tick_left = 0.0;
+                        self.live_arp.step_idx = 0;
+                    }
+                } else {
+                    match track {
+                        TrackId::Moog => {
+                            self.moog.note_on(note, velocity, false, false, &p.moog);
+                            self.last_moog_note = Some(note);
+                            self.gate_moog = self.sr * 4.0;
+                        }
+                        TrackId::MoogPad => {
+                            self.pad_moog
+                                .note_on(note, velocity, false, false, &p.moog_pad);
+                            self.gate_pad = self.sr * 4.0;
+                        }
+                        TrackId::Monologue => {
+                            self.mono
+                                .note_on(note, velocity, false, false, &p.monologue);
+                            self.last_mono_note = Some(note);
+                            self.gate_mono = self.sr * 4.0;
+                        }
+                        TrackId::Tb303 => {
+                            self.acid.note_on(note, velocity, false, false);
+                            self.last_acid_note = Some(note);
+                            self.gate_acid = self.sr * 4.0;
+                        }
+                        TrackId::Sampler => {
+                            self.sampler.note_on(note, velocity, &p.sampler);
+                            self.gate_sampler = self.sr * 4.0;
+                        }
+                        TrackId::Drums => {
+                            let lane = (note as usize) % 8;
+                            if let Some(v) = DrumVoiceId::from_index(lane) {
+                                self.drums.trigger(v, velocity, false, false, &p.drums);
+                                if v == DrumVoiceId::Kick {
+                                    self.sidechain_peak = self.sidechain_peak.max(velocity);
+                                    if p.fx.global_filter_env_trigger == FilterEnvTrigger::Kick {
+                                        self.trigger_global_filter_env();
+                                    }
+                                }
+                            }
+                        }
+                        TrackId::MidiOut => {}
+                    }
                 }
-                TrackId::MidiOut => {}
-            },
-            LiveEvent::ReleaseNote { track, note } => match track {
-                TrackId::Moog => self.moog.note_off(note),
-                TrackId::MoogPad => self.pad_moog.note_off(note),
-                TrackId::Monologue => self.mono.note_off(note),
-                TrackId::Tb303 => self.acid.note_off(note),
-                TrackId::Sampler => self.sampler.note_off(note),
-                TrackId::Drums | TrackId::MidiOut => {}
-            },
+            }
+            LiveEvent::ReleaseNote { track, note } => {
+                self.live_arp.held.retain(|&(n, _)| n != note);
+                if p.arp.enabled && !matches!(track, TrackId::Drums | TrackId::MidiOut) {
+                    if !p.arp.latch {
+                        self.live_arp.latched.retain(|&(n, _)| n != note);
+                        if self.live_arp.latched.is_empty() {
+                            self.stop_arp_sounding();
+                        }
+                    }
+                } else {
+                    match track {
+                        TrackId::Moog => self.moog.note_off(note),
+                        TrackId::MoogPad => self.pad_moog.note_off(note),
+                        TrackId::Monologue => self.mono.note_off(note),
+                        TrackId::Tb303 => self.acid.note_off(note),
+                        TrackId::Sampler => self.sampler.note_off(note),
+                        TrackId::Drums | TrackId::MidiOut => {}
+                    }
+                }
+            }
             LiveEvent::TriggerBassDrop => {
                 if self.was_playing {
                     if matches!(self.drop_macro_phase, DropMacroPhase::Building { .. }) {
@@ -1174,6 +1592,10 @@ impl Runtime {
                 self.party_bar_in_sec = 0;
                 if self.party_section_idx == 0 {
                     self.party_cycle = self.party_cycle.wrapping_add(1);
+                    if let Some(qv) = self.party_queued_vibe.take() {
+                        self.party_forced_vibe = Some((self.party_cycle, qv));
+                    }
+                    self.party_space_boost = self.party_space_boost.max(0.42);
                     self.party_rig_reroll = 0;
                     self.party_rig_custom = false;
                     self.party_rig = None;
@@ -1202,6 +1624,10 @@ impl Runtime {
             LiveEvent::NextPartySong => {
                 // DJ mix straight into a brand-new song with fresh vibe, template, and voice palette!
                 self.party_cycle = self.party_cycle.wrapping_add(1);
+                if let Some(qv) = self.party_queued_vibe.take() {
+                    self.party_forced_vibe = Some((self.party_cycle, qv));
+                }
+                self.party_space_boost = self.party_space_boost.max(0.42);
                 self.party_evolution = self.party_evolution.wrapping_add(1);
                 self.party_section_idx = 0;
                 self.party_bar_in_sec = 0;
@@ -1223,6 +1649,19 @@ impl Runtime {
                     true,
                 );
             }
+            LiveEvent::PrevPartySong => {
+                self.party_cycle = self.party_cycle.saturating_sub(1);
+                self.party_section_idx = 0;
+                self.party_bar_in_sec = 0;
+                self.party_space_boost = self.party_space_boost.max(0.36);
+                self.party_rig_reroll = 0;
+                self.party_rig_custom = false;
+                self.party_rig = None;
+                self.ensure_party_rig(p);
+            }
+            LiveEvent::QueueNextPartyVibe(vibe_opt) => {
+                self.party_queued_vibe = vibe_opt;
+            }
             LiveEvent::ReloadPartyRig => {
                 let prev_presets = self.party_rig.as_ref().map(|r| r.voice_presets);
                 let song_vibe = self
@@ -1230,7 +1669,13 @@ impl Runtime {
                     .as_ref()
                     .map(|r| r.vibe)
                     .unwrap_or_else(|| {
-                        pick_party_vibe(p.vibe, p.party_mix_mode, self.party_cycle, p.party_seed)
+                        pick_party_vibe_crate(
+                            p.vibe,
+                            p.party_mix_mode,
+                            p.party_crate_mask,
+                            self.party_cycle,
+                            p.party_seed,
+                        )
                     });
                 self.party_rig_reroll = self.party_rig_reroll.wrapping_add(1).max(1);
                 self.party_rig_custom = true;
@@ -1265,13 +1710,18 @@ impl Runtime {
                 self.mono.clear_motion_locks();
                 self.acid.clear_motion_locks();
                 self.party_rig = Some(rig);
+                let forced = self
+                    .party_forced_vibe
+                    .and_then(|(c, v)| if c == self.party_cycle { Some(v) } else { None });
                 self.party_rig_sig = (
                     p.vibe as u8,
                     p.party_mix_mode as u8,
+                    p.party_crate_mask,
                     self.party_cycle,
                     p.party_seed,
                     p.party_sound_morph,
                     self.party_rig_reroll,
+                    forced.map(|v| v as u8),
                 );
             }
             LiveEvent::SetPartyInstrument { track, preset_idx } => {
@@ -1346,7 +1796,31 @@ impl Runtime {
                 self.volca.release_part(part);
             }
             LiveEvent::PlayExtraNote { idx, note, velocity } => {
-                if let (Some(synth), Some(tr)) = (self.extra_synths.get_mut(idx), p.extra_tracks.get(idx)) {
+                if p.arp.enabled {
+                    let tgt = ArpTarget::Extra(idx);
+                    if self.live_arp.target != tgt
+                        || (p.arp.latch && self.live_arp.held.is_empty())
+                    {
+                        self.live_arp.latched.clear();
+                        self.stop_arp_sounding();
+                    }
+                    self.live_arp.target = tgt;
+                    if let Some(entry) = self.live_arp.held.iter_mut().find(|(n, _)| *n == note) {
+                        entry.1 = velocity;
+                    } else if self.live_arp.held.len() < 16 {
+                        self.live_arp.held.push((note, velocity));
+                    }
+                    if let Some(entry) = self.live_arp.latched.iter_mut().find(|(n, _)| *n == note)
+                    {
+                        entry.1 = velocity;
+                    } else if self.live_arp.latched.len() < 16 {
+                        self.live_arp.latched.push((note, velocity));
+                    }
+                    if self.live_arp.latched.len() == 1 {
+                        self.live_arp.tick_left = 0.0;
+                        self.live_arp.step_idx = 0;
+                    }
+                } else if let (Some(synth), Some(tr)) = (self.extra_synths.get_mut(idx), p.extra_tracks.get(idx)) {
                     synth.note_on(note, velocity, false, false, &tr.synth);
                     if idx < MAX_EXTRA_TRACKS {
                         self.extra_gates[idx] = self.sr * 4.0;
@@ -1354,7 +1828,15 @@ impl Runtime {
                 }
             }
             LiveEvent::ReleaseExtraNote { idx, note } => {
-                if let Some(synth) = self.extra_synths.get_mut(idx) {
+                self.live_arp.held.retain(|&(n, _)| n != note);
+                if p.arp.enabled {
+                    if !p.arp.latch {
+                        self.live_arp.latched.retain(|&(n, _)| n != note);
+                        if self.live_arp.latched.is_empty() {
+                            self.stop_arp_sounding();
+                        }
+                    }
+                } else if let Some(synth) = self.extra_synths.get_mut(idx) {
                     synth.note_off(note);
                 }
             }
@@ -1368,6 +1850,25 @@ impl Runtime {
                     self.suppressed_steps
                         .push((track, extra_idx, lane, global_step));
                 }
+            }
+            LiveEvent::LoadSoundFont { bank, .. } => {
+                let _ = self.moog.set_soundfont_bank(bank.clone());
+                let _ = self.pad_moog.set_soundfont_bank(bank.clone());
+                let _ = self.mono.set_soundfont_bank(bank.clone());
+                for s in &mut self.extra_synths {
+                    let _ = s.set_soundfont_bank(bank.clone());
+                }
+            }
+            LiveEvent::JumpToSongSection { section_idx } => {
+                let start_step: usize = p
+                    .song_sections
+                    .iter()
+                    .take(section_idx)
+                    .map(|s| s.bars.max(1) as usize * 16)
+                    .sum();
+                self.step = start_step;
+                self.tick_left = 0.0;
+                self.all_notes_off();
             }
         }
     }
@@ -1402,6 +1903,249 @@ impl Runtime {
         self.gate_sampler = 0.0;
         self.ratchets.clear();
         self.volca_ratchets.clear();
+        self.pending_triggers.clear();
+        self.last_pad_notes.clear();
+        self.stop_arp_sounding();
+        if let Some(b) = self.live_arp.bass_latched.take() {
+            self.moog.note_off(b);
+        }
+    }
+
+    fn trigger_arp_voice(&mut self, target: ArpTarget, note: u8, velocity: f32, p: &Project) {
+        let vel = velocity.clamp(0.05, 1.0);
+        let use_rig = p.party_mode && (p.party_sound_morph || self.party_rig_custom);
+        match target {
+            ArpTarget::Core(TrackId::Moog) => {
+                let mp = if use_rig {
+                    self.party_rig.as_ref().map(|r| &r.moog).unwrap_or(&p.moog)
+                } else {
+                    &p.moog
+                };
+                self.moog.note_on(note, vel, false, false, mp);
+            }
+            ArpTarget::Core(TrackId::MoogPad) | ArpTarget::ChordPad => {
+                let pp = if use_rig {
+                    self.party_rig.as_ref().map(|r| &r.moog_pad).unwrap_or(&p.moog_pad)
+                } else {
+                    &p.moog_pad
+                };
+                self.pad_moog.note_on(note, vel, false, false, pp);
+            }
+            ArpTarget::Core(TrackId::Monologue) => {
+                let mp = if use_rig {
+                    self.party_rig.as_ref().map(|r| &r.monologue).unwrap_or(&p.monologue)
+                } else {
+                    &p.monologue
+                };
+                self.mono.clear_motion_locks();
+                self.mono.note_on(note, vel, false, false, mp);
+            }
+            ArpTarget::Core(TrackId::Tb303) => {
+                self.acid.clear_motion_locks();
+                self.acid.note_on(note, vel, false, false);
+            }
+            ArpTarget::Core(TrackId::Sampler) => {
+                let sp = if use_rig {
+                    self.party_rig.as_ref().map(|r| &r.sampler).unwrap_or(&p.sampler)
+                } else {
+                    &p.sampler
+                };
+                self.sampler.clear_motion_locks();
+                self.sampler.note_on(note, vel, sp);
+            }
+            ArpTarget::Extra(idx) => {
+                if let (Some(synth), Some(tr)) = (self.extra_synths.get_mut(idx), p.extra_tracks.get(idx)) {
+                    synth.note_on(note, vel, false, false, &tr.synth);
+                }
+            }
+            ArpTarget::Core(TrackId::Drums | TrackId::MidiOut) => {}
+        }
+    }
+
+    fn release_arp_voice(&mut self, target: ArpTarget, note: u8) {
+        match target {
+            ArpTarget::Core(TrackId::Moog) => self.moog.note_off(note),
+            ArpTarget::Core(TrackId::MoogPad) | ArpTarget::ChordPad => self.pad_moog.note_off(note),
+            ArpTarget::Core(TrackId::Monologue) => self.mono.note_off(note),
+            ArpTarget::Core(TrackId::Tb303) => self.acid.note_off(note),
+            ArpTarget::Core(TrackId::Sampler) => self.sampler.note_off(note),
+            ArpTarget::Extra(idx) => {
+                if let Some(synth) = self.extra_synths.get_mut(idx) {
+                    synth.note_off(note);
+                }
+            }
+            ArpTarget::Core(TrackId::Drums | TrackId::MidiOut) => {}
+        }
+    }
+
+    fn stop_arp_sounding(&mut self) {
+        if let Some((tgt, note)) = self.live_arp.sounding.take() {
+            self.release_arp_voice(tgt, note);
+        }
+        self.live_arp.gate_left = 0.0;
+    }
+
+    fn process_live_arp(&mut self, p: &Project) {
+        if self.live_arp.was_enabled && !p.arp.enabled {
+            self.stop_arp_sounding();
+            self.live_arp.held.clear();
+            self.live_arp.latched.clear();
+            if let Some(b) = self.live_arp.bass_latched.take() {
+                self.moog.note_off(b);
+            }
+        }
+        if self.live_arp.was_latch && !p.arp.latch {
+            let held_copy = self.live_arp.held.clone();
+            self.live_arp.latched = held_copy;
+            if self.live_arp.latched.is_empty() {
+                self.stop_arp_sounding();
+                if let Some(b) = self.live_arp.bass_latched.take() {
+                    self.moog.note_off(b);
+                }
+            }
+        }
+        self.live_arp.was_enabled = p.arp.enabled;
+        self.live_arp.was_latch = p.arp.latch;
+
+        if !p.arp.enabled {
+            return;
+        }
+
+        if self.live_arp.gate_left > 0.0 {
+            self.live_arp.gate_left -= 1.0;
+            if self.live_arp.gate_left <= 0.0 && self.live_arp.sounding.is_some() {
+                self.stop_arp_sounding();
+            }
+        }
+
+        if self.live_arp.latched.is_empty() {
+            return;
+        }
+
+        if self.live_arp.tick_left > 0.0 {
+            self.live_arp.tick_left -= 1.0;
+            return;
+        }
+
+        // Build expanded arpeggiator sequence across 1..=3 octaves (zero audio glitches, small stack Vec)
+        let octaves = p.arp.octaves.clamp(1, 3);
+        let mut pool = self.live_arp.latched.clone();
+        match p.arp.mode {
+            ArpMode::Up | ArpMode::UpDown => pool.sort_by_key(|&(n, _)| n),
+            ArpMode::Down => pool.sort_by_key(|&(n, _)| std::cmp::Reverse(n)),
+            ArpMode::AsPlayed | ArpMode::Random => {}
+        }
+
+        let mut seq: Vec<(u8, f32)> = Vec::with_capacity(pool.len() * octaves as usize * 2);
+        if p.arp.mode == ArpMode::Down {
+            for oct in (0..octaves).rev() {
+                for &(n, v) in &pool {
+                    seq.push(((n as u16 + oct as u16 * 12).min(108) as u8, v));
+                }
+            }
+        } else {
+            for oct in 0..octaves {
+                for &(n, v) in &pool {
+                    seq.push(((n as u16 + oct as u16 * 12).min(108) as u8, v));
+                }
+            }
+        }
+
+        if p.arp.mode == ArpMode::UpDown && seq.len() >= 3 {
+            let n = seq.len();
+            for i in (1..n - 1).rev() {
+                seq.push(seq[i]);
+            }
+        }
+
+        if seq.is_empty() {
+            return;
+        }
+
+        let pick_idx = if p.arp.mode == ArpMode::Random {
+            if seq.len() == 1 {
+                0
+            } else {
+                let mut idx = (self.live_arp.rng.next_u32() as usize) % seq.len();
+                if idx == self.live_arp.last_rand_idx {
+                    idx = (idx + 1) % seq.len();
+                }
+                self.live_arp.last_rand_idx = idx;
+                idx
+            }
+        } else {
+            self.live_arp.step_idx % seq.len()
+        };
+
+        let (note, vel) = seq[pick_idx];
+        self.stop_arp_sounding();
+        let target = self.live_arp.target;
+        self.trigger_arp_voice(target, note, vel, p);
+        self.live_arp.sounding = Some((target, note));
+
+        let bpm = if p.party_mode && self.party_live_bpm >= 40.0 {
+            self.party_live_bpm
+        } else {
+            p.bpm
+        }
+        .clamp(40.0, 240.0);
+        let base_dur = (60.0 / bpm) * p.arp.rate.step_beats() * self.sr;
+        let step_dur = if p.arp.swing && p.arp.rate == ArpRate::Sixteenth {
+            let sw = p.swing.clamp(0.0, 0.5) * 0.65;
+            if self.live_arp.step_idx % 2 == 0 {
+                base_dur * (1.0 + sw)
+            } else {
+                base_dur * (1.0 - sw)
+            }
+        } else {
+            base_dur
+        };
+
+        self.live_arp.tick_left = step_dur.max(64.0);
+        self.live_arp.gate_left = (step_dur * p.arp.gate.clamp(0.15, 0.95)).max(32.0);
+        self.live_arp.step_idx = self.live_arp.step_idx.wrapping_add(1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_mono_note(
+        &mut self,
+        p: &Project,
+        use_rig: bool,
+        note: u8,
+        prev_note: Option<u8>,
+        vel: f32,
+        accent: bool,
+        slide: bool,
+        motion: MotionLocks,
+        apply_party_cut: bool,
+        gate_samples: f32,
+    ) {
+        if motion.any_locked() {
+            let mut m = motion;
+            if apply_party_cut {
+                if let Some(c) = m.cutoff {
+                    m.cutoff = Some((c + (self.party_lead_cut_mul - 1.0) * 0.14).clamp(0.72, 0.96));
+                }
+            }
+            self.mono.set_motion_locks(m, true);
+        } else {
+            self.mono.clear_motion_locks();
+        }
+        if !slide {
+            if let Some(prev) = prev_note {
+                self.mono.note_off(prev);
+            }
+        }
+        let mono_p = if use_rig {
+            self.party_rig
+                .as_ref()
+                .map(|r| &r.monologue)
+                .unwrap_or(&p.monologue)
+        } else {
+            &p.monologue
+        };
+        self.mono.note_on(note, vel, accent, slide, mono_p);
+        self.gate_mono = gate_samples;
     }
 
     fn step_duration_samples(&self, p: &Project, step_index: usize) -> f32 {
@@ -1441,16 +2185,16 @@ impl Runtime {
         // Determine active section mask, pattern index, fill, and Party DJ state
         let mut pat_idx = p.active_pattern.min(p.patterns.len().saturating_sub(1));
         let mut section_mask: u8 = 0b111111;
+        let mut extra_section_mask: u16 = 0x03FF;
         let mut section_fill = false;
         let mut party_snare_roll = false;
         let mut party_section_energy = p.party_energy;
         let mut song_vibe = p.vibe;
         let mut active_bpm = p.bpm;
         let mut sec_lead_bright = 0.75_f32;
-        let mut sec_acid_int = 0.5_f32;
 
         if p.party_mode {
-            if self.last_base_vibe != Some(p.vibe) {
+            if self.last_base_vibe.is_some() && self.last_base_vibe != Some(p.vibe) {
                 self.party_cycle = 0;
                 self.party_section_idx = 0;
                 self.party_bar_in_sec = 0;
@@ -1459,8 +2203,9 @@ impl Runtime {
                 self.party_rig_reroll = 0;
                 self.party_rig_custom = false;
                 self.party_rig = None;
-                self.last_base_vibe = Some(p.vibe);
+                self.party_forced_vibe = None;
             }
+            self.last_base_vibe = Some(p.vibe);
             self.ensure_party_rig(p);
 
             if global > 0 && global % 16 == 0 {
@@ -1473,6 +2218,11 @@ impl Runtime {
                     self.party_section_idx = (self.party_section_idx + 1) % tmpl.len();
                     if self.party_section_idx == 0 {
                         self.party_cycle = self.party_cycle.wrapping_add(1);
+                        if let Some(qv) = self.party_queued_vibe.take() {
+                            self.party_forced_vibe = Some((self.party_cycle, qv));
+                        }
+                        self.party_space_boost = self.party_space_boost.max(0.42);
+                        self.last_pad_notes.clear();
                         self.force_fill_steps = 8; // DJ song mix transition fill!
                         self.party_rig_reroll = 0;
                         self.party_rig_custom = false;
@@ -1519,27 +2269,51 @@ impl Runtime {
                 (p.bpm, p.vibe, String::new())
             };
             song_vibe = rig_vibe;
-            if self.party_live_bpm < 40.0 {
-                self.party_live_bpm = rig_bpm;
-            } else {
-                self.party_live_bpm += (rig_bpm - self.party_live_bpm) * 0.08;
-            }
-            active_bpm = self.party_live_bpm.clamp(40.0, 240.0);
+
+            let next_cycle = self.party_cycle.wrapping_add(1);
+            let next_vibe = self.party_queued_vibe.unwrap_or_else(|| {
+                pick_party_vibe_crate(
+                    p.vibe,
+                    p.party_mix_mode,
+                    p.party_crate_mask,
+                    next_cycle,
+                    p.party_seed,
+                )
+            });
+            const KEY_SHIFTS_NEXT: [u8; 8] = [0, 7, 5, 10, 3, 8, 2, 9];
+            let next_root = (p.root_note + KEY_SHIFTS_NEXT[(next_cycle as usize) % KEY_SHIFTS_NEXT.len()]) % 12;
+            let next_bpm = next_vibe.default_bpm();
+            telemetry.party_next_title = party_song_title(next_vibe, next_cycle, next_root);
+            telemetry.party_next_vibe = next_vibe.name().to_string();
+            telemetry.party_next_bpm = next_bpm;
+            telemetry.party_queued_vibe = self.party_queued_vibe;
 
             let tmpl = PARTY_TEMPLATES[self.party_template_idx % PARTY_TEMPLATES.len()];
             let sec_idx = self.party_section_idx % tmpl.len();
             let sec = &tmpl[sec_idx];
             let sec_bars = scaled_section_bars(sec.bars, p.party_pace);
+            let bar_progress =
+                (self.party_bar_in_sec * 16 + (global % 16)) as f32 / (sec_bars * 16).max(1) as f32;
+
+            let is_outro = sec_idx + 1 == tmpl.len();
+            let target_bpm = if is_outro && p.party_auto_evolve {
+                rig_bpm + (next_bpm - rig_bpm) * (bar_progress * 0.80)
+            } else {
+                rig_bpm
+            };
+            if self.party_live_bpm < 40.0 {
+                self.party_live_bpm = rig_bpm;
+            } else {
+                let rate = if is_outro { 0.14 } else { 0.08 };
+                self.party_live_bpm += (target_bpm - self.party_live_bpm) * rate;
+            }
+            active_bpm = self.party_live_bpm.clamp(40.0, 240.0);
             section_mask = sec.mask;
             party_section_energy = (p.party_energy * sec.energy_mul).clamp(0.18, 1.0);
             sec_lead_bright = sec.lead_brightness;
-            sec_acid_int = sec.acid_intensity;
             if p.party_energy < 0.35 {
                 section_mask &= !0b010000; // pull 303 on chill energy
             }
-
-            let bar_progress =
-                (self.party_bar_in_sec * 16 + (global % 16)) as f32 / (sec_bars * 16).max(1) as f32;
             match sec.filter_sweep {
                 PartyFilterSweep::LowPassOpen => {
                     self.party_filter_target_hz = 750.0 * (18_000.0_f32 / 750.0).powf(bar_progress);
@@ -1631,6 +2405,11 @@ impl Runtime {
                 .unwrap_or(p.voice_presets);
             telemetry.party_bpm = active_bpm;
             telemetry.party_vibe_name = song_vibe.name().to_string();
+            telemetry.party_vibe = song_vibe;
+            telemetry.party_rig_reroll = self.party_rig_reroll;
+            telemetry.party_template_idx = self.party_template_idx;
+            telemetry.party_rig_custom = self.party_rig_custom;
+            telemetry.active_song_section = None;
         } else if p.song_mode && !p.song_sections.is_empty() {
             self.party_filter_target_hz = 18_000.0;
             self.party_filter_mode = GlobalFilterMode::LowPass;
@@ -1642,6 +2421,7 @@ impl Runtime {
             telemetry.party_voice_presets = p.voice_presets;
             telemetry.party_vibe_name.clear();
             telemetry.party_bpm = 0.0;
+            telemetry.active_song_section = None;
 
             let total_steps: usize = p
                 .song_sections
@@ -1653,11 +2433,12 @@ impl Runtime {
             } else {
                 global % total_steps
             };
-            for sec in &p.song_sections {
+            for (sec_i, sec) in p.song_sections.iter().enumerate() {
                 let len = sec.bars.max(1) as usize * 16;
                 if rem < len {
                     pat_idx = sec.pattern.min(p.patterns.len().saturating_sub(1));
                     section_mask = sec.track_mask;
+                    extra_section_mask = sec.extra_mask;
                     if sec.bass_drop && rem == 0 {
                         self.trigger_drop_impact(
                             p.root_note,
@@ -1670,6 +2451,7 @@ impl Runtime {
                     telemetry.party_section = sec.name.clone();
                     telemetry.party_bar = rem / 16 + 1;
                     telemetry.party_section_bars = sec.bars.max(1) as usize;
+                    telemetry.active_song_section = Some(sec_i);
                     break;
                 }
                 rem -= len;
@@ -1688,6 +2470,7 @@ impl Runtime {
             telemetry.party_section.clear();
             telemetry.party_bar = (global / 16) % 4 + 1;
             telemetry.party_section_bars = 4;
+            telemetry.active_song_section = None;
         }
 
         let use_rig = p.party_mode && (p.party_sound_morph || self.party_rig_custom);
@@ -1708,6 +2491,8 @@ impl Runtime {
         };
         if p.party_mode {
             telemetry.party_song_title = party_song_title(song_vibe, self.party_cycle, dj_root);
+            telemetry.party_dj_root = dj_root;
+            telemetry.party_prog_idx = prog_offset;
         } else {
             telemetry.party_song_title.clear();
         }
@@ -1932,6 +2717,7 @@ impl Runtime {
                 &pat.drums
             };
 
+            let pocket_scale = groove_pocket_scale(song_vibe);
             let phase = global % 16;
             for lane in 0..8 {
                 let d_lane = &drum_seq.lanes[lane];
@@ -1942,7 +2728,7 @@ impl Runtime {
                     && (st.probability >= 0.999 || hash_f32(seed, global, lane as u32) <= st.probability)
                 {
                     if let Some(voice) = DrumVoiceId::from_index(lane) {
-                        // Subtle velocity humanization + per-step Pitch/Pan P-Locks!
+                        // Subtle velocity humanization + per-step Pitch/Pan P-Locks + studio groove pocket
                         let human = 0.94 + hash_f32(seed, global, lane as u32 + 99) * 0.12;
                         let vel = (st.velocity * human).clamp(0.1, 1.0);
                         let drums_p = if use_rig {
@@ -1950,18 +2736,46 @@ impl Runtime {
                         } else {
                             &p.drums
                         };
-                        if st.pitch_offset != 0 || st.pan_lock.is_some() {
-                            let mut dk = drums_p.clone();
-                            dk.voices[lane].tune = (dk.voices[lane].tune + st.pitch_offset as f32).clamp(-12.0, 12.0);
-                            if let Some(pan) = st.pan_lock {
-                                dk.voices[lane].pan = pan.clamp(-1.0, 1.0);
+                        let delay_ms = match voice {
+                            DrumVoiceId::Kick => 0.0,
+                            DrumVoiceId::Snare | DrumVoiceId::Clap => {
+                                (3.5 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
                             }
-                            self.drums.trigger(voice, vel, st.accent, st.flam, &dk);
+                            DrumVoiceId::ClosedHat | DrumVoiceId::OpenHat => {
+                                (0.6 + hash_f32(seed, global, lane as u32 + 301) * 3.0) * pocket_scale
+                            }
+                            DrumVoiceId::CowbellRim | DrumVoiceId::Tom | DrumVoiceId::Cymbal => {
+                                (1.2 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
+                            }
+                        };
+                        let delay_samples = (delay_ms * 0.001 * self.sr).min(base_step_samples * 0.22);
+                        if delay_samples > 1.0 {
+                            self.pending_triggers.push((
+                                delay_samples,
+                                PendingTrigger::Drum {
+                                    lane,
+                                    vel,
+                                    accent: st.accent,
+                                    flam: st.flam,
+                                    pitch_offset: st.pitch_offset,
+                                    pan_lock: st.pan_lock,
+                                },
+                            ));
                         } else {
-                            self.drums.trigger(voice, vel, st.accent, st.flam, drums_p);
+                            trigger_drum_with_lock(
+                                &mut self.drums,
+                                drums_p,
+                                lane,
+                                voice,
+                                vel,
+                                st.accent,
+                                st.flam,
+                                st.pitch_offset,
+                                st.pan_lock,
+                            );
                         }
                         if voice == DrumVoiceId::Kick {
-                            self.sidechain_env = vel;
+                            self.sidechain_peak = self.sidechain_peak.max(vel);
                             if p.fx.global_filter_env_trigger == FilterEnvTrigger::Kick {
                                 self.gfilt_env_attacking = true;
                             }
@@ -1972,7 +2786,7 @@ impl Runtime {
                             for r in 1..n {
                                 self.ratchets.push(RatchetEvent {
                                     lane,
-                                    samples_left: sub_len * r as f32,
+                                    samples_left: delay_samples + sub_len * r as f32,
                                     vel: vel * (0.85 - r as f32 * 0.12).max(0.35),
                                     accent: false,
                                     tune_offset: 0.0,
@@ -2080,97 +2894,27 @@ impl Runtime {
                         };
                     }
                 } else {
-                    // Evolve rhythmic bass feel per 4-bar phrase & section with funk slaps & chromatic walkups
-                    if !st.active && (step16 == 3 || step16 == 7 || step16 == 11) && party_section_energy >= 0.55 && hash_f32(seed, global, 17) < 0.42 {
-                        // Syncopated 16th-note thumb slap with snappy auto-wah quack
+                    // Clean, grounded musical groove support (no chromatic fart slides or resonant auto-wah locks)
+                    if bass_style == 2 && party_section_energy >= 0.78 && step16 % 4 == 2 && !st.active {
                         st = MelodicStep {
                             active: true,
-                            note: (bass_root + if step16 == 11 { 10 } else { 12 }).min(60),
-                            velocity: 0.82,
-                            gate: 0.48,
-                            accent: true,
-                            motion: MotionLocks {
-                                cutoff: Some(0.80),
-                                resonance: Some(0.54),
-                                drive: Some(0.64),
-                                shape: Some(0.65),
-                            },
+                            note: bass_root.clamp(33, 56),
+                            velocity: 0.72,
+                            gate: 0.75,
                             ..Default::default()
                         };
-                    } else if !st.active && step16 == 15 && hash_f32(seed, global, 18) < 0.55 {
-                        // Chromatic half-step walkup slide into the next bar's "One"
-                        let next_slot = prog.slots[(chord_idx + 1) % 4];
-                        let next_bass = bass_midi_for(dj_root, next_slot.offset);
-                        st = MelodicStep {
-                            active: true,
-                            note: next_bass.saturating_sub(1).max(33),
-                            velocity: 0.78,
-                            gate: 0.90,
-                            slide: true,
-                            motion: MotionLocks {
-                                cutoff: Some(0.76),
-                                resonance: Some(0.52),
-                                drive: Some(0.62),
-                                shape: Some(0.60),
-                            },
-                            ..Default::default()
-                        };
-                    } else if bass_style == 1 && (step16 == 6 || step16 == 14) && !st.active {
-                        // Syncopated octave bounce
-                        st = MelodicStep {
-                            active: true,
-                            note: (bass_root + 12).min(60),
-                            velocity: 0.78,
-                            gate: 0.9,
-                            slide: step16 == 14,
-                            motion: MotionLocks {
-                                cutoff: Some(0.76),
-                                resonance: Some(0.50),
-                                drive: Some(0.60),
-                                shape: Some(0.60),
-                            },
-                            ..Default::default()
-                        };
-                    } else if bass_style == 2 && party_section_energy >= 0.75 && step16 % 2 == 0 && !st.active {
-                        // Driving offbeat 8th-note pump during high-energy Groove/Drops
-                        let oct = if step16 % 4 == 2 { 12 } else { 0 };
-                        st = MelodicStep {
-                            active: true,
-                            note: (bass_root + oct).min(60),
-                            velocity: 0.74,
-                            gate: 0.65,
-                            ..Default::default()
-                        };
-                    } else if bass_style == 3 && step16 == 10 && !st.active && hash_f32(seed, global, 13) < 0.65 {
-                        // Fifth / octave turnaround pickup
+                    } else if (bass_style == 1 || bass_style == 3)
+                        && !st.active
+                        && step16 == 14
+                        && chord_idx % 2 == 1
+                        && hash_f32(seed, global, 11) < 0.40
+                    {
                         let jump = if hash_f32(seed, global, 14) < 0.5 { 7 } else { 12 };
                         st = MelodicStep {
                             active: true,
-                            note: (bass_root + jump).min(60),
-                            velocity: 0.76,
-                            gate: 1.1,
-                            slide: true,
-                            motion: MotionLocks {
-                                cutoff: Some(0.74),
-                                resonance: Some(0.48),
-                                drive: Some(0.56),
-                                shape: None,
-                            },
-                            ..Default::default()
-                        };
-                    } else if !st.active && step16 == 14 && hash_f32(seed, global, 11) < 0.45 {
-                        st = MelodicStep {
-                            active: true,
-                            note: (bass_root + 12).min(60),
+                            note: (bass_root + jump).min(56),
                             velocity: 0.72,
-                            gate: 1.2,
-                            slide: true,
-                            motion: MotionLocks {
-                                cutoff: Some(0.78),
-                                resonance: Some(0.52),
-                                drive: Some(0.60),
-                                shape: None,
-                            },
+                            gate: 1.0,
                             ..Default::default()
                         };
                     }
@@ -2199,8 +2943,9 @@ impl Runtime {
                 } else {
                     &p.moog
                 };
+                let vel = (st.velocity * phrase_vel_mul(global, seed, 411)).clamp(0.15, 1.0);
                 self.moog
-                    .note_on(note, st.velocity, st.accent, st.slide, moog_p);
+                    .note_on(note, vel, st.accent, st.slide, moog_p);
                 self.last_moog_note = Some(note);
                 self.gate_moog = base_step_samples * st.gate.clamp(0.15, 16.0);
             }
@@ -2270,34 +3015,56 @@ impl Runtime {
                 } else {
                     self.pad_moog.clear_motion_locks();
                 }
+                self.pending_triggers
+                    .retain(|(_, ev)| !matches!(ev, PendingTrigger::PadNote { .. }));
                 self.pad_moog.all_notes_off();
                 let pad_p = if use_rig {
                     self.party_rig.as_ref().map(|r| &r.moog_pad).unwrap_or(&p.moog_pad)
                 } else {
                     &p.moog_pad
                 };
+                let pocket_scale = groove_pocket_scale(song_vibe);
                 if st.chord != crate::model::ChordType::Single {
-                    // Voice-led lush chord!
-                    let mut notes_to_play = if party_evolve_active || p.party_mode {
-                        pad_notes.clone()
+                    // Voice-led lush chord gliding smoothly from previous bar's voicing!
+                    let slot = if party_evolve_active || p.party_mode {
+                        active_slot
                     } else {
-                        let slot = ChordSlot {
+                        ChordSlot {
                             offset: (st.note + 12 - (dj_root % 12)) % 12,
                             chord: st.chord,
-                        };
-                        voice_led_chord(dj_root, slot, 60)
+                        }
                     };
-                    // Subtle octave lift on Drop 2 / Climax / odd phrases for harmonic bloom
+                    let mut notes_to_play =
+                        voice_led_chord_near(dj_root, slot, &self.last_pad_notes, 60);
+                    self.last_pad_notes = notes_to_play.clone();
+                    // Subtle octave lift on Drop 2 / Climax / odd phrases for harmonic bloom (upper ceiling capped)
                     if p.party_mode && sec_lead_bright >= 0.96 && (party_phrase % 2 == 1) {
                         for n in &mut notes_to_play {
-                            if *n <= 72 {
+                            if *n <= 64 {
                                 *n += 12;
                             }
                         }
                     }
-                    for n in notes_to_play {
-                        self.pad_moog
-                            .note_on(n, st.velocity, st.accent, false, pad_p);
+                    for (k, n) in notes_to_play.into_iter().enumerate() {
+                        let v_taper = (1.0 - k as f32 * 0.035).max(0.84);
+                        let vel = (st.velocity * v_taper).clamp(0.15, 1.0);
+                        let strum_samples = if k == 0 {
+                            0.0
+                        } else {
+                            (k as f32 * 3.2 * pocket_scale * 0.001 * self.sr).min(0.014 * self.sr)
+                        };
+                        if strum_samples <= 1.0 {
+                            self.pad_moog.note_on(n, vel, st.accent, false, pad_p);
+                        } else {
+                            self.pending_triggers.push((
+                                strum_samples,
+                                PendingTrigger::PadNote {
+                                    note: n,
+                                    vel,
+                                    accent: st.accent,
+                                },
+                            ));
+                        }
                     }
                 } else {
                     self.pad_moog
@@ -2308,9 +3075,19 @@ impl Runtime {
         }
 
         // --- 3b. EXTRA DYNAMIC SYNTH TRACKS (tracks 7..=16) ---
-        if (section_mask & 0b000100) != 0 && !follow_override {
+        let extra_build_cut = matches!(self.drop_macro_phase, DropMacroPhase::Building { .. })
+            && p.drop_macro.cut_chords;
+        if !drop_in_gap && !extra_build_cut && !follow_override {
             let extra_n = p.extra_tracks.len().min(MAX_EXTRA_TRACKS).min(pat.extra_seqs.len());
             for ei in 0..extra_n {
+                let extra_on = if p.party_mode {
+                    (section_mask & 0b000100) != 0
+                } else {
+                    (extra_section_mask & (1u16 << ei)) != 0
+                };
+                if !extra_on {
+                    continue;
+                }
                 let seq = &pat.extra_seqs[ei];
                 let st = seq.steps[global % seq.step_count.as_usize()];
                 if st.active && !self.is_step_suppressed(None, Some(ei), None, global) {
@@ -2346,7 +3123,7 @@ impl Runtime {
         // --- 4. ARP / MONOLOGUE (bit 3) ---
         if (section_mask & 0b001000) != 0 {
             let seq = if p.party_mode { &self.party_melodic.2 } else { &pat.monologue };
-            let mut st = seq.steps[global % seq.step_count.as_usize()];
+            let st = seq.steps[global % seq.step_count.as_usize()];
             let arp_len = arp_tones.len().max(1);
             let arp_mode = (party_phrase + self.party_section_idx as u32) % 5;
             let pick_arp_note = |step_i: usize| -> u8 {
@@ -2367,86 +3144,62 @@ impl Runtime {
                 }
                 n
             };
-            // Preserve the song's generated melodic hook; add sparkle & sparse funky fills on peak sections
-            if p.party_mode {
-                if !st.active && sec_lead_bright >= 0.85 && global % 2 == 0 && hash_f32(seed, global, 23) < party_section_energy * 0.30 {
-                    st = MelodicStep {
-                        active: true,
-                        note: pick_arp_note(global),
-                        velocity: 0.82,
-                        gate: 0.85,
-                        motion: MotionLocks {
-                            cutoff: Some(0.86),
-                            resonance: Some(0.56),
-                            drive: Some(0.46),
-                            shape: Some(0.75),
-                        },
-                        ..Default::default()
-                    };
-                } else if st.active && sec_lead_bright >= 0.90 && global % 8 == 6 && st.note <= 74 {
-                    st.note += 12;
-                }
-            }
             if st.active && !self.is_step_suppressed(Some(TrackId::Monologue), None, None, global) {
                 let note = if follow_override {
                     pick_arp_note(global)
                 } else {
                     st.note
                 };
-                if st.motion.any_locked() {
-                    let mut m = st.motion;
-                    if p.party_mode && p.party_sound_morph {
-                        if let Some(c) = m.cutoff {
-                            m.cutoff = Some((c + (self.party_lead_cut_mul - 1.0) * 0.14).clamp(0.72, 0.96));
-                        }
-                    }
-                    self.mono.set_motion_locks(m, true);
+                let vel = (st.velocity * phrase_vel_mul(global, seed, 511)).clamp(0.15, 1.0);
+                let gate_samples = base_step_samples * st.gate.clamp(0.15, 8.0);
+                let apply_party_cut = p.party_mode && p.party_sound_morph;
+                let pocket_scale = groove_pocket_scale(song_vibe);
+                let mono_delay = if global % 4 != 0 && !st.slide {
+                    let delay_ms = (0.8 + hash_f32(seed, global, 521) * 2.4) * pocket_scale;
+                    (delay_ms * 0.001 * self.sr).min(base_step_samples * 0.20)
                 } else {
-                    self.mono.clear_motion_locks();
-                }
-                if !st.slide {
-                    if let Some(prev) = self.last_mono_note.take() {
-                        self.mono.note_off(prev);
-                    }
-                }
-                let mono_p = if use_rig {
-                    self.party_rig.as_ref().map(|r| &r.monologue).unwrap_or(&p.monologue)
-                } else {
-                    &p.monologue
+                    0.0
                 };
-                self.mono
-                    .note_on(note, st.velocity, st.accent, st.slide, mono_p);
+                self.pending_triggers
+                    .retain(|(_, ev)| !matches!(ev, PendingTrigger::MonoNote { .. }));
+                let prev_note = self.last_mono_note.take();
                 self.last_mono_note = Some(note);
-                self.gate_mono = base_step_samples * st.gate.clamp(0.15, 8.0);
+                if mono_delay > 1.0 {
+                    self.gate_mono = gate_samples + mono_delay;
+                    self.pending_triggers.push((
+                        mono_delay,
+                        PendingTrigger::MonoNote {
+                            note,
+                            prev_note,
+                            vel,
+                            accent: st.accent,
+                            slide: st.slide,
+                            motion: st.motion,
+                            party_rig_cut: apply_party_cut,
+                            gate_samples,
+                        },
+                    ));
+                } else {
+                    self.dispatch_mono_note(
+                        p,
+                        use_rig,
+                        note,
+                        prev_note,
+                        vel,
+                        st.accent,
+                        st.slide,
+                        st.motion,
+                        apply_party_cut,
+                        gate_samples,
+                    );
+                }
             }
         }
 
         // --- 5. LEAD / TB-303 (bit 4) ---
         if (section_mask & 0b010000) != 0 {
             let seq = if p.party_mode { &self.party_melodic.3 } else { &pat.tb303 };
-            let mut st = seq.steps[global % seq.step_count.as_usize()];
-            // Use the song's generated 303 riff with section-aware octave lift & acid accents
-            if p.party_mode {
-                if st.active && sec_acid_int >= 0.80 {
-                    if (global % 16) % 6 == 2 && st.note <= 64 {
-                        st.note += 12;
-                    }
-                    if global % 4 == 2 {
-                        st.accent = true;
-                    }
-                } else if !st.active && sec_acid_int >= 0.92 && (global % 4 == 2) && hash_f32(seed, global, 41) < 0.42 {
-                    let tone = arp_tones[(global + self.party_section_idx) % arp_tones.len().max(1)];
-                    st = MelodicStep {
-                        active: true,
-                        note: (48 + (tone % 12)).clamp(36, 72),
-                        velocity: 0.86,
-                        gate: 0.75,
-                        accent: true,
-                        slide: hash_f32(seed, global, 44) < 0.40,
-                        ..Default::default()
-                    };
-                }
-            }
+            let st = seq.steps[global % seq.step_count.as_usize()];
             if st.active && !self.is_step_suppressed(Some(TrackId::Tb303), None, None, global) {
                 let note = if follow_override {
                     let tone = arp_tones[global % arp_tones.len().max(1)];
@@ -2464,8 +3217,9 @@ impl Runtime {
                         self.acid.note_off(prev);
                     }
                 }
+                let vel = (st.velocity * phrase_vel_mul(global, seed, 611)).clamp(0.15, 1.0);
                 self.acid
-                    .note_on(note, st.velocity, st.accent, st.slide);
+                    .note_on(note, vel, st.accent, st.slide);
                 self.last_acid_note = Some(note);
                 self.gate_acid = base_step_samples * st.gate.clamp(0.15, 4.0);
             }
@@ -2491,13 +3245,14 @@ impl Runtime {
                 } else {
                     &p.sampler
                 };
-                self.sampler.note_on(note, st.velocity, samp_p);
+                let vel = (st.velocity * phrase_vel_mul(global, seed, 711)).clamp(0.15, 1.0);
+                self.sampler.note_on(note, vel, samp_p);
                 self.gate_sampler = base_step_samples * st.gate.clamp(0.25, 16.0);
             }
 
             // 8-Part Volca Sample Lanes!
             for (part_idx, lane) in pat.sample_lanes.iter().take(8).enumerate() {
-                let len = lane.step_count.as_usize();
+                let len = lane.effective_len();
                 let dst = lane.steps[global % len];
                 if dst.active
                     && !self.is_step_suppressed(Some(TrackId::Sampler), None, Some(part_idx), global)
@@ -2563,6 +3318,7 @@ impl Runtime {
         if playing && !self.was_playing {
             self.step = 0;
             self.tick_left = 0.0;
+            self.pending_triggers.clear();
             self.party_section_idx = 0;
             self.party_bar_in_sec = 0;
             self.party_cycle = 0;
@@ -2634,6 +3390,81 @@ impl Runtime {
                 }
             }
 
+            // Process sample-accurate groove micro-timing queue (drums, chord strum, melodic pocket)
+            let mut pi = 0;
+            let use_rig_pending = p.party_mode && (p.party_sound_morph || self.party_rig_custom);
+            while pi < self.pending_triggers.len() {
+                self.pending_triggers[pi].0 -= 1.0;
+                if self.pending_triggers[pi].0 <= 0.0 {
+                    let (_, ev) = self.pending_triggers.swap_remove(pi);
+                    match ev {
+                        PendingTrigger::Drum {
+                            lane,
+                            vel,
+                            accent,
+                            flam,
+                            pitch_offset,
+                            pan_lock,
+                        } => {
+                            if let Some(voice) = DrumVoiceId::from_index(lane) {
+                                let drums_p = if use_rig_pending {
+                                    self.party_rig.as_ref().map(|r| &r.drums).unwrap_or(&p.drums)
+                                } else {
+                                    &p.drums
+                                };
+                                trigger_drum_with_lock(
+                                    &mut self.drums,
+                                    drums_p,
+                                    lane,
+                                    voice,
+                                    vel,
+                                    accent,
+                                    flam,
+                                    pitch_offset,
+                                    pan_lock,
+                                );
+                            }
+                        }
+                        PendingTrigger::PadNote { note, vel, accent } => {
+                            let pad_p = if use_rig_pending {
+                                self.party_rig
+                                    .as_ref()
+                                    .map(|r| &r.moog_pad)
+                                    .unwrap_or(&p.moog_pad)
+                            } else {
+                                &p.moog_pad
+                            };
+                            self.pad_moog.note_on(note, vel, accent, false, pad_p);
+                        }
+                        PendingTrigger::MonoNote {
+                            note,
+                            prev_note,
+                            vel,
+                            accent,
+                            slide,
+                            motion,
+                            party_rig_cut,
+                            gate_samples,
+                        } => {
+                            self.dispatch_mono_note(
+                                p,
+                                use_rig_pending,
+                                note,
+                                prev_note,
+                                vel,
+                                accent,
+                                slide,
+                                motion,
+                                party_rig_cut,
+                                gate_samples,
+                            );
+                        }
+                    }
+                } else {
+                    pi += 1;
+                }
+            }
+
             // Process Volca sample ratchets
             let mut vi = 0;
             while vi < self.volca_ratchets.len() {
@@ -2646,6 +3477,9 @@ impl Runtime {
                 }
             }
         }
+
+        // Advance Vintage Hardware Arpeggiator (runs live whether playing or stopped!)
+        self.process_live_arp(p);
 
         // Advance per-voice gate timers (proper sustain & release!)
         if self.gate_moog > 0.0 {
@@ -2760,8 +3594,10 @@ impl Runtime {
             samp_p = p.sampler.clone();
         }
 
-        // Sidechain ducking envelope decay (musical pumping without burying melodic synths!)
-        self.sidechain_env *= self.sidechain_decay;
+        // Smooth click-free sidechain ducking envelope (~2.5ms attack, ~145ms release)
+        self.sidechain_peak *= self.sidechain_decay;
+        let sc_atk = one_pole_coeff(160.0, self.sr);
+        self.sidechain_env += sc_atk * (self.sidechain_peak - self.sidechain_env);
         let sc_amt = self.auto_sidechain.unwrap_or(sc_base).clamp(0.0, 1.0);
         let duck = (1.0 - self.sidechain_env * sc_amt * 0.56).clamp(0.36, 1.0);
         let duck_bass = (1.0 - self.sidechain_env * sc_amt * 0.72).clamp(0.24, 1.0);
@@ -2822,7 +3658,7 @@ impl Runtime {
             self.drop_phase = (self.drop_phase + self.drop_pitch / self.sr).fract();
             let sub = (self.drop_phase * std::f32::consts::TAU).sin()
                 + 0.28 * (self.drop_phase * 2.0 * std::f32::consts::TAU).sin();
-            sub_sig = (sub * 1.5).tanh() * self.drop_env * 0.46;
+            sub_sig = (sub * 1.5).tanh() * self.drop_env * 0.54;
             self.drop_env *= (-1.0 / (1.05 * self.sr)).exp();
         }
         let mut boom_sig = 0.0_f32;
@@ -2831,7 +3667,7 @@ impl Runtime {
             self.drop_boom_phase = (self.drop_boom_phase + self.drop_boom_pitch / self.sr).fract();
             boom_sig = ((self.drop_boom_phase * std::f32::consts::TAU).sin() * 2.0).tanh()
                 * self.drop_boom_env
-                * 0.38;
+                * 0.46;
             self.drop_boom_env *= (-1.0 / (0.095 * self.sr)).exp();
         }
         let mut whoosh_sig = 0.0_f32;
@@ -2844,6 +3680,15 @@ impl Runtime {
             self.drop_whoosh_env *= (-1.0 / (0.72 * self.sr)).exp();
         }
         let drop_sig = riser_sig + sub_sig + boom_sig + whoosh_sig;
+
+        let chorus_amt = if use_morph {
+            self.party_rig
+                .as_ref()
+                .map(|r| r.stereo_chorus)
+                .unwrap_or(p.fx.stereo_chorus)
+        } else {
+            p.fx.stereo_chorus
+        };
 
         // Render all studio voices (6 core + up to 10 dynamic extra tracks!)
         let any_solo = p.mixer.channels.iter().any(|c| c.solo)
@@ -2859,12 +3704,15 @@ impl Runtime {
         let mut rev_l = riser_sig * 0.45 + whoosh_sig * 0.35;
         let mut rev_r = riser_sig * 0.45 + whoosh_sig * 0.35;
 
-        // 0: Bass (Moog) — center punch + deep sidechain pocket + per-instrument filter
-        let moog_s = self.moog.process_sample(&moog_p) * duck_bass;
+        // 0: Bass (Moog) — center sub punch + true stereo upper harmonics + console strip EQ + deep sidechain pocket
+        let (moog_l, moog_r) = self.moog.process_stereo(&moog_p);
+        let moog_l = moog_l * duck_bass;
+        let moog_r = moog_r * duck_bass;
         if audible(ch[0].mute, ch[0].solo) {
             let (gl, gr) = pan_gains(ch[0].pan);
-            let sl = moog_s * vol_bass * gl * 0.54;
-            let sr_v = moog_s * vol_bass * gr * 0.54;
+            let sl = moog_l * vol_bass * gl * 0.56;
+            let sr_v = moog_r * vol_bass * gr * 0.56;
+            let (sl, sr_v) = self.channel_eq.process_bass((sl, sr_v));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[0].0,
                 &mut self.track_filters[0].1,
@@ -2885,18 +3733,22 @@ impl Runtime {
             }
         }
 
-        // 1: Arp / Lead (Monologue) — crisp stereo lead upfront + per-instrument filter!
-        let mono_s = self.mono.process_sample(&mono_p) * (0.62 + 0.38 * duck);
+        // 1: Arp / Lead (Monologue) — true stereo unison + Juno BBD shimmer + studio console strip (130Hz HPF + body + silk)
+        let (mono_l, mono_r) = self.mono.process_stereo(&mono_p);
+        let mono_duck = 0.62 + 0.38 * duck;
+        let (wl, wr) = self
+            .arp_chorus
+            .process_stereo(mono_l * mono_duck, mono_r * mono_duck, chorus_amt * 0.65);
         if audible(ch[1].mute, ch[1].solo) {
-            let (wl, wr) = self.arp_widener.process(mono_s, 0.55);
             let (gl, gr) = pan_gains(ch[1].pan);
-            let sl = wl * vol_lead * gl * 0.86;
-            let sr_v = wr * vol_lead * gr * 0.86;
+            let sl_raw = wl * vol_lead * gl * 0.82;
+            let sr_raw = wr * vol_lead * gr * 0.82;
+            let (eq_l, eq_r) = self.channel_eq.process_lead((sl_raw, sr_raw));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[1].0,
                 &mut self.track_filters[1].1,
-                sl,
-                sr_v,
+                eq_l,
+                eq_r,
                 &ch[1].filter,
                 self.sr,
             );
@@ -2912,18 +3764,19 @@ impl Runtime {
             }
         }
 
-        // 2: Acid / 303 — present acid/funk counter-line + per-instrument filter
+        // 2: Acid / 303 — present acid/funk counter-line + 110Hz HPF & 1.6kHz bite console strip
         let acid_s = self.acid.process_sample(&acid_p) * (0.55 + 0.45 * duck);
         let acid_mute = ch[2].mute && !enable_303_override;
         if audible(acid_mute, ch[2].solo) {
             let (gl, gr) = pan_gains(ch[2].pan);
-            let sl = acid_s * vol_303 * gl * 0.82;
-            let sr_v = acid_s * vol_303 * gr * 0.82;
+            let sl = acid_s * vol_303 * gl * 0.80;
+            let sr_v = acid_s * vol_303 * gr * 0.80;
+            let (eq_l, eq_r) = self.channel_eq.process_acid((sl, sr_v));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[2].0,
                 &mut self.track_filters[2].1,
-                sl,
-                sr_v,
+                eq_l,
+                eq_r,
                 &ch[2].filter,
                 self.sr,
             );
@@ -2939,11 +3792,11 @@ impl Runtime {
             }
         }
 
-        // 3: Drums — TRUE STEREO preserved, balanced with synths + per-instrument filter!
+        // 3: Drums — TRUE STEREO preserved, punchy studio snap!
         let (dl, dr) = self.drums.process_sample(&drums_p);
         if audible(ch[3].mute, ch[3].solo) {
-            let sl = dl * vol_drums * 0.56;
-            let sr_v = dr * vol_drums * 0.56;
+            let sl = dl * vol_drums * 0.62;
+            let sr_v = dr * vol_drums * 0.62;
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[3].0,
                 &mut self.track_filters[3].1,
@@ -2964,8 +3817,14 @@ impl Runtime {
             }
         }
 
-        // 4: Sampler + 8-Part Volca Bank — true stereo + Isolator EQ + per-instrument filter
-        let samp_s = self.sampler.process_sample(&samp_p) * (0.55 + 0.45 * duck);
+        // 4: Sampler + 8-Part Volca Bank — true stereo playback + BBD stereo chorus + Isolator EQ + console strip
+        let (samp_raw_l, samp_raw_r) = self.sampler.process_stereo(&samp_p);
+        let samp_duck = 0.55 + 0.45 * duck;
+        let (swl, swr) = self.sampler_chorus.process_stereo(
+            samp_raw_l * samp_duck,
+            samp_raw_r * samp_duck,
+            chorus_amt * 0.72,
+        );
         let iso_b = self.auto_iso_bass.unwrap_or(p.sampler_iso_bass);
         let iso_t = self.auto_iso_treble.unwrap_or(p.sampler_iso_treble);
         let (vl, vr, vrev_l, vrev_r) =
@@ -2974,15 +3833,15 @@ impl Runtime {
         let v_duck = 0.55 + 0.45 * duck;
         let samp_mute = ch[4].mute && !enable_samp_override;
         if audible(samp_mute, ch[4].solo) {
-            let (wl, wr) = self.sampler_widener.process(samp_s, 0.58);
             let (gl, gr) = pan_gains(ch[4].pan);
-            let sl = (wl * gl * 0.84 + vl * v_duck * 0.78) * vol_samp;
-            let sr_v = (wr * gr * 0.84 + vr * v_duck * 0.78) * vol_samp;
+            let sl_raw = (swl * gl * 0.82 + vl * v_duck * 0.80) * vol_samp;
+            let sr_raw = (swr * gr * 0.82 + vr * v_duck * 0.80) * vol_samp;
+            let (eq_l, eq_r) = self.channel_eq.process_sampler((sl_raw, sr_raw));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[4].0,
                 &mut self.track_filters[4].1,
-                sl,
-                sr_v,
+                eq_l,
+                eq_r,
                 &ch[4].filter,
                 self.sr,
             );
@@ -2998,17 +3857,21 @@ impl Runtime {
             }
         }
 
-        // 5: Chords / MoogPad — lush stereo Haas width + upfront presence + per-instrument filter!
-        let pad_s = self.pad_moog.process_sample(&pad_p) * (0.48 + 0.52 * duck);
+        // 5: Chords / MoogPad — true stereo unison + lush Juno BBD chorus + 120Hz HPF & 1.8kHz pocket console strip
+        let (pad_l, pad_r) = self.pad_moog.process_stereo(&pad_p);
+        let pad_duck = 0.48 + 0.52 * duck;
+        let (pwl, pwr) = self
+            .pad_chorus
+            .process_stereo(pad_l * pad_duck, pad_r * pad_duck, chorus_amt.max(0.32));
         if audible(p.mixer.moog_pad_mute, p.mixer.moog_pad_solo) {
-            let (wl, wr) = self.pad_widener.process(pad_s, 0.72);
-            let sl = wl * vol_pad * 0.92;
-            let sr_v = wr * vol_pad * 0.92;
+            let sl_raw = pwl * vol_pad * 0.88;
+            let sr_raw = pwr * vol_pad * 0.88;
+            let (eq_l, eq_r) = self.channel_eq.process_pad((sl_raw, sr_raw));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.pad_filter.0,
                 &mut self.pad_filter.1,
-                sl,
-                sr_v,
+                eq_l,
+                eq_r,
                 &p.mixer.moog_pad_filter,
                 self.sr,
             );
@@ -3024,14 +3887,16 @@ impl Runtime {
             }
         }
 
-        // 6+: Extra Dynamic Synth Tracks (tracks 7..=16) + per-instrument filter
+        // 6+: Extra Dynamic Synth Tracks (tracks 7..=16) + true stereo + per-instrument filter
         let extra_duck = 0.52 + 0.48 * duck;
         for (ei, tr) in p.extra_tracks.iter().take(MAX_EXTRA_TRACKS).enumerate() {
-            let s = self.extra_synths[ei].process_sample(&tr.synth) * extra_duck;
+            let (esl, esr) = self.extra_synths[ei].process_stereo(&tr.synth);
+            let s_l = esl * extra_duck;
+            let s_r = esr * extra_duck;
             if audible(tr.mute, tr.solo) {
                 let (gl, gr) = pan_gains(tr.pan);
-                let sl = s * tr.volume * gl * 0.78;
-                let sr_v = s * tr.volume * gr * 0.78;
+                let sl = s_l * tr.volume * gl * 0.78;
+                let sr_v = s_r * tr.volume * gr * 0.78;
                 let (efl, efr) = &mut self.extra_filters[ei];
                 let (sl, sr_v) = apply_track_filter(
                     efl,
@@ -3056,8 +3921,11 @@ impl Runtime {
             if let Some(rig) = &self.party_rig {
                 fx_params.delay_div = rig.delay_div;
                 fx_params.reverb_size = rig.reverb_size;
+                fx_params.reverb_shimmer = rig.reverb_shimmer;
                 fx_params.analog_warmth = rig.analog_warmth;
                 fx_params.master_crisp = rig.master_crisp;
+                fx_params.stereo_chorus = rig.stereo_chorus;
+                fx_params.club_punch = rig.club_punch;
                 if self.auto_space.is_none() {
                     fx_params.reverb_mix = rig.reverb_mix;
                     fx_params.delay_mix = rig.delay_mix;
@@ -3184,6 +4052,7 @@ impl Runtime {
             .volca
             .playhead_norm(selected_part)
             .or_else(|| self.sampler.latest_playhead_norm());
+        telemetry.volca_active_mask = self.volca.active_parts_mask();
         if p.party_mode {
             if let Some(rig) = &self.party_rig {
                 telemetry.party_voice_presets = rig.voice_presets;
@@ -3211,6 +4080,7 @@ pub struct AudioEngine {
     pub selected_sample_part: Arc<AtomicUsize>,
     live_queue: Arc<Mutex<VecDeque<LiveEvent>>>,
     telemetry: Arc<Mutex<EngineTelemetry>>,
+    sf2_meta: Arc<Mutex<(String, Vec<String>)>>,
 }
 
 impl AudioEngine {
@@ -3229,6 +4099,7 @@ impl AudioEngine {
             selected_sample_part: Arc::new(AtomicUsize::new(0)),
             live_queue: Arc::new(Mutex::new(VecDeque::new())),
             telemetry: Arc::new(Mutex::new(EngineTelemetry::default())),
+            sf2_meta: Arc::new(Mutex::new((String::new(), Vec::new()))),
         }
     }
 
@@ -3240,6 +4111,22 @@ impl AudioEngine {
     }
 
     pub fn start(project: Project) -> Self {
+        let initial_sf2: Option<Arc<SoundFontBank>> = project
+            .soundfont_path
+            .as_deref()
+            .and_then(|p| SoundFontBank::from_file(Path::new(p)).ok())
+            .or_else(|| {
+                discover_system_soundfonts()
+                    .into_iter()
+                    .find_map(|p| SoundFontBank::from_file(&p).ok())
+            })
+            .map(Arc::new);
+        let init_meta = initial_sf2
+            .as_ref()
+            .map(|b| (b.name.clone(), b.preset_names()))
+            .unwrap_or_default();
+        let sf2_meta = Arc::new(Mutex::new(init_meta));
+
         let project = Arc::new(Mutex::new(project));
         let playing = Arc::new(AtomicBool::new(false));
         let current_step = Arc::new(AtomicUsize::new(0));
@@ -3266,6 +4153,7 @@ impl AudioEngine {
                 selected_sample_part,
                 live_queue,
                 telemetry,
+                sf2_meta,
             };
         };
         let Ok(cfg) = device.default_output_config() else {
@@ -3282,6 +4170,7 @@ impl AudioEngine {
                 selected_sample_part,
                 live_queue,
                 telemetry,
+                sf2_meta,
             };
         };
 
@@ -3299,6 +4188,14 @@ impl AudioEngine {
         let tel_ref = telemetry.clone();
 
         let mut rt = Runtime::new(sr);
+        if let Some(bank) = initial_sf2 {
+            let _ = rt.moog.set_soundfont_bank(Some(bank.clone()));
+            let _ = rt.pad_moog.set_soundfont_bank(Some(bank.clone()));
+            let _ = rt.mono.set_soundfont_bank(Some(bank.clone()));
+            for s in &mut rt.extra_synths {
+                let _ = s.set_soundfont_bank(Some(bank.clone()));
+            }
+        }
         let mut local_tel = EngineTelemetry::default();
         let mut scope_decim = 0usize;
 
@@ -3365,6 +4262,7 @@ impl AudioEngine {
                     selected_sample_part,
                     live_queue,
                     telemetry,
+                    sf2_meta,
                 },
                 Err(e) => Self {
                     _stream: None,
@@ -3379,6 +4277,7 @@ impl AudioEngine {
                     selected_sample_part,
                     live_queue,
                     telemetry,
+                    sf2_meta,
                 },
             },
             Err(e) => Self {
@@ -3394,8 +4293,30 @@ impl AudioEngine {
                 selected_sample_part,
                 live_queue,
                 telemetry,
+                sf2_meta,
             },
         }
+    }
+
+    pub fn load_soundfont_file(&self, path: &Path) -> Result<String, String> {
+        let bank = Arc::new(SoundFontBank::from_file(path)?);
+        let name = bank.name.clone();
+        let presets = bank.preset_names();
+        if let Ok(mut meta) = self.sf2_meta.lock() {
+            *meta = (name.clone(), presets);
+        }
+        self.send_live(LiveEvent::LoadSoundFont {
+            bank: Some(bank),
+            name: name.clone(),
+        });
+        Ok(name)
+    }
+
+    pub fn soundfont_meta(&self) -> (String, Vec<String>) {
+        self.sf2_meta
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 
     pub fn step_phase(&self) -> f32 {
@@ -3432,10 +4353,13 @@ pub fn export_wav(project: &Project, path: &Path, bars: usize) -> Result<(), Str
     let total_seconds = (bars.max(1) as f32) * 4.0 * (60.0 / project.bpm.clamp(40.0, 240.0));
     let total_samples = (total_seconds * sr as f32).round() as usize;
 
+    let mut dither_rng = Xorshift32::new(0xD174_E201);
     for _ in 0..total_samples {
         let (l, r) = rt.process_sample(project, true, false, false, 0, &mut tel);
-        let il = (l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-        let ir = (r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        let d_l = (dither_rng.next_f32() - dither_rng.next_f32()) / 32768.0;
+        let d_r = (dither_rng.next_f32() - dither_rng.next_f32()) / 32768.0;
+        let il = ((l + d_l).clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        let ir = ((r + d_r).clamp(-1.0, 1.0) * 32767.0).round() as i16;
         writer.write_sample(il).map_err(|e| e.to_string())?;
         writer.write_sample(ir).map_err(|e| e.to_string())?;
     }
@@ -3480,6 +4404,9 @@ pub fn export_stems(project: &Project, dir: &Path, bars: usize) -> Result<usize,
             ch.solo = false;
         }
         solo_proj.mixer.moog_pad_solo = false;
+        for et in &mut solo_proj.extra_tracks {
+            et.solo = false;
+        }
         if track == TrackId::MoogPad {
             solo_proj.mixer.moog_pad_mute = false;
             solo_proj.mixer.moog_pad_solo = true;
@@ -3488,6 +4415,30 @@ pub fn export_stems(project: &Project, dir: &Path, bars: usize) -> Result<usize,
             solo_proj.mixer.channels[idx].mute = false;
             solo_proj.mixer.channels[idx].solo = true;
         }
+        export_wav(&solo_proj, &dir.join(fname), bars)?;
+        count += 1;
+    }
+    for (ei, tr) in project.extra_tracks.iter().take(MAX_EXTRA_TRACKS).enumerate() {
+        if tr.mute {
+            continue;
+        }
+        let mut solo_proj = project.clone();
+        for ch in &mut solo_proj.mixer.channels {
+            ch.solo = false;
+        }
+        solo_proj.mixer.moog_pad_solo = false;
+        for (j, et) in solo_proj.extra_tracks.iter_mut().enumerate() {
+            et.solo = j == ei;
+            if j == ei {
+                et.mute = false;
+            }
+        }
+        let slug: String = tr
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+            .collect();
+        let fname = format!("{:02}_extra_{}.wav", 7 + ei, slug.trim_matches('_'));
         export_wav(&solo_proj, &dir.join(fname), bars)?;
         count += 1;
     }
@@ -3665,16 +4616,23 @@ mod tests {
 
         let (fbass, fpad, farp, facid, _) = generate_melodic_tracks(Vibe::ElectroFunk, 4, 3, 0xF00D_5EED);
         assert!(
-            fbass.steps.iter().any(|s| s.active && s.motion.any_locked()),
-            "Expected Bass auto-wah MotionLocks"
+            fbass
+                .steps
+                .iter()
+                .all(|s| !s.active || s.motion.resonance.unwrap_or(0.0) <= 0.25),
+            "Expected ElectroFunk bass to avoid harsh resonant auto-wah MotionLocks"
         );
         assert!(
             fpad.steps.iter().any(|s| s.active && s.motion.any_locked()),
             "Expected Chords wah/comping MotionLocks"
         );
         assert!(
-            farp.steps.iter().any(|s| s.active && s.motion.any_locked()),
-            "Expected Arp/Clav MotionLocks"
+            farp.steps.iter().any(|s| s.active)
+                && farp
+                    .steps
+                    .iter()
+                    .all(|s| !s.active || (s.motion.cutoff.is_none() && s.motion.resonance.is_none())),
+            "Expected active ElectroFunk lead without harsh auto-wah MotionLocks"
         );
         assert!(
             facid.steps.iter().any(|s| s.active && s.motion.any_locked()),
@@ -4482,5 +5440,1366 @@ mod tests {
             "Expected ReloadPartyRig to swap rig presets"
         );
         assert_eq!(tel.party_voice_presets, after_presets);
+    }
+
+    #[test]
+    fn drum_tuning_uses_semitones_and_kicks_hit_club_sub_band() {
+        use crate::model::{apply_voice_preset, DrumVoiceId};
+
+        let sr = 44_100.0_f32;
+        let measure_kick_hz = |preset_idx: usize| -> f32 {
+            let mut p = Project::default();
+            apply_voice_preset(&mut p, TrackId::Drums, preset_idx);
+            let mut dm = DrumMachine::new(sr);
+            dm.trigger(DrumVoiceId::Kick, 1.0, false, false, &p.drums);
+
+            let start = (0.070 * sr) as usize;
+            let end = (0.190 * sr) as usize;
+            let mut prev = 0.0_f32;
+            let mut rising_crossings = Vec::new();
+            for i in 0..end {
+                let (l, r) = dm.process_sample(&p.drums);
+                let m = 0.5 * (l + r);
+                if i >= start && prev <= 0.0 && m > 0.0 {
+                    rising_crossings.push(i);
+                }
+                prev = m;
+            }
+            assert!(
+                rising_crossings.len() >= 2,
+                "Expected >=2 positive zero crossings in kick body for preset {preset_idx}, got {}",
+                rising_crossings.len()
+            );
+            let span = (*rising_crossings.last().unwrap() - rising_crossings[0]) as f32;
+            let cycles = (rising_crossings.len() - 1) as f32;
+            cycles * sr / span
+        };
+
+        let hz_808_warm = measure_kick_hz(0); // tune = -2.0 st on 47 Hz -> ~41.9 Hz
+        let hz_909_club = measure_kick_hz(1); // tune = +1.0 st on 52.5 Hz -> ~55.6 Hz
+        let hz_trap_808 = measure_kick_hz(8); // tune = -3.0 st on 47 Hz -> ~39.5 Hz
+
+        assert!(
+            (36.0..=48.0).contains(&hz_808_warm),
+            "808 Warm kick should hit 36..48 Hz club sub band, got {hz_808_warm:.2} Hz"
+        );
+        assert!(
+            (49.0..=62.0).contains(&hz_909_club),
+            "909 Club kick should hit 49..62 Hz club punch band, got {hz_909_club:.2} Hz"
+        );
+        assert!(
+            (34.0..=45.0).contains(&hz_trap_808),
+            "Trap 808 kick should hit 34..45 Hz sub band, got {hz_trap_808:.2} Hz"
+        );
+    }
+
+    #[test]
+    fn analog_filters_and_bbd_chorus_retain_bass_and_widen_cleanly() {
+        use crate::dsp::{AnalogStereoChorus, DiodeLadder303Filter, MoogLadderFilter};
+
+        let sr = 44_100.0_f32;
+        let n = 16_384_usize;
+
+        // 1. MoogLadderFilter retains >= 65% of 80 Hz passband energy at res=0.72
+        let measure_moog_80hz = |res: f32| -> f32 {
+            let mut f = MoogLadderFilter::new(sr);
+            let mut sq = 0.0_f64;
+            for i in 0..n {
+                let t = i as f32 / sr;
+                let s = (t * 80.0 * std::f32::consts::TAU).sin() * 0.5;
+                let y = f.process(s, 650.0, res);
+                assert!(y.is_finite());
+                if i >= n / 2 {
+                    sq += (y as f64) * (y as f64);
+                }
+            }
+            (sq / (n / 2) as f64).sqrt() as f32
+        };
+        let rms_dry = measure_moog_80hz(0.0);
+        let rms_res = measure_moog_80hz(0.72);
+        assert!(
+            rms_res >= rms_dry * 0.65,
+            "MoogLadderFilter lost too much 80Hz bass at res=0.72: dry={rms_dry}, res={rms_res}"
+        );
+
+        // 2. DiodeLadder303Filter boosts resonant acid peak around cutoff while keeping fundamental
+        let measure_303_cutoff_rms = |res: f32| -> f32 {
+            let mut f = DiodeLadder303Filter::new(sr);
+            let mut sq = 0.0_f64;
+            for i in 0..n {
+                let t = i as f32 / sr;
+                let saw = (t * 110.0).fract() * 2.0 - 1.0;
+                let y = f.process(saw * 0.45, 720.0, res);
+                assert!(y.is_finite());
+                if i >= n / 2 {
+                    sq += (y as f64) * (y as f64);
+                }
+            }
+            (sq / (n / 2) as f64).sqrt() as f32
+        };
+        let d_flat = measure_303_cutoff_rms(0.05);
+        let d_squelch = measure_303_cutoff_rms(0.85);
+        assert!(
+            d_squelch > d_flat * 1.10,
+            "DiodeLadder303Filter should deliver stronger resonant acid energy: flat={d_flat}, squelch={d_squelch}"
+        );
+
+        // 3. AnalogStereoChorus widens mono cleanly with negligible DC offset
+        let mut chorus = AnalogStereoChorus::new(sr);
+        let mut side_sq = 0.0_f64;
+        let mut sum_l = 0.0_f64;
+        let mut sum_r = 0.0_f64;
+        for i in 0..n {
+            let t = i as f32 / sr;
+            let mono = (t * 220.0 * std::f32::consts::TAU).sin() * 0.45
+                + (t * 440.0 * std::f32::consts::TAU).sin() * 0.25;
+            let (l, r) = chorus.process_mono(mono, 0.70);
+            assert!(l.is_finite() && r.is_finite());
+            if i >= n / 4 {
+                let side = 0.5 * (l - r);
+                side_sq += (side as f64) * (side as f64);
+                sum_l += l as f64;
+                sum_r += r as f64;
+            }
+        }
+        let count = (n - n / 4) as f64;
+        let side_rms = (side_sq / count).sqrt() as f32;
+        let dc_l = (sum_l / count).abs() as f32;
+        let dc_r = (sum_r / count).abs() as f32;
+        assert!(side_rms > 0.08, "AnalogStereoChorus side_rms too narrow: {side_rms}");
+        assert!(dc_l < 0.01 && dc_r < 0.01, "AnalogStereoChorus DC offset too high: ({dc_l}, {dc_r})");
+    }
+
+    #[test]
+    fn club_heft_mastering_delivers_fat_sub_stereo_width_and_loudness() {
+        use crate::model::apply_vibe_to_project;
+
+        let sr = 44_100.0_f32;
+        let vibes = [
+            Vibe::DeepHouse,
+            Vibe::AcidClub,
+            Vibe::BigRoomEdm,
+            Vibe::Trap808,
+            Vibe::ImperialBass,
+            Vibe::ElectroFunk,
+        ];
+        for &vibe in &vibes {
+            let mut p = Project::default();
+            apply_vibe_to_project(&mut p, vibe, None, 0xC10B_BEEF);
+            p.party_mode = false;
+
+            let mut rt = Runtime::new(sr);
+            let mut tel = EngineTelemetry::default();
+            let total_secs = 4.0 * 4.0 * (60.0 / p.bpm.clamp(40.0, 240.0));
+            let n = (total_secs * sr).round() as usize;
+
+            let mut sub_lp = Svf12Filter::new(sr);
+            let mut sub_hp = Svf12Filter::new(sr);
+            let mut sum_sq = 0.0_f64;
+            let mut sub_sq = 0.0_f64;
+            let mut side_sq = 0.0_f64;
+            let mut peak = 0.0_f32;
+
+            for _ in 0..n {
+                let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+                assert!(l.is_finite() && r.is_finite(), "[{:?}] Non-finite sample", vibe);
+                assert!(l.abs() <= 0.98 && r.abs() <= 0.98, "[{:?}] Clipping: ({l}, {r})", vibe);
+                peak = peak.max(l.abs()).max(r.abs());
+                sum_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+                let mid = 0.5 * (l + r);
+                let side = 0.5 * (l - r);
+                side_sq += (side as f64) * (side as f64);
+                let bp_sub = sub_hp.process_hp(sub_lp.process_lp(mid, 120.0, 0.05), 35.0, 0.05);
+                sub_sq += (bp_sub as f64) * (bp_sub as f64);
+            }
+            let rms = (sum_sq / (n.max(1) as f64 * 2.0)).sqrt() as f32;
+            let sub_rms = (sub_sq / n.max(1) as f64).sqrt() as f32;
+            let side_rms = (side_sq / n.max(1) as f64).sqrt() as f32;
+
+            assert!(rms >= 0.14, "[{:?}] Club loudness RMS too low: {rms}", vibe);
+            assert!(sub_rms >= 0.055, "[{:?}] Club sub-bass RMS (35..120Hz) too thin: {sub_rms}", vibe);
+            assert!(side_rms >= 0.03, "[{:?}] Stereo width side_rms too narrow: {side_rms}", vibe);
+        }
+    }
+
+    #[test]
+    fn studio_drums_and_analog_synths_have_wide_dynamic_and_spectral_range() {
+        use crate::model::{apply_voice_preset, DrumVoiceId};
+
+        let sr = 44_100.0_f32;
+
+        // 1. 909/Linn Snare & Closed Hat have crisp broadband energy + punchy dynamic crest factor (>= 2.2)
+        let mut p = Project::default();
+        apply_voice_preset(&mut p, TrackId::Drums, 4); // 80s Linn Gate
+        let mut dm = DrumMachine::new(sr);
+        dm.trigger(DrumVoiceId::Snare, 1.0, false, false, &p.drums);
+
+        let n_snare = (0.35 * sr) as usize;
+        let mut sq = 0.0_f64;
+        let mut hf_sq = 0.0_f64;
+        let mut peak = 0.0_f32;
+        let mut hp_lp = 0.0_f32;
+        let hp_a = (std::f32::consts::TAU * 4_500.0 / sr).clamp(0.01, 0.8);
+        for _ in 0..n_snare {
+            let (l, r) = dm.process_sample(&p.drums);
+            assert!(l.is_finite() && r.is_finite());
+            let m = 0.5 * (l + r);
+            peak = peak.max(l.abs()).max(r.abs());
+            sq += (m as f64) * (m as f64);
+            hp_lp += hp_a * (m - hp_lp);
+            let hf = m - hp_lp;
+            hf_sq += (hf as f64) * (hf as f64);
+        }
+        let snare_rms = (sq / n_snare as f64).sqrt() as f32;
+        let snare_hf_rms = (hf_sq / n_snare as f64).sqrt() as f32;
+        let crest = peak / snare_rms.max(1e-6);
+        assert!(crest >= 2.2, "Expected punchy studio snare crest factor >= 2.2, got {crest:.2}");
+        assert!(snare_hf_rms > snare_rms * 0.25, "Expected crisp broadband snare highs: hf={snare_hf_rms}, total={snare_rms}");
+
+        let mut dm_hat = DrumMachine::new(sr);
+        dm_hat.trigger(DrumVoiceId::ClosedHat, 1.0, false, false, &p.drums);
+        let n_hat = (0.15 * sr) as usize;
+        let mut hat_hf_sq = 0.0_f64;
+        let mut hat_hp_lp = 0.0_f32;
+        for _ in 0..n_hat {
+            let (l, r) = dm_hat.process_sample(&p.drums);
+            let m = 0.5 * (l + r);
+            hat_hp_lp += hp_a * (m - hat_hp_lp);
+            let hf = m - hat_hp_lp;
+            hat_hf_sq += (hf as f64) * (hf as f64);
+        }
+        let hat_hf_rms = (hat_hf_sq / n_hat as f64).sqrt() as f32;
+        assert!(hat_hf_rms > 0.015, "Expected shimmering broadband 909/Linn hat highs, got {hat_hf_rms}");
+
+        // 2. Polyphonic OB-X 80s Power chord renders wide, unclipped, bright analog stereo harmonics
+        apply_voice_preset(&mut p, TrackId::MoogPad, 5); // OB-X 80s Power
+        let mut poly = MoogSynth::new(sr);
+        for &note in &[48u8, 55, 60, 64, 67] {
+            poly.note_on(note, 0.85, false, false, &p.moog_pad);
+        }
+        let n_pad = 16_384_usize;
+        let mut pad_side_sq = 0.0_f64;
+        let mut pad_hf_sq = 0.0_f64;
+        let mut pad_peak = 0.0_f32;
+        let mut pad_hp_lp = 0.0_f32;
+        let pad_hp_a = (std::f32::consts::TAU * 2_500.0 / sr).clamp(0.01, 0.8);
+        for _ in 0..n_pad {
+            let (l, r) = poly.process_stereo(&p.moog_pad);
+            assert!(l.is_finite() && r.is_finite());
+            pad_peak = pad_peak.max(l.abs()).max(r.abs());
+            let side = 0.5 * (l - r);
+            pad_side_sq += (side as f64) * (side as f64);
+            let mid = 0.5 * (l + r);
+            pad_hp_lp += pad_hp_a * (mid - pad_hp_lp);
+            let hf = mid - pad_hp_lp;
+            pad_hf_sq += (hf as f64) * (hf as f64);
+        }
+        let pad_side_rms = (pad_side_sq / n_pad as f64).sqrt() as f32;
+        let pad_hf_rms = (pad_hf_sq / n_pad as f64).sqrt() as f32;
+        assert!(pad_peak <= 0.99, "OB-Xa poly chord clipped at {pad_peak}");
+        assert!(pad_side_rms > 0.04, "Expected wide stereo OB-Xa unison spread, got {pad_side_rms}");
+        assert!(pad_hf_rms > 0.015, "Expected open 12dB OB-Xa upper harmonics, got {pad_hf_rms}");
+
+        // 3. 8-channel Hadamard FDN reverb generates lush decorrelated stereo tail after dry burst
+        let mut fx = MasterFx::new(sr);
+        let mut fxp = p.fx.clone();
+        fxp.delay_enabled = false;
+        fxp.reverb_enabled = true;
+        fxp.reverb_mix = 0.85;
+        fxp.reverb_size = 0.72;
+        fxp.reverb_damp = 0.40;
+        fxp.global_filter_enabled = false;
+        fxp.analog_warmth = 0.0;
+        fxp.master_crisp = 0.0;
+        fxp.club_punch = 0.0;
+
+        let n_rev = 22_050_usize;
+        let mut rev_l_sq = 0.0_f64;
+        let mut rev_r_sq = 0.0_f64;
+        let mut rev_side_sq = 0.0_f64;
+        let mut tail_count = 0usize;
+        for i in 0..n_rev {
+            let burst = if i < 441 {
+                let t = i as f32 / sr;
+                ((t * 880.0 * std::f32::consts::TAU).sin() * 0.55
+                    + (t * 1320.0 * std::f32::consts::TAU).sin() * 0.35)
+                    * 0.85
+            } else {
+                0.0
+            };
+            let (ol, or) = fx.process_stereo(0.0, 0.0, 0.0, 0.0, burst, burst * 0.7, &fxp, 120.0);
+            assert!(ol.is_finite() && or.is_finite());
+            if i >= 1_500 {
+                rev_l_sq += (ol as f64) * (ol as f64);
+                rev_r_sq += (or as f64) * (or as f64);
+                let side = 0.5 * (ol - or);
+                rev_side_sq += (side as f64) * (side as f64);
+                tail_count += 1;
+            }
+        }
+        let rev_l_rms = (rev_l_sq / tail_count as f64).sqrt() as f32;
+        let rev_r_rms = (rev_r_sq / tail_count as f64).sqrt() as f32;
+        let rev_side_rms = (rev_side_sq / tail_count as f64).sqrt() as f32;
+        assert!(rev_l_rms > 0.02 && rev_r_rms > 0.02, "Expected lush FDN reverb tail: L={rev_l_rms}, R={rev_r_rms}");
+        assert!(rev_side_rms > 0.015, "Expected decorrelated stereo FDN width, got {rev_side_rms}");
+    }
+
+    #[test]
+    fn studio_mastering_preserves_dynamics_stereo_width_and_clean_highs() {
+        use crate::model::{apply_vibe_to_project, FxParams};
+
+        let vibes = [
+            Vibe::Arena80s,
+            Vibe::DeepHouse,
+            Vibe::ElectroFunk,
+            Vibe::ImperialBass,
+            Vibe::Dubstep,
+        ];
+        let sr = 44_100.0_f32;
+        for &vibe in &vibes {
+            let mut p = Project::default();
+            apply_vibe_to_project(&mut p, vibe, None, 20261124);
+            p.party_mode = false;
+
+            let mut rt = Runtime::new(sr);
+            let mut tel = EngineTelemetry::default();
+            let total_secs = 4.0 * 4.0 * (60.0 / p.bpm.clamp(40.0, 240.0));
+            let n = (total_secs * sr).round() as usize;
+
+            let mut sum_sq = 0.0_f64;
+            let mut mid_sq = 0.0_f64;
+            let mut side_sq = 0.0_f64;
+            let mut peak = 0.0_f32;
+
+            let mut sub_l_lp = Biquad::new();
+            let mut sub_r_lp = Biquad::new();
+            sub_l_lp.set_lowpass(sr, 120.0, 0.7071);
+            sub_r_lp.set_lowpass(sr, 120.0, 0.7071);
+            let mut sub_ll = 0.0_f64;
+            let mut sub_rr = 0.0_f64;
+            let mut sub_lr = 0.0_f64;
+
+            let mut midband_lp = Biquad::new();
+            let mut midband_hp = Biquad::new();
+            midband_lp.set_lowpass(sr, 4_000.0, 0.7071);
+            midband_hp.set_highpass(sr, 400.0, 0.7071);
+            let mut ultra_hp = Biquad::new();
+            ultra_hp.set_highpass(sr, 16_000.0, 0.7071);
+            let mut midband_sq = 0.0_f64;
+            let mut ultra_sq = 0.0_f64;
+
+            for _ in 0..n {
+                let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+                assert!(l.is_finite() && r.is_finite(), "[{:?}] Non-finite sample", vibe);
+                assert!(l.abs() <= 0.961 && r.abs() <= 0.961, "[{:?}] Exceeded ceiling: ({l}, {r})", vibe);
+                peak = peak.max(l.abs()).max(r.abs());
+                sum_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+
+                let m = 0.5 * (l + r);
+                let s = 0.5 * (l - r);
+                mid_sq += (m as f64) * (m as f64);
+                side_sq += (s as f64) * (s as f64);
+
+                let sl = sub_l_lp.process(l) as f64;
+                let sr_v = sub_r_lp.process(r) as f64;
+                sub_ll += sl * sl;
+                sub_rr += sr_v * sr_v;
+                sub_lr += sl * sr_v;
+
+                let mb = midband_hp.process(midband_lp.process(m)) as f64;
+                let uh = ultra_hp.process(m) as f64;
+                midband_sq += mb * mb;
+                ultra_sq += uh * uh;
+            }
+
+            let rms = (sum_sq / (n.max(1) as f64 * 2.0)).sqrt() as f32;
+            let crest_db = 20.0 * (peak.max(1e-6) / rms.max(1e-6)).log10();
+            let sm_ratio = (side_sq / mid_sq.max(1e-12)).sqrt() as f32;
+            let sub_corr = (sub_lr / (sub_ll * sub_rr).sqrt().max(1e-12)) as f32;
+            let midband_rms = (midband_sq / n.max(1) as f64).sqrt() as f32;
+            let ultra_rms = (ultra_sq / n.max(1) as f64).sqrt() as f32;
+
+            assert!(
+                crest_db >= 8.5,
+                "[{:?}] Crest factor too squashed: {crest_db:.2} dB (peak={peak:.3}, rms={rms:.3})",
+                vibe
+            );
+            assert!(
+                sm_ratio >= 0.16,
+                "[{:?}] Stereo width S/M too narrow: {sm_ratio:.3}",
+                vibe
+            );
+            if vibe == Vibe::Arena80s {
+                assert!(
+                    sm_ratio >= 0.22,
+                    "Arena80s should be wide >= 0.22, got {sm_ratio:.3}"
+                );
+            }
+            assert!(
+                sub_corr >= 0.97,
+                "[{:?}] Sub <120Hz stereo correlation too loose: {sub_corr:.4}",
+                vibe
+            );
+            assert!(
+                ultra_rms < midband_rms * 0.65,
+                "[{:?}] Ultrasonic >16kHz fizz too high: ultra={ultra_rms:.4}, midband={midband_rms:.4}",
+                vibe
+            );
+        }
+
+        // Sample-rate invariance sanity check for Biquad + MasterFx at 44.1 kHz & 48 kHz
+        for &test_sr in &[44_100.0_f32, 48_000.0_f32] {
+            let mut bq = Biquad::new();
+            bq.set_high_shelf(test_sr, 10_500.0, 0.70, 2.5);
+            let mut fx = MasterFx::new(test_sr);
+            let fxp = FxParams::default();
+            for i in 0..4096 {
+                let t = i as f32 / test_sr;
+                let s = (t * 440.0 * std::f32::consts::TAU).sin() * 0.4;
+                let y = bq.process(s);
+                let (ol, or) = fx.process_stereo(y, y, y * 0.2, y * 0.2, y * 0.2, y * 0.2, &fxp, 122.0);
+                assert!(ol.is_finite() && or.is_finite() && ol.abs() <= 0.961 && or.abs() <= 0.961);
+            }
+        }
+    }
+
+    #[test]
+    fn stereo_sampler_and_saved_sample_preserve_stereo_and_velocity_dynamics() {
+        use crate::model::{SamplerMode, SamplerParams, SavedSample};
+
+        let sr = 44_100u32;
+        for id in 0..9u8 {
+            let (l, r) = generate_builtin_sample_stereo(id, sr);
+            assert!(!l.is_empty() && l.len() == r.len(), "Patch {id} empty or mismatched len");
+            let mut side_sq = 0.0_f64;
+            for (&sl, &sr_v) in l.iter().zip(r.iter()) {
+                assert!(
+                    sl.is_finite() && sr_v.is_finite() && sl.abs() <= 1.0 && sr_v.abs() <= 1.0,
+                    "Patch {id} out of range: ({sl}, {sr_v})"
+                );
+                let side = 0.5 * (sl - sr_v);
+                side_sq += (side as f64) * (side as f64);
+            }
+            if matches!(id, 0 | 3 | 5 | 6 | 7) {
+                let side_rms = (side_sq / l.len() as f64).sqrt() as f32;
+                assert!(
+                    side_rms > 0.015,
+                    "Expected true stereo width > 0.015 on built-in patch {id}, got {side_rms:.4}"
+                );
+            }
+        }
+
+        // Stereo round-trip + legacy mono decode backwards compatibility
+        let left_in: Vec<f32> = (0..128).map(|i| (i as f32 * 0.05).sin() * 0.8).collect();
+        let right_in: Vec<f32> = (0..128).map(|i| (i as f32 * 0.05).cos() * 0.6).collect();
+        let saved_st = SavedSample::from_stereo_pcm("StereoTest", sr, &left_in, &right_in, None);
+        assert_eq!(saved_st.channels, 2);
+        let (dec_l, dec_r) = saved_st.decode_stereo_pcm().expect("decode stereo");
+        assert_eq!(dec_l.len(), 128);
+        assert_eq!(dec_r.len(), 128);
+        let diff_lr: f32 = dec_l.iter().zip(dec_r.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff_lr > 10.0, "Expected distinct L/R round-trip, got diff={diff_lr}");
+        let downmix = saved_st.decode_f32_pcm().expect("downmix mono");
+        assert_eq!(downmix.len(), 128);
+
+        let mut legacy_mono = SavedSample::from_f32_pcm("Legacy", sr, &left_in, None);
+        legacy_mono.channels = 0; // simulate old serialized project JSON without channels field
+        let (ml, mr) = legacy_mono.decode_stereo_pcm().expect("decode legacy mono");
+        assert_eq!(ml, mr, "Legacy mono sample should mirror to L/R identically");
+
+        // Sk1Sampler velocity-to-brightness & output level dynamics
+        let render_vel = |vel: f32| -> f32 {
+            let mut samp = Sk1Sampler::new(sr as f32);
+            let mut sp = SamplerParams::default();
+            sp.mode = SamplerMode::HiFi;
+            sp.cutoff = 4_800.0;
+            samp.note_on(60, vel, &sp);
+            let mut sum_sq = 0.0_f64;
+            for _ in 0..4096 {
+                let (l, r) = samp.process_stereo(&sp);
+                assert!(l.is_finite() && r.is_finite());
+                sum_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            (sum_sq / (4096.0 * 2.0)).sqrt() as f32
+        };
+        let rms_soft = render_vel(0.25);
+        let rms_loud = render_vel(0.95);
+        assert!(
+            rms_loud > rms_soft * 2.0,
+            "Expected strong sampler velocity dynamics: loud={rms_loud:.4}, soft={rms_soft:.4}"
+        );
+    }
+
+    #[test]
+    fn expressive_groove_pocket_and_formant_growl_render_cleanly() {
+        use crate::model::{
+            apply_vibe_to_project, LfoTarget, MonologueOscWave, MonologueParams, Osc2ModMode,
+        };
+
+        let sr = 44_100.0_f32;
+        // 1) Monologue delayed vibrato bloom + slow drift + silk smoother
+        let mut vib_synth = MonologueSynth::new(sr);
+        let mut vib_p = MonologueParams::default();
+        vib_p.amp_sustain = true;
+        vib_p.lfo_target = LfoTarget::Pitch;
+        vib_p.lfo_rate = 0.56;
+        vib_p.lfo_int = 0.020;
+        vib_synth.note_on(76, 0.90, false, false, &vib_p);
+        let mut vib_peak = 0.0_f32;
+        for _ in 0..16_384 {
+            let (l, r) = vib_synth.process_stereo(&vib_p);
+            assert!(l.is_finite() && r.is_finite());
+            vib_peak = vib_peak.max(l.abs()).max(r.abs());
+        }
+        assert!(vib_peak > 0.05 && vib_peak <= 1.4, "Unexpected vibrato lead peak: {vib_peak}");
+
+        // 2) Monologue Osc2ModMode::Ring wavefolded talking formant growl
+        let mut growl_synth = MonologueSynth::new(sr);
+        let mut growl_p = MonologueParams::default();
+        growl_p.vco1_wave = MonologueOscWave::Saw;
+        growl_p.vco2_wave = MonologueOscWave::Square;
+        growl_p.mod_mode = Osc2ModMode::Ring;
+        growl_p.vco2_octave = -1;
+        growl_p.vco2_pitch = 5.0;
+        growl_p.vco1_shape = 0.65;
+        growl_p.vco2_shape = 0.55;
+        growl_p.cutoff = 1150.0;
+        growl_p.resonance = 0.62;
+        growl_p.drive = 0.84;
+        growl_p.lfo_target = LfoTarget::Cutoff;
+        growl_p.lfo_int = 0.55;
+        growl_synth.note_on(40, 0.96, true, false, &growl_p);
+        let mut growl_peak = 0.0_f32;
+        for _ in 0..16_384 {
+            let (l, r) = growl_synth.process_stereo(&growl_p);
+            assert!(l.is_finite() && r.is_finite());
+            growl_peak = growl_peak.max(l.abs()).max(r.abs());
+        }
+        assert!(
+            growl_peak > 0.05 && growl_peak <= 1.8,
+            "Unexpected formant growl peak: {growl_peak}"
+        );
+
+        // 3) Full Runtime groove pocket + console strips across 2 bars of key vibes
+        for &vibe in &[Vibe::Dubstep, Vibe::Arena80s, Vibe::ElectroFunk, Vibe::DeepHouse] {
+            let mut p = Project::default();
+            apply_vibe_to_project(&mut p, vibe, None, 20261124);
+            p.party_mode = false;
+            let mut rt = Runtime::new(sr);
+            let mut tel = EngineTelemetry::default();
+            let total_secs = 2.0 * 4.0 * (60.0 / p.bpm.clamp(40.0, 240.0));
+            let n = (total_secs * sr).round() as usize;
+            let mut peak = 0.0_f32;
+            let mut sum_sq = 0.0_f64;
+            for _ in 0..n {
+                let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+                assert!(l.is_finite() && r.is_finite(), "[{:?}] Non-finite output", vibe);
+                assert!(l.abs() <= 0.961 && r.abs() <= 0.961, "[{:?}] Clipped output: ({l}, {r})", vibe);
+                peak = peak.max(l.abs()).max(r.abs());
+                sum_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            let rms = (sum_sq / (n.max(1) as f64 * 2.0)).sqrt() as f32;
+            let crest_db = 20.0 * (peak.max(1e-6) / rms.max(1e-6)).log10();
+            assert!(
+                crest_db >= 8.5,
+                "[{:?}] Crest dropped below 8.5 dB: {crest_db:.2} dB",
+                vibe
+            );
+        }
+    }
+
+    #[test]
+    fn halfband_oversampler_and_genre_purity_invariants_hold() {
+        use crate::dsp::{AnalogDrift, HalfBandDecim2x, HalfBandUp2x};
+        use crate::model::{apply_vibe_to_project, PROGRESSIONS};
+
+        let sr = 48_000.0_f32;
+        // 1) Half-band 2x oversampler preserves 15 kHz passband (> 0.90 gain, no boxcar -6 dB droop)
+        let mut up = HalfBandUp2x::new();
+        let mut decim = HalfBandDecim2x::new();
+        let mut sum_sq = 0.0_f64;
+        let n = 4096_usize;
+        for i in 0..n {
+            let x = (i as f32 * 15_000.0 / sr * std::f32::consts::TAU).sin();
+            let u = up.process(x);
+            let y = decim.process(u[0], u[1]);
+            if i >= 256 {
+                sum_sq += (y as f64) * (y as f64);
+            }
+        }
+        let rms_15k = (sum_sq / (n - 256) as f64).sqrt() as f32;
+        assert!(
+            rms_15k > 0.64,
+            "Expected flat 15 kHz passband RMS > 0.64 (~0.707 ideal), got {rms_15k:.4}"
+        );
+
+        // 2) Ornstein-Uhlenbeck AnalogDrift stays finite, bounded, and non-trivial
+        let mut drift = AnalogDrift::new(0x1234_5678);
+        let mut d_sq = 0.0_f64;
+        for _ in 0..24_000 {
+            let v = drift.next(sr);
+            assert!(v.is_finite() && v.abs() <= 1.0);
+            d_sq += (v as f64) * (v as f64);
+        }
+        let drift_rms = (d_sq / 24_000.0).sqrt() as f32;
+        assert!(
+            drift_rms > 0.05 && drift_rms <= 1.0,
+            "Expected organic thermal drift RMS in (0.05, 1.0], got {drift_rms:.4}"
+        );
+
+        // 3) Lyrical/rock vibes have zero auto-wah lead hijacking & exact chord-root sampler pitch classes
+        for &vibe in &[Vibe::IndieRock, Vibe::Synthwave, Vibe::LofiChill, Vibe::EuphoricTrance] {
+            for seed in [42_u32, 1337, 20261124] {
+                let mut p = Project::default();
+                apply_vibe_to_project(&mut p, vibe, None, seed);
+                let pat = &p.patterns[p.active_pattern];
+                for st in &pat.monologue.steps {
+                    if st.active {
+                        assert!(
+                            st.motion.cutoff.is_none() && st.motion.resonance.is_none(),
+                            "[{:?}] Unexpected auto-wah motion lock on lead step",
+                            vibe
+                        );
+                    }
+                }
+                let prog = &PROGRESSIONS[p.progression_idx % PROGRESSIONS.len()];
+                for bar in 0..4 {
+                    let expected_pc = (p.root_note + prog.slots[bar].offset) % 12;
+                    for step_i in 0..16 {
+                        let s = &pat.sampler.steps[bar * 16 + step_i];
+                        if s.active {
+                            assert_eq!(
+                                s.note % 12,
+                                expected_pc,
+                                "[{:?}] Sampler note {} pitch class != chord root pc {}",
+                                vibe,
+                                s.note,
+                                expected_pc
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hardware_arpeggiator_modes_latch_and_philharmonia_layers_work() {
+        use crate::dsp::{DrumMachine, Svf12Filter};
+        use crate::model::{ArpMode, ArpRate, DrumModel};
+
+        let sr = 44_100.0_f32;
+        // 1) Legacy project JSON without `arp` deserializes cleanly with defaults
+        let legacy_json = r#"{"version":2,"bpm":120.0}"#;
+        let mut p: Project = serde_json::from_str(legacy_json).expect("legacy project json");
+        p.normalize();
+        assert!(!p.arp.enabled);
+        assert_eq!(p.arp.mode, ArpMode::Up);
+        assert_eq!(p.arp.rate, ArpRate::Sixteenth);
+        assert_eq!(p.arp.octaves, 2);
+
+        // 2) Exercise all ArpModes + Latch + disable cleanly leaving 0 active voices
+        p.arp.enabled = true;
+        p.arp.latch = true;
+        p.arp.rate = ArpRate::Sixteenth;
+        p.arp.octaves = 2;
+        let mut rt = Runtime::new(sr);
+        let mut tel = EngineTelemetry::default();
+        for &note in &[60u8, 64, 67] {
+            rt.handle_live_event(
+                LiveEvent::PlayNote {
+                    track: TrackId::Monologue,
+                    note,
+                    velocity: 0.88,
+                },
+                &p,
+            );
+        }
+        // Release keys while HOLD/latch is active
+        for &note in &[60u8, 64, 67] {
+            rt.handle_live_event(
+                LiveEvent::ReleaseNote {
+                    track: TrackId::Monologue,
+                    note,
+                },
+                &p,
+            );
+        }
+        for mode in ArpMode::ALL {
+            p.arp.mode = mode;
+            let mut sq = 0.0_f64;
+            for _ in 0..8_192 {
+                let (l, r) = rt.process_sample(&p, false, false, false, 0, &mut tel);
+                assert!(l.is_finite() && r.is_finite());
+                assert!(l.abs() <= 0.961 && r.abs() <= 0.961);
+                sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            let rms = (sq / (8_192.0 * 2.0)).sqrt() as f32;
+            assert!(rms > 0.005, "Expected latched arp mode {:?} to produce audio, rms={rms}", mode);
+        }
+        p.arp.enabled = false;
+        for _ in 0..24_000 {
+            let _ = rt.process_sample(&p, false, false, false, 0, &mut tel);
+        }
+        assert!(rt.live_arp.sounding.is_none());
+        assert_eq!(rt.mono.is_active(), false);
+
+        // 3) Upgraded 909/Studio Crash Cymbal has wide stereo image and full mid-bronze body (500..3500 Hz)
+        let mut p_cym = Project::default();
+        p_cym.drums.voices[7].model = DrumModel::Tr909;
+        let mut dm = DrumMachine::new(sr);
+        dm.trigger(DrumVoiceId::Cymbal, 1.0, false, false, &p_cym.drums);
+        let n_cym = (1.4 * sr) as usize;
+        let mut side_sq = 0.0_f64;
+        let mut body_sq = 0.0_f64;
+        let mut bp_lp = Svf12Filter::new(sr);
+        let mut bp_hp = Svf12Filter::new(sr);
+        for _ in 0..n_cym {
+            let (l, r) = dm.process_sample(&p_cym.drums);
+            assert!(l.is_finite() && r.is_finite());
+            let m = 0.5 * (l + r);
+            let s = 0.5 * (l - r);
+            side_sq += (s as f64) * (s as f64);
+            let mid_band = bp_hp.process_hp(bp_lp.process_lp(m, 3_500.0, 0.05), 500.0, 0.05);
+            body_sq += (mid_band as f64) * (mid_band as f64);
+        }
+        let side_rms = (side_sq / n_cym as f64).sqrt() as f32;
+        let body_rms = (body_sq / n_cym as f64).sqrt() as f32;
+        assert!(side_rms > 0.01, "Expected wide stereo crash cymbal side_rms > 0.01, got {side_rms:.4}");
+        assert!(body_rms > 0.015, "Expected full mid-bronze crash body RMS > 0.015, got {body_rms:.4}");
+    }
+
+    #[test]
+    fn multi_engine_fm_wavetable_philharmonia_shimmer_and_sf2_work() {
+        use crate::dsp::{FmSynth, MasterFx, MultiSampleSynth, SoundFontBank, SoundFontSynth, WavetableSynth};
+
+        let sr = 44_100.0_f32;
+        // 1) 4-Op FM Engine across all 6 banks
+        let mut fm = FmSynth::new(sr);
+        for bank in 0..6u8 {
+            fm.all_notes_off();
+            fm.note_on(60, 0.9, false, false, true, 0.04);
+            fm.note_on(67, 0.85, false, false, true, 0.04);
+            let mut sq = 0.0_f64;
+            for _ in 0..2048 {
+                let (l, r) = fm.process_stereo(
+                    bank, 0.58, 3600.0, 0.22, 0.20, 0.5, 0.004, 0.45, 0.55, 0.3, 0.04, true, 0.2, 0.0,
+                );
+                assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.8 && r.abs() <= 1.8);
+                sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            let rms = (sq / 4096.0).sqrt() as f32;
+            assert!(rms > 0.01, "FM bank {bank} too quiet: {rms}");
+        }
+
+        // 2) Wavetable + 7-Voice HyperSaw Engine across all 6 banks (verifies wide HyperSaw stereo)
+        let mut wt = WavetableSynth::new(sr);
+        for bank in 0..6u8 {
+            wt.all_notes_off();
+            wt.note_on(60, 0.9, false, false, true, 0.04);
+            wt.note_on(64, 0.88, false, false, true, 0.04);
+            let mut side_sq = 0.0_f64;
+            let mut mid_sq = 0.0_f64;
+            for _ in 0..2048 {
+                let (l, r) = wt.process_stereo(
+                    bank, 0.65, 3600.0, 0.22, 0.18, 0.5, 0.01, 0.4, 0.5, 0.3, 0.01, 0.4, 0.7, 0.3,
+                    0.04, true, 0.0, 0.0,
+                );
+                assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.8 && r.abs() <= 1.8);
+                let m = 0.5 * (l + r);
+                let s = 0.5 * (l - r);
+                mid_sq += (m as f64) * (m as f64);
+                side_sq += (s as f64) * (s as f64);
+            }
+            let mid_rms = (mid_sq / 2048.0).sqrt() as f32;
+            let side_rms = (side_sq / 2048.0).sqrt() as f32;
+            assert!(mid_rms > 0.01, "Wavetable bank {bank} silent: {mid_rms}");
+            if bank == 0 {
+                assert!(side_rms > 0.008, "Virus 7x HyperSaw should have stereo width, got {side_rms}");
+            }
+        }
+
+        // 3) Chromatic Multi-Sampled Philharmonia + D-50 Engine across all 6 banks
+        let mut ms = MultiSampleSynth::new(sr);
+        for bank in 0..6u8 {
+            ms.all_notes_off();
+            ms.note_on(57, 0.9, false, true, bank);
+            ms.note_on(64, 0.88, false, true, bank);
+            let mut sq = 0.0_f64;
+            for _ in 0..3072 {
+                let (l, r) = ms.process_stereo(
+                    bank, 0.45, 4200.0, 0.18, 0.20, 0.01, 0.6, 0.7, 0.3, true, 0.15,
+                    if bank == 2 { 0.75 } else { 0.0 },
+                );
+                assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.8 && r.abs() <= 1.8);
+                sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            let rms = (sq / 6144.0).sqrt() as f32;
+            assert!(rms > 0.005, "Philharmonia bank {bank} silent: {rms}");
+        }
+
+        // 4) Pure-Rust SoundFont 2.0 (RIFF sfbk) parser + playback
+        let mut sf2_bytes: Vec<u8> = Vec::new();
+        let push_chunk = |dst: &mut Vec<u8>, id: &[u8; 4], data: &[u8]| {
+            dst.extend_from_slice(id);
+            dst.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            dst.extend_from_slice(data);
+            if data.len() & 1 == 1 {
+                dst.push(0);
+            }
+        };
+        let mut info_list = Vec::new();
+        info_list.extend_from_slice(b"INFO");
+        push_chunk(&mut info_list, b"INAM", b"UnitTestBank\0\0");
+
+        let mut smpl_raw = Vec::with_capacity(4096 * 2);
+        for i in 0..4096 {
+            let v = ((i as f32 * 440.0 / sr * std::f32::consts::TAU).sin() * 24000.0) as i16;
+            smpl_raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut sdta_list = Vec::new();
+        sdta_list.extend_from_slice(b"sdta");
+        push_chunk(&mut sdta_list, b"smpl", &smpl_raw);
+
+        let mut phdr = Vec::new();
+        let mut p_rec = [0u8; 38];
+        p_rec[..9].copy_from_slice(b"TestPiano");
+        phdr.extend_from_slice(&p_rec);
+        let mut eop = [0u8; 38];
+        eop[..3].copy_from_slice(b"EOP");
+        eop[24..26].copy_from_slice(&1u16.to_le_bytes());
+        phdr.extend_from_slice(&eop);
+
+        let mut pbag = Vec::new();
+        pbag.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]);
+        let mut pgen = Vec::new();
+        // op 41 = instrument 0
+        pgen.extend_from_slice(&41u16.to_le_bytes());
+        pgen.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut inst = Vec::new();
+        let mut i_rec = [0u8; 22];
+        i_rec[..8].copy_from_slice(b"SineInst");
+        inst.extend_from_slice(&i_rec);
+        let mut eoi = [0u8; 22];
+        eoi[..3].copy_from_slice(b"EOI");
+        eoi[20..22].copy_from_slice(&1u16.to_le_bytes());
+        inst.extend_from_slice(&eoi);
+
+        let mut ibag = Vec::new();
+        ibag.extend_from_slice(&[0, 0, 0, 0, 2, 0, 0, 0]);
+        let mut igen = Vec::new();
+        // op 54 = sampleModes (1 = loop), op 53 = sampleID 0
+        igen.extend_from_slice(&54u16.to_le_bytes());
+        igen.extend_from_slice(&1u16.to_le_bytes());
+        igen.extend_from_slice(&53u16.to_le_bytes());
+        igen.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut shdr = Vec::new();
+        let mut s_rec = [0u8; 46];
+        s_rec[..7].copy_from_slice(b"Sine440");
+        s_rec[20..24].copy_from_slice(&0u32.to_le_bytes());
+        s_rec[24..28].copy_from_slice(&4096u32.to_le_bytes());
+        s_rec[28..32].copy_from_slice(&100u32.to_le_bytes());
+        s_rec[32..36].copy_from_slice(&2100u32.to_le_bytes());
+        s_rec[36..40].copy_from_slice(&(sr as u32).to_le_bytes());
+        s_rec[40] = 69; // A4
+        s_rec[44] = 1;  // monoSample
+        shdr.extend_from_slice(&s_rec);
+        let mut eos = [0u8; 46];
+        eos[..3].copy_from_slice(b"EOS");
+        shdr.extend_from_slice(&eos);
+
+        let mut pdta_list = Vec::new();
+        pdta_list.extend_from_slice(b"pdta");
+        push_chunk(&mut pdta_list, b"phdr", &phdr);
+        push_chunk(&mut pdta_list, b"pbag", &pbag);
+        push_chunk(&mut pdta_list, b"pgen", &pgen);
+        push_chunk(&mut pdta_list, b"inst", &inst);
+        push_chunk(&mut pdta_list, b"ibag", &ibag);
+        push_chunk(&mut pdta_list, b"igen", &igen);
+        push_chunk(&mut pdta_list, b"shdr", &shdr);
+
+        let mut sfbk_body = Vec::new();
+        sfbk_body.extend_from_slice(b"sfbk");
+        push_chunk(&mut sfbk_body, b"LIST", &info_list);
+        push_chunk(&mut sfbk_body, b"LIST", &sdta_list);
+        push_chunk(&mut sfbk_body, b"LIST", &pdta_list);
+        push_chunk(&mut sf2_bytes, b"RIFF", &sfbk_body);
+
+        let parsed = std::sync::Arc::new(SoundFontBank::from_bytes(&sf2_bytes).expect("parse sf2"));
+        assert_eq!(parsed.name, "UnitTestBank");
+        assert_eq!(parsed.presets.len(), 1);
+        assert_eq!(parsed.presets[0].name, "TestPiano");
+        let mut sf2 = SoundFontSynth::new(sr);
+        let _ = sf2.set_bank(Some(parsed));
+        sf2.note_on(64, 0.9, true, 0);
+        let mut sf2_sq = 0.0_f64;
+        for _ in 0..2048 {
+            let (l, r) = sf2.process_stereo(6000.0, 0.1, 0.0, 0.0, 0.0);
+            assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.8 && r.abs() <= 1.8);
+            sf2_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+        }
+        assert!((sf2_sq / 4096.0).sqrt() > 0.02);
+
+        // 5) Shimmer Hall Reverb in MasterFx
+        let mut fx = MasterFx::new(sr);
+        let mut fxp = Project::default().fx;
+        fxp.reverb_enabled = true;
+        fxp.reverb_mix = 0.65;
+        fxp.reverb_shimmer = 0.70;
+        let mut wet_tail_sq = 0.0_f64;
+        for i in 0..16_384 {
+            let imp = if i < 256 { (i as f32 * 440.0 / sr * std::f32::consts::TAU).sin() * 0.6 } else { 0.0 };
+            let (l, r) = fx.process_stereo(imp, imp, 0.0, 0.0, imp, imp, &fxp, 120.0);
+            assert!(l.is_finite() && r.is_finite() && l.abs() <= 0.961 && r.abs() <= 0.961);
+            if i > 4096 {
+                wet_tail_sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+        }
+        assert!(wet_tail_sq > 0.05, "Expected lush shimmer tail energy, got {wet_tail_sq}");
+    }
+
+    #[test]
+    fn voice_leading_and_melodic_contour_stay_smooth_and_in_key() {
+        use crate::model::{
+            generate_melodic_tracks, voice_led_chord_near, ChordSlot, ChordType, PROGRESSIONS,
+        };
+
+        // 1) Bar-to-bar voice_led_chord_near moves smoothly vs root-position jumps across i -> VI -> III -> VII
+        let slots = [
+            ChordSlot { offset: 0, chord: ChordType::Minor9 },
+            ChordSlot { offset: 8, chord: ChordType::Major7 },
+            ChordSlot { offset: 3, chord: ChordType::Major9 },
+            ChordSlot { offset: 10, chord: ChordType::Add9 },
+        ];
+        let mut prev: Vec<u8> = Vec::new();
+        for (bi, &sl) in slots.iter().enumerate() {
+            let voiced = voice_led_chord_near(0, sl, &prev, 60);
+            assert!(!voiced.is_empty());
+            assert!(
+                voiced.iter().all(|&n| (48..=74).contains(&n)),
+                "Bar {bi} voiced chord out of warm pad zone: {:?}",
+                voiced
+            );
+            if !prev.is_empty() {
+                let total_move: i32 = voiced
+                    .iter()
+                    .map(|&n| prev.iter().map(|&p| (p as i32 - n as i32).abs()).min().unwrap_or(0))
+                    .sum();
+                let avg_move = total_move as f32 / voiced.len() as f32;
+                assert!(
+                    avg_move <= 3.5,
+                    "Expected smooth bar-to-bar voice leading (avg <= 3.5st), got {avg_move:.2}st: {:?} -> {:?}",
+                    prev,
+                    voiced
+                );
+            }
+            prev = voiced;
+        }
+
+        // 2) Generated melodies across core musical vibes avoid big leaps and land on chord tones on downbeats
+        for &vibe in &[
+            Vibe::ElectroFunk,
+            Vibe::DeepHouse,
+            Vibe::Synthwave,
+            Vibe::LofiChill,
+            Vibe::Arena80s,
+        ] {
+            let prog_idx = vibe.default_progression() % PROGRESSIONS.len();
+            let prog = &PROGRESSIONS[prog_idx];
+            let (_, _, arp, _, _) = generate_melodic_tracks(vibe, 0, prog_idx, 20261124);
+            let mut prev_n: Option<u8> = None;
+            for bar in 0..4 {
+                let slot = prog.slots[bar];
+                let ivs = slot.chord.intervals();
+                let chord_pcs: Vec<u8> = ivs.iter().map(|&iv| (slot.offset + iv) % 12).collect();
+                for st in 0..16 {
+                    let s = &arp.steps[bar * 16 + st];
+                    if !s.active {
+                        continue;
+                    }
+                    if st % 4 == 0 {
+                        assert!(
+                            chord_pcs.contains(&(s.note % 12)),
+                            "[{:?}] bar {bar} step {st} note {} (pc {}) missed chord tones {:?}",
+                            vibe,
+                            s.note,
+                            s.note % 12,
+                            chord_pcs
+                        );
+                    }
+                    if let Some(p) = prev_n {
+                        let leap = (s.note as i16 - p as i16).abs();
+                        assert!(
+                            leap <= 9,
+                            "[{:?}] bar {bar} step {st} jumped {leap}st ({p} -> {})",
+                            vibe,
+                            s.note
+                        );
+                    }
+                    prev_n = Some(s.note);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn philharmonia_orchestra_instrument_banks_and_percussion_kit_work() {
+        use crate::dsp::{philharmonia_bank_loaded_count, MultiSampleSynth, NUM_PHILHARMONIA_BANKS};
+        use crate::model::{apply_philharmonia_instrument, generate_philharmonia_track_seq, ExtraTrack, SynthEngine};
+
+        let banks = SynthEngine::PhilharmoniaD50.bank_names();
+        assert_eq!(banks.len(), NUM_PHILHARMONIA_BANKS);
+        assert_eq!(banks[6], "Solo Violin");
+        assert_eq!(banks[25], "Philharmonia Percussion Kit");
+
+        let sr = 44_100.0_f32;
+        let mut ms = MultiSampleSynth::new(sr);
+        let disk_expected = std::path::Path::new("philharmonia-all-samples").is_dir();
+
+        // Check representative solo, pizzicato, wind, brass, and percussion kit banks
+        for &(bank_id, test_notes) in &[
+            (6u8, &[64u8, 69, 76][..]),
+            (8, &[48, 55, 60]),
+            (9, &[36, 43]),
+            (10, &[55, 62, 69]),
+            (11, &[55, 62]),
+            (13, &[60, 67]),
+            (17, &[72, 79]),
+            (19, &[60, 67]),
+            (24, &[57, 64]),
+            (25, &[48, 49, 55, 62]),
+        ] {
+            let (loaded, zone_cnt) = philharmonia_bank_loaded_count(bank_id);
+            assert!(zone_cnt >= 1, "Bank {bank_id} returned 0 zones");
+            if disk_expected {
+                assert!(loaded, "Expected real disk Philharmonia recordings for bank {bank_id}");
+                if bank_id == 25 {
+                    assert!(zone_cnt >= 16, "Expected >=16 perc kit zones, got {zone_cnt}");
+                }
+            }
+            ms.all_notes_off();
+            for &n in test_notes {
+                ms.note_on(n, 0.90, false, true, bank_id);
+            }
+            let mut sq = 0.0_f64;
+            for _ in 0..4096 {
+                let (l, r) = ms.process_stereo(bank_id, 0.0, 14_000.0, 0.1, 0.05, 0.01, 0.8, 0.8, 0.4, true, 0.0, 0.0);
+                assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.8 && r.abs() <= 1.8);
+                sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+            }
+            let rms = (sq / 8192.0).sqrt() as f32;
+            assert!(rms > 0.005, "Philharmonia bank {bank_id} too quiet: rms={rms}");
+
+            let mut tr = ExtraTrack::default();
+            apply_philharmonia_instrument(&mut tr, bank_id);
+            assert_eq!(tr.synth.engine, SynthEngine::PhilharmoniaD50);
+            assert_eq!(tr.synth.engine_bank, bank_id);
+            let seq = generate_philharmonia_track_seq(0, 0, bank_id, 42);
+            assert!(seq.steps.iter().any(|s| s.active), "Empty starter seq for bank {bank_id}");
+        }
+    }
+
+    #[test]
+    fn sampler_filter_passthrough_bypasses_svf_cleanly() {
+        use crate::model::{SamplePart, SamplerMode, SamplerParams};
+
+        let sr = 44_100.0_f32;
+        let len = 8192_usize;
+        let tone_10k: Vec<f32> = (0..len)
+            .map(|i| ((i as f32 * 10_000.0 / sr) * std::f32::consts::TAU).sin() * 0.75)
+            .collect();
+        let buf = Arc::new(tone_10k);
+
+        let measure = |sp: &SamplerParams| -> f32 {
+            let mut samp = Sk1Sampler::new(sr);
+            let _ = samp.swap_stereo_buffer(Arc::clone(&buf), Arc::clone(&buf), sr as u32);
+            samp.note_on(60, 0.95, sp);
+            let mut sq = 0.0_f64;
+            for i in 0..4096 {
+                let (l, r) = samp.process_stereo(sp);
+                assert!(l.is_finite() && r.is_finite());
+                if i >= 512 {
+                    sq += (l as f64) * (l as f64) + (r as f64) * (r as f64);
+                }
+            }
+            (sq / (3584.0 * 2.0)).sqrt() as f32
+        };
+
+        let mut sp = SamplerParams::default();
+        sp.mode = SamplerMode::HiFi;
+        sp.bit_crush = 0.0;
+        sp.filter_enabled = true;
+        sp.cutoff = 300.0;
+        sp.resonance = 0.0;
+        let rms_filtered = measure(&sp);
+        assert!(rms_filtered < 0.05, "Expected 300Hz LP to heavily attenuate 10kHz, got {rms_filtered}");
+
+        // Even with cutoff=300 and HighPass mode set, filter_enabled=false must bypass transparently
+        sp.filter_mode = GlobalFilterMode::HighPass;
+        sp.filter_enabled = false;
+        let rms_thru_mode = measure(&sp);
+        assert!(
+            rms_thru_mode > rms_filtered * 4.0 && rms_thru_mode > 0.15,
+            "Expected filter_enabled=false passthrough for 10kHz: filtered={rms_filtered}, thru={rms_thru_mode}"
+        );
+
+        sp.set_filter_passthrough();
+        assert!(!sp.filter_enabled && sp.cutoff >= 17_999.0 && sp.resonance == 0.0);
+        let mut part = SamplePart::default();
+        assert!(part.filter_enabled);
+        part.set_filter_passthrough();
+        assert!(!part.filter_enabled && !part.to_sampler_params().filter_enabled);
+
+        // Legacy JSON missing filter_enabled keeps backwards-compatible default true
+        let legacy: SamplerParams = serde_json::from_str(r#"{"cutoff":4200.0}"#).expect("legacy json");
+        assert!(legacy.filter_enabled);
+    }
+
+    #[test]
+    fn volca_lane_polymeter_shift_and_euclidean_work() {
+        use crate::model::DrumLane;
+
+        let mut lane = DrumLane::default();
+        assert_eq!(lane.effective_len(), 16);
+        lane.active_steps = 12;
+        assert_eq!(lane.effective_len(), 12);
+
+        lane.fill_euclidean(5, 0);
+        let hits: Vec<usize> = (0..12).filter(|&i| lane.steps[i].active).collect();
+        assert_eq!(hits.len(), 5);
+        assert!(lane.steps[12..16].iter().all(|s| !s.active));
+
+        lane.shift(1);
+        let shifted_hits: Vec<usize> = (0..12).filter(|&i| lane.steps[i].active).collect();
+        let expected: Vec<usize> = hits.iter().map(|&h| (h + 1) % 12).collect();
+        for h in &shifted_hits {
+            assert!(expected.contains(h));
+        }
+
+        lane.steps[0].reverse = true;
+        lane.steps[0].pitch_offset = 5;
+        lane.steps[0].cutoff_lock = Some(0.5);
+        assert!(lane.steps[0].has_step_fx());
+        lane.clear_motion();
+        assert!(!lane.steps[0].has_step_fx());
+    }
+
+    #[test]
+    fn volca_philharmonia_kit_loads_clean_passthrough_pads() {
+        use crate::dsp::sampler::{load_volca_kit, VOLCA_KIT_NAMES};
+        use crate::model::SamplePart;
+
+        let mut parts = SamplePart::default_bank();
+        for (kit_id, _) in VOLCA_KIT_NAMES.iter().enumerate() {
+            let prev_gens: Vec<u64> = parts.iter().map(|p| p.generation).collect();
+            let msg = load_volca_kit(&mut parts, kit_id, 44_100);
+            assert!(!msg.is_empty());
+            for (i, part) in parts.iter().enumerate() {
+                assert!(!part.name.is_empty());
+                assert!(!part.filter_enabled, "Kit {kit_id} pad {i} should be passthrough");
+                assert_ne!(part.generation, prev_gens[i], "Kit {kit_id} pad {i} must bump generation");
+            }
+        }
+    }
+
+    #[test]
+    fn volca_active_parts_mask_tracks_triggered_pads() {
+        use crate::model::SamplePart;
+
+        let sr = 44_100.0_f32;
+        let parts = SamplePart::default_bank();
+        let mut bank = VolcaSamplerBank::new(sr);
+        bank.sync_parts(&parts);
+        assert_eq!(bank.active_parts_mask(), 0);
+
+        bank.trigger_part(2, 0.9, &parts);
+        assert_ne!(bank.active_parts_mask() & (1 << 2), 0);
+        let (l, r, _, _) = bank.process_stereo(&parts, 1.0, 1.0);
+        assert!(l.is_finite() && r.is_finite());
+
+        bank.all_notes_off();
+        for _ in 0..((sr * 1.2) as usize) {
+            let (sl, sr_v, _, _) = bank.process_stereo(&parts, 1.0, 1.0);
+            assert!(sl.is_finite() && sr_v.is_finite());
+        }
+        assert_eq!(bank.active_parts_mask() & (1 << 2), 0);
+    }
+
+    #[test]
+    fn auto_arrange_capture_dj_song_and_extra_mask_work() {
+        use crate::model::{
+            auto_arrange_project_song, capture_party_song_to_project, ExtraTrack,
+        };
+
+        let mut p = Project::default();
+        p.extra_tracks.push(ExtraTrack::default());
+        let seq = MelodicTrackSeq::with_default_note(64, crate::model::StepCount::Steps16);
+        for pat in &mut p.patterns {
+            pat.extra_seqs.push(seq.clone());
+        }
+
+        // 1. Auto-Arrange Loop -> Song
+        auto_arrange_project_song(&mut p, 0xCAFE_BABE);
+        assert!(p.song_mode);
+        assert!(!p.party_mode);
+        assert_eq!(p.song_sections.len(), 7);
+        assert_eq!(p.song_sections[0].extra_mask, 0);
+        assert_eq!(p.song_sections[1].extra_mask, 0x03FF);
+
+        // Render Intro (extra masked out) then Groove (extra enabled)
+        let mut rt = Runtime::new(44_100.0);
+        let mut tel = EngineTelemetry::default();
+        let mut peak = 0.0_f32;
+        for _ in 0..22_050 {
+            let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+            assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.0 && r.abs() <= 1.0);
+            peak = peak.max(l.abs()).max(r.abs());
+        }
+        assert!(peak > 0.05, "Auto-arranged song rendered silent");
+        assert_eq!(tel.active_song_section, Some(0));
+
+        // 2. Capture active Party DJ song into Studio & Song Arranger
+        p.party_mode = true;
+        p.song_mode = false;
+        let mut dj_rt = Runtime::new(44_100.0);
+        let mut dj_tel = EngineTelemetry::default();
+        for _ in 0..8_192 {
+            let _ = dj_rt.process_sample(&p, true, false, false, 0, &mut dj_tel);
+        }
+        let mut captured = p.clone();
+        let title = capture_party_song_to_project(&mut captured, &dj_tel);
+        assert!(!title.is_empty());
+        assert!(!captured.party_mode && captured.song_mode && !captured.auto_beat_mode);
+        assert!(!captured.song_sections.is_empty());
+        assert!(captured.patterns[1].drums.lanes[0].steps.iter().any(|s| s.active));
+    }
+
+    #[test]
+    fn dj_crates_tempo_bridge_and_up_next_queue_work() {
+        use crate::model::{party_crate_vibes, pick_party_vibe_crate, PartyMixMode};
+
+        let club_pool = party_crate_vibes(PartyMixMode::ClubCrate, Vibe::DeepHouse, 0x00FF_FFFF);
+        assert!(club_pool.contains(&Vibe::DetroitTechno));
+
+        let mut prev = Vibe::DeepHouse;
+        for cycle in 1..=12 {
+            let v = pick_party_vibe_crate(
+                Vibe::DeepHouse,
+                PartyMixMode::AllVibes,
+                0x00FF_FFFF,
+                cycle,
+                0x1357_9BDF,
+            );
+            assert_ne!(v, prev, "Must never repeat back-to-back on cycle {cycle}");
+            let b1 = prev.default_bpm();
+            let b2 = v.default_bpm();
+            let bridged = (b2 - b1).abs() <= 28.0
+                || (b2 - b1 * 0.5).abs() <= 16.0
+                || (b2 - b1 * 2.0).abs() <= 16.0;
+            assert!(bridged, "Tempo jump {prev:?} ({b1}) -> {v:?} ({b2}) exceeded bridge");
+            prev = v;
+        }
+
+        // Custom crate bitmask (only Synthwave + Eurobeat)
+        let mask = (1u32 << (Vibe::Synthwave as usize)) | (1u32 << (Vibe::Eurobeat as usize));
+        let custom = party_crate_vibes(PartyMixMode::CustomCrate, Vibe::DeepHouse, mask);
+        assert_eq!(custom, vec![Vibe::Synthwave, Vibe::Eurobeat]);
+
+        // Up-Next queue forces next song vibe & populates telemetry
+        let mut p = Project::default();
+        p.party_mode = true;
+        let mut rt = Runtime::new(44_100.0);
+        let mut tel = EngineTelemetry::default();
+        rt.handle_live_event(LiveEvent::QueueNextPartyVibe(Some(Vibe::Eurobeat)), &p);
+        let _ = rt.process_sample(&p, true, false, false, 0, &mut tel);
+        assert_eq!(tel.party_queued_vibe, Some(Vibe::Eurobeat));
+        assert_eq!(tel.party_next_vibe, Vibe::Eurobeat.name());
+        assert!((tel.party_next_bpm - Vibe::Eurobeat.default_bpm()).abs() < 0.1);
+
+        rt.handle_live_event(LiveEvent::NextPartySong, &p);
+        for _ in 0..8_192 {
+            let _ = rt.process_sample(&p, true, false, false, 0, &mut tel);
+        }
+        assert_eq!(tel.party_vibe, Vibe::Eurobeat);
+    }
+
+    #[test]
+    fn all_156_studio_presets_and_user_patch_round_trip_work() {
+        use crate::model::voice_preset_names;
+        use crate::settings::{UserPatch, UserPatchData};
+
+        let mut total = 0usize;
+        for &track in &TrackId::STUDIO_TRACKS {
+            let names = voice_preset_names(track);
+            total += names.len();
+            for (pi, &pname) in names.iter().enumerate() {
+                let mut p = Project::default();
+                apply_voice_preset(&mut p, track, pi);
+                let mut rt = Runtime::new(44_100.0);
+                let mut tel = EngineTelemetry::default();
+                for _ in 0..4096 {
+                    let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+                    assert!(
+                        l.is_finite() && r.is_finite() && l.abs() <= 1.0 && r.abs() <= 1.0,
+                        "Preset {track:?}[{pi}] '{pname}' clipped/NaN"
+                    );
+                }
+            }
+        }
+        assert_eq!(total, 156, "Expected 156 Studio presets across 6 tracks");
+
+        let p = Project::default();
+        let patch = UserPatch {
+            name: "Test Patch".into(),
+            track_role: "BASS".into(),
+            data: UserPatchData::Moog(p.moog.clone()),
+        };
+        let json = serde_json::to_string(&patch).expect("serialize user patch");
+        let back: UserPatch = serde_json::from_str(&json).expect("deserialize user patch");
+        assert_eq!(patch, back);
+    }
+
+    #[test]
+    fn wavetable_mipmaps_and_acoustic_linn_drums_render_cleanly() {
+        use crate::dsp::WavetableSynth;
+        use crate::model::{DrumKitParams, DrumModel};
+
+        let sr = 44_100.0_f32;
+        let mut wt = WavetableSynth::new(sr);
+        for bank in 0..6u8 {
+            for &note in &[84u8, 96, 104] {
+                wt.all_notes_off();
+                wt.note_on(note, 0.9, false, false, true, 0.0);
+                let mut energy = 0.0_f32;
+                for _ in 0..2048 {
+                    let (l, r) = wt.process_stereo(
+                        bank, 0.65, 16_000.0, 0.2, 0.15, 0.2, 0.005, 0.2, 0.7, 0.2, 0.004, 0.3,
+                        0.8, 0.2, 0.0, true, 0.0, 0.0,
+                    );
+                    assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.5 && r.abs() <= 1.5);
+                    energy += l * l + r * r;
+                }
+                assert!(energy > 0.01, "Wavetable bank {bank} note {note} silent");
+            }
+        }
+
+        let mut dm = DrumMachine::new(sr);
+        for model in [DrumModel::Acoustic, DrumModel::Linn80s] {
+            let mut kit = DrumKitParams::default();
+            kit.set_all_model(model);
+            for lane in 0..8 {
+                let v = DrumVoiceId::from_index(lane).unwrap();
+                dm.trigger(v, 0.92, true, false, &kit);
+                let mut peak = 0.0_f32;
+                for _ in 0..4096 {
+                    let (l, r) = dm.process_sample(&kit);
+                    assert!(l.is_finite() && r.is_finite() && l.abs() <= 1.5 && r.abs() <= 1.5);
+                    peak = peak.max(l.abs()).max(r.abs());
+                }
+                assert!(peak > 0.04, "Drum model {model:?} voice {v:?} too quiet: {peak}");
+            }
+        }
     }
 }

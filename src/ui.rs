@@ -1,24 +1,32 @@
 use crate::{
-    dsp::sampler::{load_audio_to_mono_f32, BUILTIN_SAMPLE_NAMES},
+    dsp::{
+        philharmonia_bank_status, preload_philharmonia_bank_async,
+        sampler::{load_audio_to_stereo_f32, BUILTIN_SAMPLE_NAMES},
+        PHILHARMONIA_PERC_LABELS,
+    },
     engine::{export_stems, export_wav, AudioEngine, EngineTelemetry, LiveEvent},
     mic::MicRecorder,
     midi::{MidiManager, MidiMsg},
     model::{
-        apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, build_auto_chord_pads,
-        detect_chord_from_notes, generate_auto_beat, generate_extra_track_seq,
-        generate_melodic_tracks, load_pattern, load_project, note_name, root_name, save_pattern,
-        save_project, voice_preset_names, AutoChordPad, ChordType, DelayDivision, DrumModel,
-        DrumVoiceId, EgTarget, ExtraTrack, FilterEnvTrigger, GlobalFilterMode, LfoMode, LfoTarget,
-        LfoWave, LoopMode, MonologueOscWave, MoogWave, Osc2ModMode, PartyMixMode, PartyPace,
-        Project, SamplerMode, SavedSample, Scale, SongSection, StepCount, Tb303Wave,
-        TrackFilterParams, TrackId, Vibe, MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
+        apply_extra_track_preset, apply_philharmonia_instrument, apply_vibe_to_project,
+        apply_voice_preset, auto_arrange_project_song, build_auto_chord_pads,
+        capture_party_song_to_project, detect_chord_from_notes, generate_auto_beat,
+        generate_extra_track_seq, generate_melodic_tracks, generate_philharmonia_track_seq,
+        load_pattern, load_project, note_name, root_name, save_pattern, save_project,
+        voice_preset_category, voice_preset_names, ArpMode, ArpRate, AutoChordPad, ChordType,
+        DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack, FilterEnvTrigger,
+        GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MonologueOscWave, MoogWave,
+        Osc2ModMode, PartyMixMode, PartyPace, Project, SamplerMode, SavedSample, Scale,
+        SongSection, StepCount, SynthEngine, Tb303Wave, TrackFilterParams, TrackId, Vibe,
+        MAX_EXTRA_TRACKS, NOTE_NAMES, PROGRESSIONS,
     },
     settings::{
         restart_app, spawn_install_update, spawn_update_check, AppSettings, StudioTheme,
-        UpdateStatus, CURRENT_VERSION, RELEASES_URL,
+        UpdateStatus, UserPatch, UserPatchData, CURRENT_VERSION, RELEASES_URL,
     },
 };
 use eframe::egui::{self, Color32, Key, RichText, Rounding, Sense, Stroke, Vec2};
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -70,9 +78,11 @@ pub struct FunKeySynthApp {
     step_rec_chord_buf: Vec<u8>,
     step_rec_chord_start_t: f64,
     held_keys: Vec<(Key, HeldNote)>,
+    pending_key_releases: Vec<(Key, f64)>,
     held_midi: Vec<HeldNote>,
     held_mouse: Option<HeldNote>,
     held_chord_key: Option<Key>,
+    pending_chord_release: Option<(Key, f64)>,
     held_mouse_pad: Option<usize>,
     rec_held_notes: Vec<(RecordTarget, u8, usize, f64)>,
     stutter_held: bool,
@@ -96,6 +106,88 @@ pub struct FunKeySynthApp {
     test_repeat_off_t: Option<f64>,
     test_repeat_step: usize,
     test_repeat_active: Option<(TrackId, u8, bool)>, // (track, note, is_chord)
+    phil_cat: usize,
+    user_patches: Vec<UserPatch>,
+    preset_search: String,
+    preset_cat_filter: usize,
+    save_patch_name: String,
+    show_save_patch: bool,
+    show_preset_browser: bool,
+    undo_stack: VecDeque<Project>,
+    redo_stack: Vec<Project>,
+    drag_base_proj: Option<Project>,
+    undo_action_this_frame: bool,
+}
+
+fn key_pressed_no_repeat(i: &egui::InputState, key: Key) -> bool {
+    i.events.iter().any(|ev| {
+        matches!(
+            ev,
+            egui::Event::Key {
+                key: k,
+                pressed: true,
+                repeat: false,
+                ..
+            } if *k == key
+        )
+    })
+}
+
+fn key_any_press_event(i: &egui::InputState, key: Key) -> bool {
+    i.events.iter().any(|ev| {
+        matches!(
+            ev,
+            egui::Event::Key {
+                key: k,
+                pressed: true,
+                ..
+            } if *k == key
+        )
+    })
+}
+
+const PHIL_SECTIONS: [(&str, &[usize]); 6] = [
+    ("Ensembles", &[0, 1, 2, 3, 4, 5]),
+    ("Strings", &[6, 7, 8, 9, 10]),
+    ("Plucked", &[11, 12]),
+    ("Brass", &[13, 14, 15, 16]),
+    ("Woodwinds", &[17, 18, 19, 20, 21, 22, 23, 24]),
+    ("Percussion", &[25]),
+];
+
+fn ui_add_track_menu_contents(
+    ui: &mut egui::Ui,
+    add_extra_preset: &mut Option<usize>,
+    add_phil_bank: &mut Option<u8>,
+) {
+    let bank_names = SynthEngine::PhilharmoniaD50.bank_names();
+    ui.menu_button(
+        RichText::new("🎻 Philharmonia Orchestra")
+            .strong()
+            .color(Color32::from_rgb(245, 206, 112)),
+        |ui| {
+            for &(sec_name, ids) in &PHIL_SECTIONS {
+                ui.menu_button(sec_name, |ui| {
+                    for &bi in ids {
+                        let lbl = bank_names.get(bi).copied().unwrap_or("Instrument");
+                        if ui.button(lbl).clicked() {
+                            *add_phil_bank = Some(bi as u8);
+                            ui.close_menu();
+                        }
+                    }
+                });
+            }
+        },
+    );
+    ui.separator();
+    ui.label(RichText::new("SYNTH LAYERS").strong().size(11.0).weak());
+    let presets = voice_preset_names(TrackId::MoogPad);
+    for (pi, &pname) in presets.iter().enumerate() {
+        if ui.button(format!("+ {pname}")).clicked() {
+            *add_extra_preset = Some(pi);
+            ui.close_menu();
+        }
+    }
 }
 
 impl FunKeySynthApp {
@@ -109,7 +201,8 @@ impl FunKeySynthApp {
         let icon_img = egui::ColorImage::from_rgba_unmultiplied([64, 64], include_bytes!("icon_64.rgba"));
         let app_icon = cc.egui_ctx.load_texture("app_icon", icon_img, egui::TextureOptions::LINEAR);
         let engine = AudioEngine::start(Project::default());
-        Self::with_engine(engine, settings, update_status, app_icon)
+        let user_patches = AppSettings::load_user_patches();
+        Self::with_engine(engine, settings, update_status, app_icon, user_patches)
     }
 
     #[cfg(test)]
@@ -120,7 +213,7 @@ impl FunKeySynthApp {
         let icon_img = egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0, 0, 0, 0]);
         let app_icon = ctx.load_texture("app_icon_test", icon_img, egui::TextureOptions::LINEAR);
         let engine = AudioEngine::start_silent(Project::default());
-        Self::with_engine(engine, settings, update_status, app_icon)
+        Self::with_engine(engine, settings, update_status, app_icon, Vec::new())
     }
 
     fn with_engine(
@@ -128,6 +221,7 @@ impl FunKeySynthApp {
         settings: AppSettings,
         update_status: Arc<Mutex<UpdateStatus>>,
         app_icon: egui::TextureHandle,
+        user_patches: Vec<UserPatch>,
     ) -> Self {
         Self {
             engine,
@@ -149,9 +243,11 @@ impl FunKeySynthApp {
             step_rec_chord_buf: Vec::new(),
             step_rec_chord_start_t: 0.0,
             held_keys: Vec::new(),
+            pending_key_releases: Vec::new(),
             held_midi: Vec::new(),
             held_mouse: None,
             held_chord_key: None,
+            pending_chord_release: None,
             held_mouse_pad: None,
             rec_held_notes: Vec::new(),
             stutter_held: false,
@@ -173,6 +269,65 @@ impl FunKeySynthApp {
             test_repeat_off_t: None,
             test_repeat_step: 0,
             test_repeat_active: None,
+            phil_cat: 0,
+            user_patches,
+            preset_search: String::new(),
+            preset_cat_filter: 0,
+            save_patch_name: String::new(),
+            show_save_patch: false,
+            show_preset_browser: false,
+            undo_stack: VecDeque::with_capacity(32),
+            redo_stack: Vec::with_capacity(32),
+            drag_base_proj: None,
+            undo_action_this_frame: false,
+        }
+    }
+
+    fn perform_undo(&mut self, ctx: &egui::Context, proj: &mut Project) -> bool {
+        if let Some(mut prev) = self.undo_stack.pop_back() {
+            self.redo_stack.push(proj.clone());
+            if self.redo_stack.len() > 32 {
+                self.redo_stack.remove(0);
+            }
+            prev.sample_generation = proj.sample_generation.wrapping_add(1);
+            for (i, sp) in prev.sample_parts.iter_mut().enumerate() {
+                sp.generation = proj
+                    .sample_parts
+                    .get(i)
+                    .map(|old| old.generation.wrapping_add(1))
+                    .unwrap_or(1);
+            }
+            *proj = prev;
+            self.drag_base_proj = None;
+            self.undo_action_this_frame = true;
+            self.set_toast(ctx, "Undo");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn perform_redo(&mut self, ctx: &egui::Context, proj: &mut Project) -> bool {
+        if let Some(mut next) = self.redo_stack.pop() {
+            if self.undo_stack.len() >= 32 {
+                self.undo_stack.pop_front();
+            }
+            self.undo_stack.push_back(proj.clone());
+            next.sample_generation = proj.sample_generation.wrapping_add(1);
+            for (i, sp) in next.sample_parts.iter_mut().enumerate() {
+                sp.generation = proj
+                    .sample_parts
+                    .get(i)
+                    .map(|old| old.generation.wrapping_add(1))
+                    .unwrap_or(1);
+            }
+            *proj = next;
+            self.drag_base_proj = None;
+            self.undo_action_this_frame = true;
+            self.set_toast(ctx, "Redo");
+            true
+        } else {
+            false
         }
     }
 
@@ -675,9 +830,8 @@ impl FunKeySynthApp {
         }
 
         self.maybe_clear_for_replace(p, target);
-        let len = self.target_step_count(p, target).as_usize();
-
         if let HeldNote::SamplerPitched(part, _) = held_kind {
+            let len = p.current_pattern().sample_lanes[part].effective_len();
             let pitch_offset = (note as i32 - 60).clamp(-24, 24) as i8;
             if playing {
                 let phase = self.engine.step_phase();
@@ -708,6 +862,7 @@ impl FunKeySynthApp {
             }
             return held_kind;
         }
+        let len = self.target_step_count(p, target).as_usize();
 
         if playing {
             let phase = self.engine.step_phase();
@@ -907,7 +1062,7 @@ impl FunKeySynthApp {
             self.maybe_clear_for_replace(p, target);
             let now = ctx.input(|i| i.time);
             let shift_acc = ctx.input(|i| i.modifiers.shift);
-            let len = self.target_step_count(p, target).as_usize();
+            let len = p.current_pattern().sample_lanes[part].effective_len();
             if playing {
                 let phase = self.engine.step_phase();
                 let q_global = if phase >= 0.65 { cur_step + 1 } else { cur_step };
@@ -1149,31 +1304,31 @@ impl FunKeySynthApp {
             return;
         }
 
-        // Spacebar: Play / Stop
-        if ctx.input(|i| i.key_pressed(Key::Space)) {
+        // Spacebar: Play / Stop (ignore OS key auto-repeat)
+        if ctx.input(|i| key_pressed_no_repeat(i, Key::Space)) {
             self.engine.playing.store(!playing, Ordering::Relaxed);
         }
 
-        // Octave shift: Z / [ down, X / ] up
-        if ctx.input(|i| i.key_pressed(Key::Z) || i.key_pressed(Key::OpenBracket)) {
+        // Octave shift: Z / [ down, X / ] up (ignore OS key auto-repeat)
+        if ctx.input(|i| key_pressed_no_repeat(i, Key::Z) || key_pressed_no_repeat(i, Key::OpenBracket)) {
             self.octave_offset = (self.octave_offset - 1).clamp(-2, 2);
         }
-        if ctx.input(|i| i.key_pressed(Key::X) || i.key_pressed(Key::CloseBracket)) {
+        if ctx.input(|i| key_pressed_no_repeat(i, Key::X) || key_pressed_no_repeat(i, Key::CloseBracket)) {
             self.octave_offset = (self.octave_offset + 1).clamp(-2, 2);
         }
 
         // Monologue Step Record navigation & Rest/Tie keys when armed & stopped
         if self.armed_record.is_some() && !playing {
-            if ctx.input(|i| i.key_pressed(Key::Tab) || i.key_pressed(Key::Period)) {
+            if ctx.input(|i| key_pressed_no_repeat(i, Key::Tab) || key_pressed_no_repeat(i, Key::Period)) {
                 self.step_rec_rest(p);
             }
-            if ctx.input(|i| i.key_pressed(Key::Minus)) {
+            if ctx.input(|i| key_pressed_no_repeat(i, Key::Minus)) {
                 self.step_rec_tie(p);
             }
-            if ctx.input(|i| i.key_pressed(Key::Backspace) || i.key_pressed(Key::ArrowLeft)) {
+            if ctx.input(|i| key_pressed_no_repeat(i, Key::Backspace) || key_pressed_no_repeat(i, Key::ArrowLeft)) {
                 self.step_rec_back(p);
             }
-            if ctx.input(|i| i.key_pressed(Key::ArrowRight)) {
+            if ctx.input(|i| key_pressed_no_repeat(i, Key::ArrowRight)) {
                 self.step_rec_forward(p);
             }
         }
@@ -1188,52 +1343,128 @@ impl FunKeySynthApp {
             Key::J,
             Key::K,
         ];
+        // X11 sends synthetic KeyRelease + KeyPress pairs (~0..20ms apart) on key repeat.
+        // Debounce key releases briefly and cancel immediately if the key is still down or re-pressed.
+        const RELEASE_DEBOUNCE_SECS: f64 = 0.035;
+        let now = ctx.input(|i| i.time);
 
-        // Release any keys that were released this frame using their stored HeldNote
+        for idx in 0..self.held_keys.len() {
+            let key = self.held_keys[idx].0;
+            let (released, down, any_press) =
+                ctx.input(|i| (i.key_released(key), i.key_down(key), key_any_press_event(i, key)));
+            if down || any_press {
+                self.pending_key_releases.retain(|(k, _)| *k != key);
+            } else if released && !self.pending_key_releases.iter().any(|(k, _)| *k == key) {
+                self.pending_key_releases.push((key, now));
+            }
+        }
         let mut released_indices = Vec::new();
         for (idx, &(key, _)) in self.held_keys.iter().enumerate() {
-            if ctx.input(|i| i.key_released(key)) {
-                released_indices.push(idx);
+            if let Some(&(_, t0)) = self.pending_key_releases.iter().find(|&&(k, _)| k == key) {
+                if now - t0 >= RELEASE_DEBOUNCE_SECS {
+                    released_indices.push(idx);
+                }
             }
         }
         for idx in released_indices.into_iter().rev() {
-            let (_, held) = self.held_keys.remove(idx);
+            let (key, held) = self.held_keys.remove(idx);
+            self.pending_key_releases.retain(|(k, _)| *k != key);
             self.release_held_note(ctx, p, held, playing);
         }
+        self.pending_key_releases
+            .retain(|(k, _)| self.held_keys.iter().any(|(hk, _)| hk == k));
+        if !self.pending_key_releases.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
         if let Some(ck) = self.held_chord_key {
-            if ctx.input(|i| i.key_released(ck)) {
-                self.held_chord_key = None;
-                self.release_held_note(ctx, p, HeldNote::AutoChord, playing);
+            let (released, down, any_press) =
+                ctx.input(|i| (i.key_released(ck), i.key_down(ck), key_any_press_event(i, ck)));
+            if down || any_press {
+                self.pending_chord_release = None;
+            } else if released && self.pending_chord_release.is_none() {
+                self.pending_chord_release = Some((ck, now));
             }
+            if let Some((pck, t0)) = self.pending_chord_release {
+                if pck == ck && now - t0 >= RELEASE_DEBOUNCE_SECS && !down && !any_press {
+                    self.pending_chord_release = None;
+                    self.held_chord_key = None;
+                    self.release_held_note(ctx, p, HeldNote::AutoChord, playing);
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
+            }
+        } else {
+            self.pending_chord_release = None;
         }
 
         let target = self.effective_play_target(p);
-        if self.keyboard_mode == KeyboardMode::Chords {
+        if target == RecordTarget::Core(TrackId::Sampler) {
+            const NUM_KEYS: [Key; 8] = [
+                Key::Num1,
+                Key::Num2,
+                Key::Num3,
+                Key::Num4,
+                Key::Num5,
+                Key::Num6,
+                Key::Num7,
+                Key::Num8,
+            ];
+            for (idx, &key) in NUM_KEYS.iter().enumerate() {
+                if ctx.input(|i| key_pressed_no_repeat(i, key))
+                    && !self.held_keys.iter().any(|&(k, _)| k == key)
+                {
+                    let held = self.trigger_sampler_pad_down(ctx, p, idx, 0.90, playing, cur_step);
+                    self.held_keys.push((key, held));
+                }
+            }
+            if self.volca_ui.play_mode == crate::volca_ui::VolcaPlayMode::Pads8 {
+                for (idx, &key) in PAD_KEYS.iter().enumerate() {
+                    if ctx.input(|i| key_pressed_no_repeat(i, key))
+                        && !self.held_keys.iter().any(|&(k, _)| k == key)
+                    {
+                        let held =
+                            self.trigger_sampler_pad_down(ctx, p, idx, 0.90, playing, cur_step);
+                        self.held_keys.push((key, held));
+                    }
+                }
+            } else {
+                let base = self.chromatic_base_midi();
+                for &(key, semi, _) in &CHROMATIC_KEY_MAP {
+                    if ctx.input(|i| key_pressed_no_repeat(i, key))
+                        && !self.held_keys.iter().any(|&(k, _)| k == key)
+                    {
+                        let note = (base as i16 + semi as i16).clamp(12, 108) as u8;
+                        let held = self.play_and_record_note_down(
+                            ctx, p, target, note, 0.88, playing, cur_step,
+                        );
+                        self.held_keys.push((key, held));
+                    }
+                }
+            }
+        } else if self.keyboard_mode == KeyboardMode::Chords {
             for (idx, &key) in PAD_KEYS.iter().enumerate() {
-                if ctx.input(|i| i.key_pressed(key)) {
-                    self.trigger_chord_pad_down(ctx, idx, p, pads, playing, cur_step);
-                    self.held_chord_key = Some(key);
+                if ctx.input(|i| key_pressed_no_repeat(i, key)) {
+                    if self.held_chord_key == Some(key) {
+                        // Cancel synthetic X11 repeat release without re-triggering chord or resetting arp.
+                        self.pending_chord_release = None;
+                    } else {
+                        self.pending_chord_release = None;
+                        self.trigger_chord_pad_down(ctx, idx, p, pads, playing, cur_step);
+                        self.held_chord_key = Some(key);
+                    }
                 }
             }
         } else if target == RecordTarget::Core(TrackId::Drums) {
             for (idx, &key) in PAD_KEYS.iter().enumerate() {
-                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
+                if ctx.input(|i| key_pressed_no_repeat(i, key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
                     let held = self.trigger_drum_pad_down(ctx, p, idx, 0.90, playing, cur_step);
-                    self.held_keys.push((key, held));
-                }
-            }
-        } else if self.keyboard_mode == KeyboardMode::Scale
-            && target == RecordTarget::Core(TrackId::Sampler)
-        {
-            for (idx, &key) in PAD_KEYS.iter().enumerate() {
-                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
-                    let held = self.trigger_sampler_pad_down(ctx, p, idx, 0.90, playing, cur_step);
                     self.held_keys.push((key, held));
                 }
             }
         } else if self.keyboard_mode == KeyboardMode::Scale {
             for (idx, &key) in PAD_KEYS.iter().enumerate() {
-                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
+                if ctx.input(|i| key_pressed_no_repeat(i, key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
                     let note = self.scale_lead_note(p, idx);
                     let held = self.play_and_record_note_down(
                         ctx, p, target, note, 0.88, playing, cur_step,
@@ -1245,7 +1476,7 @@ impl FunKeySynthApp {
             // Monologue-style Chromatic 1.5-octave QWERTY Piano (A W S E D F T G Y H U J K O L P ; ')
             let base = self.chromatic_base_midi();
             for &(key, semi, _) in &CHROMATIC_KEY_MAP {
-                if ctx.input(|i| i.key_pressed(key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
+                if ctx.input(|i| key_pressed_no_repeat(i, key)) && !self.held_keys.iter().any(|&(k, _)| k == key) {
                     let note = (base as i16 + semi as i16).clamp(12, 108) as u8;
                     let held = self.play_and_record_note_down(
                         ctx, p, target, note, 0.88, playing, cur_step,
@@ -1394,6 +1625,8 @@ enum TopUtilItem {
     Save,
     Sep,
     Midi,
+    Redo,
+    Undo,
 }
 
 impl FunKeySynthApp {
@@ -1444,7 +1677,7 @@ impl FunKeySynthApp {
     }
 
     fn ui_top_utils(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, proj: &mut Project, rtl: bool) {
-        const ITEMS: [TopUtilItem; 8] = [
+        const ITEMS: [TopUtilItem; 10] = [
             TopUtilItem::Prefs,
             TopUtilItem::Update,
             TopUtilItem::Stems,
@@ -1453,11 +1686,31 @@ impl FunKeySynthApp {
             TopUtilItem::Save,
             TopUtilItem::Sep,
             TopUtilItem::Midi,
+            TopUtilItem::Redo,
+            TopUtilItem::Undo,
         ];
         let count = ITEMS.len();
         for idx in 0..count {
             let item = if rtl { ITEMS[idx] } else { ITEMS[count - 1 - idx] };
             match item {
+                TopUtilItem::Undo => {
+                    if ui
+                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↶"))
+                        .on_hover_text("Undo (Ctrl+Z)")
+                        .clicked()
+                    {
+                        self.perform_undo(ctx, proj);
+                    }
+                }
+                TopUtilItem::Redo => {
+                    if ui
+                        .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("↷"))
+                        .on_hover_text("Redo (Ctrl+Y)")
+                        .clicked()
+                    {
+                        self.perform_redo(ctx, proj);
+                    }
+                }
                 TopUtilItem::Prefs => {
                     if ui
                         .button("Prefs")
@@ -1547,7 +1800,7 @@ impl FunKeySynthApp {
                     {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             let bars = if proj.song_mode {
-                                proj.song_sections.iter().map(|s| s.bars.max(1) as usize).sum::<usize>().clamp(4, 64)
+                                proj.song_sections.iter().map(|s| s.bars.max(1) as usize).sum::<usize>().clamp(4, 128)
                             } else {
                                 16
                             };
@@ -1566,7 +1819,7 @@ impl FunKeySynthApp {
                             .save_file()
                         {
                             let bars = if proj.song_mode {
-                                proj.song_sections.iter().map(|s| s.bars.max(1) as usize).sum::<usize>().clamp(4, 64)
+                                proj.song_sections.iter().map(|s| s.bars.max(1) as usize).sum::<usize>().clamp(4, 128)
                             } else {
                                 16
                             };
@@ -1667,6 +1920,20 @@ impl FunKeySynthApp {
             Ok(g) => g.clone(),
             Err(_) => return,
         };
+        self.undo_action_this_frame = false;
+        if !ctx.wants_keyboard_input() {
+            let do_undo = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Z));
+            let do_redo = ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND, Key::Y)
+                    || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::Z)
+            });
+            if do_undo {
+                self.perform_undo(ctx, &mut proj);
+            } else if do_redo {
+                self.perform_redo(ctx, &mut proj);
+            }
+        }
+        let frame_start_proj = proj.clone();
         let pads = build_auto_chord_pads(proj.root_note, proj.scale);
         let accent = if self.settings.use_vibe_accent {
             vibe_color(proj.vibe)
@@ -1696,7 +1963,7 @@ impl FunKeySynthApp {
             )
             .show(ctx, |ui| {
                 // Row 1: Brand + Primary Navigation Tabs (Left) & MIDI / Save / Load / Export / Prefs (Right)
-                if ui.available_width() >= 1080.0 {
+                if ui.available_width() >= 1240.0 {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         self.ui_top_brand_tabs(ui, accent);
@@ -1913,6 +2180,56 @@ impl FunKeySynthApp {
                 let is_armed_here = self.armed_record == Some(play_target);
                 let rec_col = Color32::from_rgb(228, 54, 70);
                 let tc = Self::target_color(&proj, play_target);
+
+                // Vintage Hardware Arpeggiator Strip (Jupiter-8 / Juno-60 style)
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    toggle_pill(
+                        ui,
+                        if proj.arp.enabled { "ARP ON" } else { "ARP" },
+                        &mut proj.arp.enabled,
+                        Color32::from_rgb(255, 184, 58),
+                        "Classic Jupiter-8 / Juno-60 style arpeggiator: hold keys, MIDI notes, or Auto-Chord pads",
+                    );
+                    toggle_pill(
+                        ui,
+                        "HOLD",
+                        &mut proj.arp.latch,
+                        Color32::from_rgb(92, 214, 178),
+                        "Latch / Hold arpeggiated notes hands-free until you play a new chord or toggle HOLD off",
+                    );
+                    ui.separator();
+                    for &m in &ArpMode::ALL {
+                        ui.selectable_value(&mut proj.arp.mode, m, m.name());
+                    }
+                    ui.separator();
+                    for &r in &ArpRate::ALL {
+                        ui.selectable_value(&mut proj.arp.rate, r, r.name());
+                    }
+                    ui.separator();
+                    for oct in 1_u8..=3 {
+                        ui.selectable_value(&mut proj.arp.octaves, oct, format!("{oct}O"));
+                    }
+                    ui.separator();
+                    let mut gate_pct = (proj.arp.gate * 100.0).round();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut gate_pct)
+                                .range(15.0..=95.0)
+                                .speed(0.5)
+                                .prefix("Gate ")
+                                .suffix("%"),
+                        )
+                        .on_hover_text("Arpeggiator note gate length (15% staccato .. 95% legato)")
+                        .changed()
+                    {
+                        proj.arp.gate = (gate_pct / 100.0).clamp(0.15, 0.95);
+                    }
+                    ui.checkbox(&mut proj.arp.swing, "Swing")
+                        .on_hover_text("Apply global groove swing to 1/16 arpeggiator steps");
+                });
+                ui.add_space(3.0);
 
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
@@ -2630,6 +2947,24 @@ impl FunKeySynthApp {
             }
         }
 
+        if !self.undo_action_this_frame {
+            let pointer_down = ctx.input(|i| i.pointer.any_down());
+            if pointer_down {
+                if self.drag_base_proj.is_none() && proj != frame_start_proj {
+                    self.drag_base_proj = Some(frame_start_proj);
+                }
+            } else {
+                let baseline = self.drag_base_proj.take().unwrap_or(frame_start_proj);
+                if proj != baseline {
+                    if self.undo_stack.len() >= 32 {
+                        self.undo_stack.pop_front();
+                    }
+                    self.undo_stack.push_back(baseline);
+                    self.redo_stack.clear();
+                }
+            }
+        }
+
         // Commit project edits back to audio thread
         if let Ok(mut guard) = self.engine.project.lock() {
             *guard = proj;
@@ -2785,6 +3120,7 @@ impl FunKeySynthApp {
             let active_core = proj.active_tracks.iter().filter(|&&a| a).count();
             let total_tracks = active_core + proj.extra_tracks.len();
             let mut add_extra_preset: Option<usize> = None;
+            let mut add_phil_bank: Option<u8> = None;
             let mut add_core = false;
 
             let show_header_title = |ui: &mut egui::Ui| {
@@ -2806,15 +3142,11 @@ impl FunKeySynthApp {
                                     .size(11.5)
                                     .color(Color32::from_rgb(82, 232, 180)),
                                 |ui| {
-                                    ui.label(RichText::new("NEW SYNTH LAYER").strong().size(11.0).weak());
-                                    ui.separator();
-                                    let presets = voice_preset_names(TrackId::MoogPad);
-                                    for (pi, &pname) in presets.iter().enumerate() {
-                                        if ui.button(format!("+ {pname}")).clicked() {
-                                            add_extra_preset = Some(pi);
-                                            ui.close_menu();
-                                        }
-                                    }
+                                    ui_add_track_menu_contents(
+                                        ui,
+                                        &mut add_extra_preset,
+                                        &mut add_phil_bank,
+                                    );
                                 },
                             );
                         }
@@ -2846,15 +3178,11 @@ impl FunKeySynthApp {
                                 .size(11.5)
                                 .color(Color32::from_rgb(82, 232, 180)),
                             |ui| {
-                                ui.label(RichText::new("NEW SYNTH LAYER").strong().size(11.0).weak());
-                                ui.separator();
-                                let presets = voice_preset_names(TrackId::MoogPad);
-                                for (pi, &pname) in presets.iter().enumerate() {
-                                    if ui.button(format!("+ {pname}")).clicked() {
-                                        add_extra_preset = Some(pi);
-                                        ui.close_menu();
-                                    }
-                                }
+                                ui_add_track_menu_contents(
+                                    ui,
+                                    &mut add_extra_preset,
+                                    &mut add_phil_bank,
+                                );
                             },
                         );
                     }
@@ -2899,6 +3227,41 @@ impl FunKeySynthApp {
                     pat.extra_seqs.push(seq.clone());
                 }
                 self.selected_extra = Some(n);
+            }
+            if let Some(bank_id) = add_phil_bank {
+                preload_philharmonia_bank_async(bank_id);
+                let palette: [[u8; 3]; 6] = [
+                    [245, 206, 112],
+                    [130, 214, 255],
+                    [255, 148, 118],
+                    [204, 162, 255],
+                    [110, 236, 192],
+                    [255, 152, 210],
+                ];
+                let n = proj.extra_tracks.len();
+                let mut tr = ExtraTrack {
+                    pan: if n % 2 == 0 { -0.22 } else { 0.22 },
+                    color: palette[n % palette.len()],
+                    ..ExtraTrack::default()
+                };
+                apply_philharmonia_instrument(&mut tr, bank_id);
+                let name = tr.name.clone();
+                proj.extra_tracks.push(tr);
+                let seed = self.next_seed();
+                let seq = generate_philharmonia_track_seq(
+                    proj.root_note,
+                    proj.progression_idx,
+                    bank_id,
+                    seed,
+                );
+                for pat in &mut proj.patterns {
+                    pat.extra_seqs.push(seq.clone());
+                }
+                self.selected_extra = Some(n);
+                self.set_toast(
+                    ctx,
+                    format!("Added {name} (Philharmonia) — play QWERTY/MIDI or tweak in Sound Lab"),
+                );
             }
             ui.add_space(4.0);
 
@@ -3034,12 +3397,18 @@ impl FunKeySynthApp {
                                         ui.add(egui::Slider::new(&mut proj.sampler.transpose, -24..=24).text("Pitch"));
                                     }
                                     TrackId::Drums => {
-                                        ui.horizontal(|ui| {
-                                            if ui.small_button("808 Kit").clicked() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if ui.small_button("808").clicked() {
                                                 proj.drums.set_all_model(DrumModel::Tr808);
                                             }
-                                            if ui.small_button("909 Kit").clicked() {
+                                            if ui.small_button("909").clicked() {
                                                 proj.drums.set_all_model(DrumModel::Tr909);
+                                            }
+                                            if ui.small_button("Acou").clicked() {
+                                                proj.drums.set_all_model(DrumModel::Acoustic);
+                                            }
+                                            if ui.small_button("Linn").clicked() {
+                                                proj.drums.set_all_model(DrumModel::Linn80s);
                                             }
                                             if ui.small_button("Hybrid").clicked() {
                                                 proj.drums.set_hybrid();
@@ -3881,10 +4250,11 @@ impl FunKeySynthApp {
                             });
                             ui.separator();
                             let vp = &mut proj.drums.voices[lane_idx];
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.label("Model:");
-                                ui.selectable_value(&mut vp.model, DrumModel::Tr808, "TR-808");
-                                ui.selectable_value(&mut vp.model, DrumModel::Tr909, "TR-909");
+                                for &m in &DrumModel::ALL {
+                                    ui.selectable_value(&mut vp.model, m, m.name());
+                                }
                             });
                             ui.add(egui::Slider::new(&mut vp.level, 0.0..=1.25).text("Level"));
                             ui.add(egui::Slider::new(&mut vp.tune, -12.0..=12.0).text("Tune"));
@@ -4749,15 +5119,15 @@ impl FunKeySynthApp {
             .add_filter("Audio (MP3, WAV, FLAC, OGG)", &["mp3", "wav", "flac", "ogg"])
             .pick_file()
         {
-            match load_audio_to_mono_f32(&path, 48_000) {
-                Ok(pcm) => {
+            match load_audio_to_stereo_f32(&path, 48_000) {
+                Ok((pcm_l, pcm_r)) => {
                     let sname = path
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("Custom Sample")
                         .to_string();
-                    let secs = pcm.len() as f32 / 48_000.0;
-                    proj.sample_data = SavedSample::from_f32_pcm(sname.clone(), 48_000, &pcm, None);
+                    let secs = pcm_l.len() as f32 / 48_000.0;
+                    proj.sample_data = SavedSample::from_stereo_pcm(sname.clone(), 48_000, &pcm_l, &pcm_r, None);
                     proj.sampler.start = 0.0;
                     proj.sampler.end = 1.0;
                     proj.sampler.speed = 1.0;
@@ -4811,6 +5181,11 @@ impl FunKeySynthApp {
                 if ui.button("Drop Now").on_hover_text("Fire a key-locked sub bass drop right now").clicked() {
                     self.engine.send_live(LiveEvent::TriggerBassDrop);
                 }
+                if ui.button("⏮ Prev").on_hover_text("Jump back to the previous DJ song").clicked() {
+                    proj.party_mode = true;
+                    self.engine.send_live(LiveEvent::PrevPartySong);
+                    self.engine.playing.store(true, Ordering::Relaxed);
+                }
                 if ui.button("Mix Next Song ⏭").on_hover_text("Generate a brand-new song with fresh voice palette, groove & arrangement and DJ-transition into it right now!").clicked() {
                     proj.party_seed = self.next_seed();
                     proj.party_mode = true;
@@ -4824,6 +5199,25 @@ impl FunKeySynthApp {
                 {
                     proj.party_mode = true;
                     self.engine.send_live(LiveEvent::ReloadPartyRig);
+                }
+                if proj.party_mode {
+                    let cap_btn = egui::Button::new(
+                        RichText::new("Capture Song → Studio")
+                            .strong()
+                            .color(Color32::from_rgb(14, 18, 24)),
+                    )
+                    .fill(Color32::from_rgb(72, 224, 148));
+                    if ui
+                        .add(cap_btn)
+                        .on_hover_text("Save this generated DJ song (synths, drums, FX, patterns & sections) into your editable Studio & Song Arranger!")
+                        .clicked()
+                    {
+                        let title = capture_party_song_to_project(proj, tel);
+                        self.set_toast(
+                            ui.ctx(),
+                            format!("Captured '{title}' to Studio & Song Arranger!"),
+                        );
+                    }
                 }
             });
 
@@ -4841,7 +5235,7 @@ impl FunKeySynthApp {
 
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label("Mix:");
+                ui.label("Crate:");
                 for &mode in &PartyMixMode::ALL {
                     ui.selectable_value(&mut proj.party_mix_mode, mode, mode.name());
                 }
@@ -4854,6 +5248,32 @@ impl FunKeySynthApp {
                 ui.checkbox(&mut proj.party_sound_morph, "Dynamic Sound Morph")
                     .on_hover_text("Swaps synth/drum/sampler voice palettes between songs and dynamically sweeps filters, space FX, and timbres live!");
             });
+
+            if proj.party_mix_mode == PartyMixMode::CustomCrate {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
+                    ui.label(RichText::new("Custom Crate:").size(11.0).weak());
+                    if ui.small_button("All").clicked() {
+                        proj.party_crate_mask = 0x00FF_FFFF;
+                    }
+                    if ui.small_button("None").clicked() {
+                        proj.party_crate_mask = 0;
+                    }
+                    for (vi, &vibe) in Vibe::ALL.iter().enumerate() {
+                        let bit = 1u32 << vi;
+                        let mut on = (proj.party_crate_mask & bit) != 0;
+                        if ui.selectable_label(on, vibe.name()).clicked() {
+                            on = !on;
+                            if on {
+                                proj.party_crate_mask |= bit;
+                            } else {
+                                proj.party_crate_mask &= !bit;
+                            }
+                        }
+                    }
+                });
+            }
 
             if proj.party_mode {
                 let bpm_disp = if tel.party_bpm >= 40.0 {
@@ -4879,6 +5299,44 @@ impl FunKeySynthApp {
                     .strong()
                     .color(accent),
                 );
+                ui.add_space(3.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let next_lbl = if tel.party_next_title.is_empty() {
+                        "Auto-selecting next track...".to_string()
+                    } else {
+                        format!(
+                            "UP NEXT: {}  •  {:.0} BPM",
+                            tel.party_next_title,
+                            tel.party_next_bpm
+                        )
+                    };
+                    ui.label(RichText::new(next_lbl).size(11.5).color(Color32::from_rgb(176, 186, 206)));
+                    let q_lbl = match tel.party_queued_vibe {
+                        Some(v) => format!("Queue: {}", v.name()),
+                        None => "Queue Next: Auto".to_string(),
+                    };
+                    egui::ComboBox::from_id_salt("dj_queue_next_vibe")
+                        .width(142.0)
+                        .selected_text(q_lbl)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(tel.party_queued_vibe.is_none(), "Auto (Crate)")
+                                .clicked()
+                            {
+                                self.engine.send_live(LiveEvent::QueueNextPartyVibe(None));
+                            }
+                            for &v in &Vibe::ALL {
+                                if ui
+                                    .selectable_label(tel.party_queued_vibe == Some(v), v.name())
+                                    .clicked()
+                                {
+                                    self.engine
+                                        .send_live(LiveEvent::QueueNextPartyVibe(Some(v)));
+                                }
+                            }
+                        });
+                });
                 ui.add_space(6.0);
                 egui::Frame::none()
                     .fill(theme.control_bg())
@@ -4987,16 +5445,46 @@ impl FunKeySynthApp {
 
         // 2. VISUAL SONG ARRANGER
         card_frame(ui, theme, |ui| {
+            let total_bars: usize = proj
+                .song_sections
+                .iter()
+                .map(|s| s.bars.max(1) as usize)
+                .sum();
+            let total_secs = ((total_bars as f32) * 4.0 * 60.0 / proj.bpm.clamp(40.0, 240.0)).round() as usize;
+            let mins = total_secs / 60;
+            let secs = total_secs % 60;
+
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("SONG ARRANGER").strong().size(14.0).color(accent));
                 ui.separator();
-                toggle_pill(
+                if toggle_pill(
                     ui,
                     if proj.song_mode { "SONG MODE ON" } else { "SONG MODE OFF" },
                     &mut proj.song_mode,
                     Color32::from_rgb(72, 224, 148),
-                    "Play through the sections below in order (when Party Mode is off)",
-                );
+                    "Play through the sections below in order (automatically pauses Party DJ Mode)",
+                ) && proj.song_mode
+                {
+                    proj.party_mode = false;
+                }
+                let auto_btn = egui::Button::new(
+                    RichText::new("Auto-Arrange Loop → Song")
+                        .strong()
+                        .color(Color32::from_rgb(14, 18, 24)),
+                )
+                .fill(accent);
+                if ui
+                    .add(auto_btn)
+                    .on_hover_text("Build a full 4-pattern, 7-section song (Intro -> Groove -> Build -> Drop -> Break -> Drop 2 -> Outro) from your active loop!")
+                    .clicked()
+                {
+                    let seed = self.next_seed();
+                    auto_arrange_project_song(proj, seed);
+                    self.set_toast(
+                        ui.ctx(),
+                        "Built 7-section Song Arrangement in Patterns P1–P4!",
+                    );
+                }
                 if ui.button("+ Add Section").clicked() {
                     proj.song_sections.push(SongSection {
                         name: format!("Part {}", proj.song_sections.len() + 1),
@@ -5005,55 +5493,200 @@ impl FunKeySynthApp {
                         bass_drop: false,
                         fill: true,
                         track_mask: 0b111111,
+                        extra_mask: 0x03FF,
                     });
                 }
-                if ui.button("Reset Default Arrangement").clicked() {
+                if ui
+                    .button("Clone Pat → Next")
+                    .on_hover_text("Copy the active pattern into the next pattern slot for fast Verse/Chorus variations")
+                    .clicked()
+                {
+                    let n_pats = proj.patterns.len().max(1);
+                    let src = proj.active_pattern.min(n_pats - 1);
+                    let dst = (src + 1) % n_pats;
+                    let cloned = proj.patterns[src].clone();
+                    proj.patterns[dst] = cloned;
+                    proj.active_pattern = dst;
+                    self.set_toast(
+                        ui.ctx(),
+                        format!("Cloned P{} → P{}", src + 1, dst + 1),
+                    );
+                }
+                if ui.button("Reset Default").clicked() {
                     proj.song_sections = crate::model::default_vibe_sections(proj.active_pattern);
                 }
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("Total: {total_bars} bars ({mins}:{secs:02})"))
+                        .size(11.5)
+                        .weak(),
+                );
             });
 
             ui.add_space(8.0);
 
             let mut remove_idx = None;
-            egui::Grid::new("song_arranger_grid")
-                .striped(true)
-                .spacing(Vec2::new(10.0, 6.0))
-                .show(ui, |ui| {
-                    ui.strong("Section");
-                    ui.strong("Bars");
-                    ui.strong("Drums");
-                    ui.strong("Bass");
-                    ui.strong("Chords");
-                    ui.strong("Arp");
-                    ui.strong("303");
-                    ui.strong("Samp");
-                    ui.strong("Drop");
-                    ui.strong("Fill");
-                    ui.strong("");
-                    ui.end_row();
+            let mut move_up_idx = None;
+            let mut move_down_idx = None;
+            let mut dup_idx = None;
+            let n_pats = proj.patterns.len().max(1);
+            let extra_count = proj.extra_tracks.len().min(MAX_EXTRA_TRACKS);
+            let extra_names: Vec<String> = proj
+                .extra_tracks
+                .iter()
+                .take(extra_count)
+                .map(|t| t.name.clone())
+                .collect();
 
-                    for (idx, sec) in proj.song_sections.iter_mut().enumerate() {
-                        ui.add(egui::TextEdit::singleline(&mut sec.name).desired_width(96.0));
-                        ui.add(egui::DragValue::new(&mut sec.bars).range(1..=16));
-                        for bit in 0..6 {
-                            let mut on = (sec.track_mask & (1 << bit)) != 0;
-                            if ui.checkbox(&mut on, "").changed() {
-                                if on {
-                                    sec.track_mask |= 1 << bit;
-                                } else {
-                                    sec.track_mask &= !(1 << bit);
-                                }
+            egui::ScrollArea::horizontal()
+                .id_salt("song_arr_scroll")
+                .show(ui, |ui| {
+                    egui::Grid::new("song_arranger_grid")
+                        .striped(true)
+                        .spacing(Vec2::new(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.strong("Play");
+                            ui.strong("Section");
+                            ui.strong("Pat");
+                            ui.strong("Bars");
+                            ui.strong("Drums");
+                            ui.strong("Bass");
+                            ui.strong("Chords");
+                            ui.strong("Arp");
+                            ui.strong("303");
+                            ui.strong("Samp");
+                            for (ei, ename) in extra_names.iter().enumerate() {
+                                ui.strong(format!("E{}", ei + 1))
+                                    .on_hover_text(ename);
                             }
-                        }
-                        ui.checkbox(&mut sec.bass_drop, "");
-                        ui.checkbox(&mut sec.fill, "");
-                        if ui.small_button("X").clicked() {
-                            remove_idx = Some(idx);
-                        }
-                        ui.end_row();
-                    }
+                            ui.strong("Drop");
+                            ui.strong("Fill");
+                            ui.strong("Order");
+                            ui.end_row();
+
+                            let sec_count = proj.song_sections.len();
+                            for (idx, sec) in proj.song_sections.iter_mut().enumerate() {
+                                let is_active_sec = proj.song_mode
+                                    && !proj.party_mode
+                                    && tel.active_song_section == Some(idx);
+                                let play_lbl = if is_active_sec {
+                                    format!("▶ {}/{}", tel.party_bar, sec.bars.max(1))
+                                } else {
+                                    "▶".to_string()
+                                };
+                                let pbtn = egui::Button::new(
+                                    RichText::new(play_lbl)
+                                        .strong()
+                                        .size(11.0)
+                                        .color(if is_active_sec {
+                                            Color32::from_rgb(12, 14, 20)
+                                        } else {
+                                            Color32::from_rgb(212, 220, 236)
+                                        }),
+                                )
+                                .fill(if is_active_sec {
+                                    accent
+                                } else {
+                                    theme.control_bg()
+                                });
+                                if ui
+                                    .add(pbtn)
+                                    .on_hover_text("Jump to and play this section now")
+                                    .clicked()
+                                {
+                                    proj.party_mode = false;
+                                    proj.song_mode = true;
+                                    self.engine.send_live(LiveEvent::JumpToSongSection {
+                                        section_idx: idx,
+                                    });
+                                    self.engine.playing.store(true, Ordering::Relaxed);
+                                }
+
+                                ui.add(egui::TextEdit::singleline(&mut sec.name).desired_width(88.0));
+
+                                let pat_cur = sec.pattern.min(n_pats - 1);
+                                egui::ComboBox::from_id_salt(("sec_pat", idx))
+                                    .width(50.0)
+                                    .selected_text(format!("P{}", pat_cur + 1))
+                                    .show_ui(ui, |ui| {
+                                        for pi in 0..n_pats {
+                                            ui.selectable_value(
+                                                &mut sec.pattern,
+                                                pi,
+                                                format!("P{}", pi + 1),
+                                            );
+                                        }
+                                    });
+
+                                ui.add(egui::DragValue::new(&mut sec.bars).range(1..=16));
+                                for bit in 0..6 {
+                                    let mut on = (sec.track_mask & (1 << bit)) != 0;
+                                    if ui.checkbox(&mut on, "").changed() {
+                                        if on {
+                                            sec.track_mask |= 1 << bit;
+                                        } else {
+                                            sec.track_mask &= !(1 << bit);
+                                        }
+                                    }
+                                }
+                                for ei in 0..extra_count {
+                                    let mut on = (sec.extra_mask & (1u16 << ei)) != 0;
+                                    if ui
+                                        .checkbox(&mut on, "")
+                                        .on_hover_text(&extra_names[ei])
+                                        .changed()
+                                    {
+                                        if on {
+                                            sec.extra_mask |= 1u16 << ei;
+                                        } else {
+                                            sec.extra_mask &= !(1u16 << ei);
+                                        }
+                                    }
+                                }
+                                ui.checkbox(&mut sec.bass_drop, "");
+                                ui.checkbox(&mut sec.fill, "");
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0;
+                                    if ui.add_enabled(idx > 0, egui::Button::new("▲").small()).clicked() {
+                                        move_up_idx = Some(idx);
+                                    }
+                                    if ui
+                                        .add_enabled(idx + 1 < sec_count, egui::Button::new("▼").small())
+                                        .clicked()
+                                    {
+                                        move_down_idx = Some(idx);
+                                    }
+                                    if ui
+                                        .small_button("Dup")
+                                        .on_hover_text("Duplicate section below")
+                                        .clicked()
+                                    {
+                                        dup_idx = Some(idx);
+                                    }
+                                    if ui
+                                        .add_enabled(sec_count > 1, egui::Button::new("X").small())
+                                        .clicked()
+                                    {
+                                        remove_idx = Some(idx);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
                 });
-            if let Some(i) = remove_idx {
+
+            if let Some(i) = move_up_idx {
+                if i > 0 {
+                    proj.song_sections.swap(i, i - 1);
+                }
+            } else if let Some(i) = move_down_idx {
+                if i + 1 < proj.song_sections.len() {
+                    proj.song_sections.swap(i, i + 1);
+                }
+            } else if let Some(i) = dup_idx {
+                let copy = proj.song_sections[i].clone();
+                proj.song_sections.insert(i + 1, copy);
+            } else if let Some(i) = remove_idx {
                 if proj.song_sections.len() > 1 {
                     proj.song_sections.remove(i);
                 }
@@ -5145,12 +5778,13 @@ impl FunKeySynthApp {
                     });
                     ui.add_space(6.0);
 
-                    // Quick Synth / Voice Preset Bar right inside Sound Lab!
-                    let lab_presets = if active_extra.is_some() {
-                        voice_preset_names(TrackId::MoogPad)
+                    // Sleek Preset Browser Bar + Favorites + User Patch Saving inside Sound Lab!
+                    let preset_track = if active_extra.is_some() {
+                        TrackId::MoogPad
                     } else {
-                        voice_preset_names(self.selected_track)
+                        self.selected_track
                     };
+                    let lab_presets = voice_preset_names(preset_track);
                     if !lab_presets.is_empty() {
                         let cur_p = if let Some(ei) = active_extra {
                             proj.extra_tracks[ei].preset_idx % lab_presets.len()
@@ -5166,50 +5800,293 @@ impl FunKeySynthApp {
                             };
                             raw_idx % lab_presets.len()
                         };
+                        let cur_name = lab_presets[cur_p];
+                        let fav_key = format!("{}:{}", preset_track.role_name(), cur_name);
+                        let is_fav = self.settings.is_favorite(&fav_key);
+
+                        let apply_lab_preset = |app: &FunKeySynthApp, proj: &mut Project, pi: usize| {
+                            if let Some(ei) = active_extra {
+                                apply_extra_track_preset(&mut proj.extra_tracks[ei], pi);
+                                proj.extra_tracks[ei].name = lab_presets[pi].to_string();
+                            } else {
+                                apply_voice_preset(proj, app.selected_track, pi);
+                                if proj.party_mode {
+                                    app.engine.send_live(LiveEvent::SetPartyInstrument {
+                                        track: app.selected_track,
+                                        preset_idx: pi,
+                                    });
+                                }
+                            }
+                        };
+
                         ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
                             ui.label(
-                                RichText::new("PRESETS:")
+                                RichText::new("PRESET:")
                                     .strong()
                                     .size(11.0)
                                     .color(Color32::from_rgb(165, 176, 200)),
                             );
-                            for (pi, &pname) in lab_presets.iter().enumerate() {
-                                let active = cur_p == pi;
-                                let pbtn = egui::Button::new(
-                                    RichText::new(pname)
-                                        .strong()
-                                        .size(11.5)
-                                        .color(if active {
-                                            Color32::from_rgb(12, 14, 20)
-                                        } else {
-                                            Color32::from_rgb(212, 220, 236)
-                                        }),
-                                )
-                                .fill(if active {
-                                    tc
-                                } else {
-                                    Color32::from_rgb(26, 31, 44)
-                                })
-                                .stroke(Stroke::new(
-                                    1.0_f32,
-                                    if active { tc } else { Color32::from_rgb(48, 56, 78) },
-                                ));
-                                if ui.add(pbtn).clicked() {
-                                    if let Some(ei) = active_extra {
-                                        apply_extra_track_preset(&mut proj.extra_tracks[ei], pi);
-                                        proj.extra_tracks[ei].name = pname.to_string();
+                            if ui.small_button("◀").on_hover_text("Previous preset").clicked() {
+                                let prev = if cur_p == 0 { lab_presets.len() - 1 } else { cur_p - 1 };
+                                apply_lab_preset(self, proj, prev);
+                            }
+                            let cur_btn = egui::Button::new(
+                                RichText::new(format!(
+                                    "{} ({}/{})",
+                                    cur_name,
+                                    cur_p + 1,
+                                    lab_presets.len()
+                                ))
+                                .strong()
+                                .size(11.5)
+                                .color(Color32::from_rgb(12, 14, 20)),
+                            )
+                            .fill(tc);
+                            if ui
+                                .add(cur_btn)
+                                .on_hover_text("Click to open searchable preset browser")
+                                .clicked()
+                            {
+                                self.show_preset_browser = !self.show_preset_browser;
+                            }
+                            if ui.small_button("▶").on_hover_text("Next preset").clicked() {
+                                let next = (cur_p + 1) % lab_presets.len();
+                                apply_lab_preset(self, proj, next);
+                            }
+                            let fav_btn = egui::Button::new(
+                                RichText::new(if is_fav { "★" } else { "☆" })
+                                    .strong()
+                                    .size(12.5)
+                                    .color(if is_fav {
+                                        Color32::from_rgb(255, 204, 64)
                                     } else {
-                                        apply_voice_preset(proj, self.selected_track, pi);
-                                        if proj.party_mode {
-                                            self.engine.send_live(LiveEvent::SetPartyInstrument {
-                                                track: self.selected_track,
-                                                preset_idx: pi,
-                                            });
-                                        }
+                                        Color32::from_rgb(180, 190, 210)
+                                    }),
+                            );
+                            if ui.add(fav_btn).on_hover_text("Toggle Favorite preset").clicked() {
+                                self.settings.toggle_favorite(&fav_key);
+                            }
+                            if ui
+                                .selectable_label(
+                                    self.show_preset_browser,
+                                    format!("Browse ({}) ▾", lab_presets.len()),
+                                )
+                                .clicked()
+                            {
+                                self.show_preset_browser = !self.show_preset_browser;
+                            }
+                            if active_extra.is_some() || self.selected_track != TrackId::MidiOut {
+                                if ui
+                                    .selectable_label(self.show_save_patch, "Save Patch")
+                                    .on_hover_text("Save your current tweaked sound as a reusable User Patch")
+                                    .clicked()
+                                {
+                                    self.show_save_patch = !self.show_save_patch;
+                                    if self.show_save_patch && self.save_patch_name.trim().is_empty() {
+                                        self.save_patch_name = format!("My {}", cur_name);
                                     }
                                 }
                             }
                         });
+
+                        if self.show_save_patch {
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("Patch Name:").size(11.0).weak());
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.save_patch_name)
+                                        .desired_width(150.0),
+                                );
+                                if ui.button("Save").clicked() {
+                                    let name = self.save_patch_name.trim().to_string();
+                                    if !name.is_empty() {
+                                        let data = if let Some(ei) = active_extra {
+                                            UserPatchData::Moog(proj.extra_tracks[ei].synth.clone())
+                                        } else {
+                                            match self.selected_track {
+                                                TrackId::Drums => UserPatchData::Drums(proj.drums.clone()),
+                                                TrackId::Moog => UserPatchData::Moog(proj.moog.clone()),
+                                                TrackId::MoogPad => UserPatchData::Moog(proj.moog_pad.clone()),
+                                                TrackId::Monologue => UserPatchData::Monologue(proj.monologue.clone()),
+                                                TrackId::Tb303 => UserPatchData::Tb303(proj.tb303.clone()),
+                                                TrackId::Sampler | TrackId::MidiOut => {
+                                                    UserPatchData::Sampler(proj.sampler.clone())
+                                                }
+                                            }
+                                        };
+                                        let patch = UserPatch {
+                                            name: name.clone(),
+                                            track_role: preset_track.role_name().to_string(),
+                                            data,
+                                        };
+                                        match AppSettings::save_user_patch(&patch) {
+                                            Ok(()) => {
+                                                self.user_patches = AppSettings::load_user_patches();
+                                                self.show_save_patch = false;
+                                                self.show_preset_browser = true;
+                                                self.set_toast(ctx, format!("Saved patch '{name}'!"));
+                                            }
+                                            Err(e) => self.set_toast(ctx, format!("Save patch error: {e}")),
+                                        }
+                                    }
+                                }
+                                if ui.small_button("Cancel").clicked() {
+                                    self.show_save_patch = false;
+                                }
+                            });
+                        }
+
+                        if self.show_preset_browser {
+                            ui.add_space(4.0);
+                            egui::Frame::none()
+                                .fill(theme.control_bg())
+                                .rounding(Rounding::same(6.0))
+                                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                                .stroke(Stroke::new(1.0_f32, theme.border()))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for &(ci, clbl) in &[
+                                            (0usize, "All"),
+                                            (1, "★ Favs"),
+                                            (2, "Analog"),
+                                            (3, "FM & Digital"),
+                                            (4, "Orchestral"),
+                                            (5, "Acoustic"),
+                                            (6, "User"),
+                                        ] {
+                                            ui.selectable_value(&mut self.preset_cat_filter, ci, clbl);
+                                        }
+                                        ui.separator();
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut self.preset_search)
+                                                .hint_text("Search presets...")
+                                                .desired_width(120.0),
+                                        );
+                                    });
+                                    ui.add_space(4.0);
+                                    let q = self.preset_search.trim().to_ascii_lowercase();
+                                    let mut del_user_patch: Option<String> = None;
+                                    let mut loaded_patch_toast: Option<String> = None;
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("sound_lab_preset_scroll")
+                                        .max_height(150.0)
+                                        .show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                                                if self.preset_cat_filter != 6 {
+                                                    for (pi, &pname) in lab_presets.iter().enumerate() {
+                                                        let cat = voice_preset_category(preset_track, pi);
+                                                        let pkey = format!("{}:{}", preset_track.role_name(), pname);
+                                                        let fav = self.settings.is_favorite(&pkey);
+                                                        let cat_ok = match self.preset_cat_filter {
+                                                            0 => true,
+                                                            1 => fav,
+                                                            2 => cat == "Analog" || cat == "Club / 808 / 909" || cat == "Acid" || cat == "Retro / Linn",
+                                                            3 => cat == "FM & Digital",
+                                                            4 => cat == "Orchestral",
+                                                            5 => cat == "Acoustic",
+                                                            _ => true,
+                                                        };
+                                                        if !cat_ok {
+                                                            continue;
+                                                        }
+                                                        if !q.is_empty() && !pname.to_ascii_lowercase().contains(&q) {
+                                                            continue;
+                                                        }
+                                                        let active = cur_p == pi;
+                                                        let lbl = if fav {
+                                                            format!("★ {pname}")
+                                                        } else {
+                                                            pname.to_string()
+                                                        };
+                                                        let pbtn = egui::Button::new(
+                                                            RichText::new(lbl)
+                                                                .strong()
+                                                                .size(11.0)
+                                                                .color(if active {
+                                                                    Color32::from_rgb(12, 14, 20)
+                                                                } else {
+                                                                    Color32::from_rgb(212, 220, 236)
+                                                                }),
+                                                        )
+                                                        .fill(if active { tc } else { Color32::from_rgb(24, 29, 42) })
+                                                        .stroke(Stroke::new(
+                                                            1.0_f32,
+                                                            if active { tc } else { Color32::from_rgb(48, 56, 78) },
+                                                        ));
+                                                        if ui.add(pbtn).on_hover_text(cat).clicked() {
+                                                            apply_lab_preset(self, proj, pi);
+                                                        }
+                                                    }
+                                                }
+                                                if self.preset_cat_filter == 0 || self.preset_cat_filter == 6 {
+                                                    for up in &self.user_patches {
+                                                        let matches_track = if active_extra.is_some() {
+                                                            matches!(up.data, UserPatchData::Moog(_))
+                                                        } else {
+                                                            match (self.selected_track, &up.data) {
+                                                                (TrackId::Drums, UserPatchData::Drums(_)) => true,
+                                                                (TrackId::Moog | TrackId::MoogPad, UserPatchData::Moog(_)) => true,
+                                                                (TrackId::Monologue, UserPatchData::Monologue(_)) => true,
+                                                                (TrackId::Tb303, UserPatchData::Tb303(_)) => true,
+                                                                (TrackId::Sampler, UserPatchData::Sampler(_)) => true,
+                                                                _ => false,
+                                                            }
+                                                        };
+                                                        if !matches_track {
+                                                            continue;
+                                                        }
+                                                        if !q.is_empty() && !up.name.to_ascii_lowercase().contains(&q) {
+                                                            continue;
+                                                        }
+                                                        if ui
+                                                            .button(
+                                                                RichText::new(format!("User: {}", up.name))
+                                                                    .size(11.0)
+                                                                    .color(Color32::from_rgb(120, 230, 175)),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            if let Some(ei) = active_extra {
+                                                                if let UserPatchData::Moog(ref mp) = up.data {
+                                                                    proj.extra_tracks[ei].synth = mp.clone();
+                                                                    proj.extra_tracks[ei].name = up.name.clone();
+                                                                }
+                                                            } else {
+                                                                match (&up.data, self.selected_track) {
+                                                                    (UserPatchData::Drums(dk), TrackId::Drums) => proj.drums = dk.clone(),
+                                                                    (UserPatchData::Moog(mp), TrackId::Moog) => proj.moog = mp.clone(),
+                                                                    (UserPatchData::Moog(mp), TrackId::MoogPad) => proj.moog_pad = mp.clone(),
+                                                                    (UserPatchData::Monologue(mn), TrackId::Monologue) => proj.monologue = mn.clone(),
+                                                                    (UserPatchData::Tb303(tb), TrackId::Tb303) => proj.tb303 = tb.clone(),
+                                                                    (UserPatchData::Sampler(sp), TrackId::Sampler) => proj.sampler = sp.clone(),
+                                                                    _ => {}
+                                                                }
+                                                            }
+                                                            loaded_patch_toast = Some(up.name.clone());
+                                                        }
+                                                        if ui
+                                                            .small_button("✕")
+                                                            .on_hover_text("Delete user patch")
+                                                            .clicked()
+                                                        {
+                                                            del_user_patch = Some(up.name.clone());
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        });
+                                    if let Some(pname) = loaded_patch_toast {
+                                        self.set_toast(ctx, format!("Loaded patch '{pname}'"));
+                                    }
+                                    if let Some(name) = del_user_patch {
+                                        let _ = AppSettings::delete_user_patch(&name);
+                                        self.user_patches = AppSettings::load_user_patches();
+                                    }
+                                });
+                        }
                         ui.add_space(6.0);
                         ui.separator();
                     }
@@ -5218,6 +6095,207 @@ impl FunKeySynthApp {
                         let f_params = track_filter_mut(proj, self.selected_track, active_extra);
                         ui_instrument_filter_bar(ui, f_params, tc, theme);
                         ui.add_space(6.0);
+                    }
+
+                    {
+                        let cur_engine = if let Some(ei) = active_extra {
+                            Some(proj.extra_tracks[ei].synth.engine)
+                        } else {
+                            match self.selected_track {
+                                TrackId::Moog => Some(proj.moog.engine),
+                                TrackId::MoogPad => Some(proj.moog_pad.engine),
+                                TrackId::Monologue => Some(proj.monologue.engine),
+                                _ => None,
+                            }
+                        };
+                        if cur_engine == Some(SynthEngine::PhilharmoniaD50) {
+                            let bank_names = SynthEngine::PhilharmoniaD50.bank_names();
+                            let bank_val = if let Some(ei) = active_extra {
+                                proj.extra_tracks[ei].synth.engine_bank
+                            } else {
+                                match self.selected_track {
+                                    TrackId::Moog => proj.moog.engine_bank,
+                                    TrackId::MoogPad => proj.moog_pad.engine_bank,
+                                    TrackId::Monologue => proj.monologue.engine_bank,
+                                    _ => 0,
+                                }
+                            };
+                            let cur_bi = (bank_val as usize) % bank_names.len();
+                            preload_philharmonia_bank_async(cur_bi as u8);
+                            let (on_disk, zones, cached) = philharmonia_bank_status(cur_bi as u8);
+                            if on_disk && !cached {
+                                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                            }
+                            let (status_txt, status_col) = if cached && on_disk {
+                                (
+                                    format!("Studio Library • {zones} real sampled zones ready"),
+                                    Color32::from_rgb(92, 236, 180),
+                                )
+                            } else if !cached && on_disk {
+                                (
+                                    "Loading studio MP3 zones...".to_string(),
+                                    Color32::from_rgb(245, 206, 112),
+                                )
+                            } else {
+                                (
+                                    "Built-in synth fallback (philharmonia-all-samples not found)".to_string(),
+                                    Color32::from_rgb(165, 176, 200),
+                                )
+                            };
+                            ui.group(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        RichText::new("PHILHARMONIA ORCHESTRA")
+                                            .strong()
+                                            .size(11.5)
+                                            .color(Color32::from_rgb(245, 206, 112)),
+                                    );
+                                    ui.label(RichText::new(status_txt).small().color(status_col));
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    const CATS: [&str; 7] = [
+                                        "All",
+                                        "Ensembles",
+                                        "Strings",
+                                        "Plucked",
+                                        "Brass",
+                                        "Woodwinds",
+                                        "Perc",
+                                    ];
+                                    for (ci, &clbl) in CATS.iter().enumerate() {
+                                        if ui.selectable_label(self.phil_cat == ci, clbl).clicked() {
+                                            self.phil_cat = ci;
+                                        }
+                                    }
+                                });
+                                ui.add_space(2.0);
+                                let mut picked_bi: Option<usize> = None;
+                                ui.horizontal_wrapped(|ui| {
+                                    let iter_ids: Vec<usize> = if self.phil_cat == 0 {
+                                        (0..bank_names.len()).collect()
+                                    } else {
+                                        PHIL_SECTIONS
+                                            .get(self.phil_cat - 1)
+                                            .map(|s| s.1.to_vec())
+                                            .unwrap_or_default()
+                                    };
+                                    for bi in iter_ids {
+                                        let active = cur_bi == bi;
+                                        let lbl = bank_names[bi];
+                                        let btn = egui::Button::new(
+                                            RichText::new(lbl).size(11.0).color(if active {
+                                                Color32::from_rgb(12, 14, 20)
+                                            } else {
+                                                Color32::from_rgb(220, 226, 240)
+                                            }),
+                                        )
+                                        .fill(if active {
+                                            Color32::from_rgb(245, 206, 112)
+                                        } else {
+                                            Color32::from_rgb(28, 34, 48)
+                                        });
+                                        if ui.add(btn).clicked() {
+                                            picked_bi = Some(bi);
+                                        }
+                                    }
+                                });
+                                if let Some(bi) = picked_bi {
+                                    preload_philharmonia_bank_async(bi as u8);
+                                    if let Some(ei) = active_extra {
+                                        proj.extra_tracks[ei].synth.engine_bank = bi as u8;
+                                        proj.extra_tracks[ei].name = bank_names[bi].to_string();
+                                        proj.extra_tracks[ei].synth.engine_morph =
+                                            if bi == 3 { 0.48 } else { 0.0 };
+                                    } else {
+                                        let target_m = match self.selected_track {
+                                            TrackId::Moog => Some(&mut proj.moog.engine_bank),
+                                            TrackId::MoogPad => Some(&mut proj.moog_pad.engine_bank),
+                                            _ => None,
+                                        };
+                                        if let Some(bref) = target_m {
+                                            *bref = bi as u8;
+                                        } else if self.selected_track == TrackId::Monologue {
+                                            proj.monologue.engine_bank = bi as u8;
+                                        }
+                                    }
+                                }
+                                if cur_bi == 25 {
+                                    ui.add_space(3.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new("Kit Map (C3–B4):")
+                                                .small()
+                                                .strong()
+                                                .color(Color32::from_rgb(180, 190, 212)),
+                                        );
+                                        for &pl in &PHILHARMONIA_PERC_LABELS {
+                                            ui.label(
+                                                RichText::new(pl)
+                                                    .small()
+                                                    .color(Color32::from_rgb(156, 168, 194)),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+                        if cur_engine == Some(SynthEngine::SoundFont) {
+                            let (sf2_name, sf2_presets) = self.engine.soundfont_meta();
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Load .sf2...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("SoundFont 2.0", &["sf2", "SF2"])
+                                        .pick_file()
+                                    {
+                                        match self.engine.load_soundfont_file(&path) {
+                                            Ok(name) => {
+                                                proj.soundfont_path = Some(path.to_string_lossy().into_owned());
+                                                self.toast = Some((format!("Loaded SF2: {name}"), 3.5));
+                                            }
+                                            Err(err) => {
+                                                self.toast = Some((format!("SF2 Error: {err}"), 4.0));
+                                            }
+                                        }
+                                    }
+                                }
+                                let lbl = if sf2_name.is_empty() {
+                                    "Built-in EP fallback (no .sf2 loaded)"
+                                } else {
+                                    sf2_name.as_str()
+                                };
+                                ui.label(RichText::new(lbl).small().color(tc));
+                                if !sf2_presets.is_empty() {
+                                    let bank_mut = if let Some(ei) = active_extra {
+                                        &mut proj.extra_tracks[ei].synth.engine_bank
+                                    } else {
+                                        match self.selected_track {
+                                            TrackId::Moog => &mut proj.moog.engine_bank,
+                                            TrackId::MoogPad => &mut proj.moog_pad.engine_bank,
+                                            TrackId::Monologue => &mut proj.monologue.engine_bank,
+                                            _ => &mut proj.moog.engine_bank,
+                                        }
+                                    };
+                                    let cur_idx = (*bank_mut as usize) % sf2_presets.len();
+                                    let cur_label = sf2_presets
+                                        .get(cur_idx)
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("Preset");
+                                    egui::ComboBox::from_id_salt("sf2_preset_sel")
+                                        .width(190.0)
+                                        .selected_text(cur_label)
+                                        .show_ui(ui, |ui| {
+                                            for (pi, pname) in sf2_presets.iter().take(255).enumerate() {
+                                                let v = pi as u8;
+                                                if ui.selectable_value(bank_mut, v, pname).clicked() {
+                                                    proj.soundfont_preset = pi;
+                                                }
+                                            }
+                                        });
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
                     }
 
                     if let Some(ei) = active_extra {
@@ -5254,6 +6332,12 @@ impl FunKeySynthApp {
                                 if ui.button("All 909").clicked() {
                                     proj.drums.set_all_model(DrumModel::Tr909);
                                 }
+                                if ui.button("Acoustic").clicked() {
+                                    proj.drums.set_all_model(DrumModel::Acoustic);
+                                }
+                                if ui.button("80s Linn").clicked() {
+                                    proj.drums.set_all_model(DrumModel::Linn80s);
+                                }
                                 if ui.button("Hybrid 808/909").clicked() {
                                     proj.drums.set_hybrid();
                                 }
@@ -5273,10 +6357,7 @@ impl FunKeySynthApp {
                                     RichText::new(format!(
                                         "{}  [{}]{}",
                                         name,
-                                        match v.model {
-                                            DrumModel::Tr808 => "808",
-                                            DrumModel::Tr909 => "909",
-                                        },
+                                        v.model.name(),
                                         if v.mute { "  (MUTED)" } else { "" }
                                     ))
                                     .strong()
@@ -5284,7 +6365,7 @@ impl FunKeySynthApp {
                                 )
                                 .default_open(i < 2)
                                 .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if ui.small_button("Hit").clicked() {
                                             v.mute = false;
                                             self.engine.send_live(LiveEvent::PlayNote {
@@ -5294,8 +6375,9 @@ impl FunKeySynthApp {
                                             });
                                         }
                                         ui.checkbox(&mut v.mute, "Mute");
-                                        ui.selectable_value(&mut v.model, DrumModel::Tr808, "808");
-                                        ui.selectable_value(&mut v.model, DrumModel::Tr909, "909");
+                                        for &m in &DrumModel::ALL {
+                                            ui.selectable_value(&mut v.model, m, m.short_name());
+                                        }
                                     });
                                     ui.add(egui::Slider::new(&mut v.level, 0.0..=1.25).text("Level"));
                                     ui.add(egui::Slider::new(&mut v.tune, -12.0..=12.0).suffix(" st").text("Tune"));
@@ -5352,10 +6434,58 @@ impl FunKeySynthApp {
                             ui.add(egui::Slider::new(&mut s.end, 0.02..=1.0).text("End"));
                             ui.add(egui::Slider::new(&mut s.transpose, -24..=24).suffix(" st").text("Transpose"));
                             ui.add(egui::Slider::new(&mut s.tune_cents, -100.0..=100.0).suffix(" ¢").text("Fine Tune"));
-                            ui.add(egui::Slider::new(&mut s.cutoff, 150.0..=16_000.0).logarithmic(true).text("Cutoff Hz"));
-                            ui.add(egui::Slider::new(&mut s.resonance, 0.0..=0.88).text("Resonance"));
+                            let mut clear_samp_thru = false;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Filter:");
+                                if ui
+                                    .selectable_label(!s.filter_enabled, "Thru (Off)")
+                                    .on_hover_text("Bypass sampler filter (clean passthrough)")
+                                    .clicked()
+                                {
+                                    s.set_filter_passthrough();
+                                }
+                                for &(mode, lbl) in &[
+                                    (GlobalFilterMode::LowPass, "LP"),
+                                    (GlobalFilterMode::BandPass, "BP"),
+                                    (GlobalFilterMode::HighPass, "HP"),
+                                ] {
+                                    if ui
+                                        .selectable_label(s.filter_enabled && s.filter_mode == mode, lbl)
+                                        .clicked()
+                                    {
+                                        s.filter_enabled = true;
+                                        s.filter_mode = mode;
+                                    }
+                                }
+                                if ui
+                                    .small_button("Clear (Thru)")
+                                    .on_hover_text("Clear sampler & channel filters to clean passthrough (Hi-Fi, 0 grit)")
+                                    .clicked()
+                                {
+                                    s.set_filter_passthrough();
+                                    s.mode = SamplerMode::HiFi;
+                                    s.bit_crush = 0.0;
+                                    clear_samp_thru = true;
+                                }
+                            });
+                            if ui
+                                .add(egui::Slider::new(&mut s.cutoff, 150.0..=18_000.0).logarithmic(true).text("Cutoff Hz"))
+                                .changed()
+                            {
+                                s.filter_enabled = true;
+                            }
+                            if ui
+                                .add(egui::Slider::new(&mut s.resonance, 0.0..=0.88).text("Resonance"))
+                                .changed()
+                            {
+                                s.filter_enabled = true;
+                            }
                             ui.add(egui::Slider::new(&mut s.attack, 0.001..=0.5).text("Attack"));
                             ui.add(egui::Slider::new(&mut s.release, 0.02..=2.0).text("Release"));
+                            if clear_samp_thru {
+                                proj.mixer.channels[TrackId::Sampler.index()].filter =
+                                    TrackFilterParams::default();
+                            }
                         }
                         TrackId::MidiOut => {}
                     }
@@ -5389,6 +6519,7 @@ impl FunKeySynthApp {
                     ui.add(egui::Slider::new(&mut fx.reverb_mix, 0.0..=1.0).text("Reverb Mix"));
                     ui.add(egui::Slider::new(&mut fx.reverb_size, 0.1..=0.95).text("Reverb Size"));
                     ui.add(egui::Slider::new(&mut fx.reverb_damp, 0.0..=1.0).text("Reverb Damp"));
+                    ui.add(egui::Slider::new(&mut fx.reverb_shimmer, 0.0..=1.0).text("Shimmer"));
                     ui.separator();
 
                     ui.horizontal_wrapped(|ui| {
@@ -5410,6 +6541,8 @@ impl FunKeySynthApp {
                     ui.add(egui::Slider::new(&mut fx.global_filter_env_decay, 0.04..=3.0).logarithmic(true).text("Env Decay"));
                     ui.add(egui::Slider::new(&mut fx.analog_warmth, 0.0..=1.0).text("Tape Warmth"));
                     ui.add(egui::Slider::new(&mut fx.master_crisp, 0.0..=1.0).text("Modern Crisp"));
+                    ui.add(egui::Slider::new(&mut fx.stereo_chorus, 0.0..=1.0).text("Juno Chorus"));
+                    ui.add(egui::Slider::new(&mut fx.club_punch, 0.0..=1.0).text("Club Punch"));
                 });
 
                 ui.add_space(8.0);
@@ -5446,62 +6579,122 @@ impl FunKeySynthApp {
     }
 }
 
+fn engine_selector_controls(
+    ui: &mut egui::Ui,
+    engine: &mut SynthEngine,
+    bank: &mut u8,
+    morph: &mut f32,
+    phaser_mix: &mut f32,
+    amp_cab: &mut f32,
+    id: &str,
+    tc: Color32,
+) {
+    ui.label(RichText::new("SYNTH ENGINE & CHARACTER").strong().size(11.5).color(tc));
+    ui.horizontal_wrapped(|ui| {
+        for &e in &SynthEngine::ALL {
+            if ui.selectable_label(*engine == e, e.name()).clicked() {
+                *engine = e;
+                if e == SynthEngine::PhilharmoniaD50 {
+                    preload_philharmonia_bank_async(*bank);
+                }
+            }
+        }
+    });
+    if *engine != SynthEngine::Analog && *engine != SynthEngine::SoundFont {
+        let banks = engine.bank_names();
+        let cur = (*bank as usize) % banks.len().max(1);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Bank:");
+            egui::ComboBox::from_id_salt((id, "eng_bank"))
+                .width(175.0)
+                .selected_text(banks[cur])
+                .show_ui(ui, |ui| {
+                    for (bi, &bname) in banks.iter().enumerate() {
+                        if ui.selectable_value(bank, bi as u8, bname).clicked()
+                            && *engine == SynthEngine::PhilharmoniaD50
+                        {
+                            preload_philharmonia_bank_async(bi as u8);
+                        }
+                    }
+                });
+        });
+        let morph_lbl = if *engine == SynthEngine::PhilharmoniaD50 {
+            "D-50 Synth Blend"
+        } else {
+            "Morph / Tone"
+        };
+        ui.add(egui::Slider::new(morph, 0.0..=1.0).text(morph_lbl));
+    }
+    ui.add(egui::Slider::new(phaser_mix, 0.0..=1.0).text("Stereo Phaser"));
+    ui.add(egui::Slider::new(amp_cab, 0.0..=1.0).text("Tube Amp / Cab"));
+    ui.separator();
+}
+
 fn moog_controls(ui: &mut egui::Ui, m: &mut crate::model::MoogParams, id: &str, tc: Color32) {
+    engine_selector_controls(
+        ui,
+        &mut m.engine,
+        &mut m.engine_bank,
+        &mut m.engine_morph,
+        &mut m.phaser_mix,
+        &mut m.amp_cab,
+        id,
+        tc,
+    );
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut m.poly_mode, "Polyphonic");
         ui.add(egui::Slider::new(&mut m.glide, 0.0..=0.6).text("Glide"));
     });
 
-    ui.separator();
-    ui.label(RichText::new("OSCILLATORS & CP3 MIXER").strong().size(11.5).color(tc));
-    // Osc 1
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Osc 1:");
-        egui::ComboBox::from_id_salt((id, "w1"))
-            .width(86.0)
-            .selected_text(m.osc1_wave.name())
-            .show_ui(ui, |ui| {
-                for &w in &MoogWave::ALL {
-                    ui.selectable_value(&mut m.osc1_wave, w, w.name());
-                }
-            });
-        ui.add(egui::Slider::new(&mut m.osc1_level, 0.0..=1.0).text("Lvl"));
-    });
-    // Osc 2
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Osc 2:");
-        egui::ComboBox::from_id_salt((id, "w2"))
-            .width(86.0)
-            .selected_text(m.osc2_wave.name())
-            .show_ui(ui, |ui| {
-                for &w in &MoogWave::ALL {
-                    ui.selectable_value(&mut m.osc2_wave, w, w.name());
-                }
-            });
-        ui.add(egui::DragValue::new(&mut m.osc2_octave).range(-2..=2).prefix("Oct "));
-        ui.add(egui::Slider::new(&mut m.osc2_level, 0.0..=1.0).text("Lvl"));
-    });
-    ui.add(egui::Slider::new(&mut m.osc2_detune, -50.0..=50.0).suffix(" ¢").text("Osc 2 Detune"));
-    // Osc 3
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Osc 3:");
-        egui::ComboBox::from_id_salt((id, "w3"))
-            .width(86.0)
-            .selected_text(m.osc3_wave.name())
-            .show_ui(ui, |ui| {
-                for &w in &MoogWave::ALL {
-                    ui.selectable_value(&mut m.osc3_wave, w, w.name());
-                }
-            });
-        ui.add(egui::DragValue::new(&mut m.osc3_octave).range(-2..=2).prefix("Oct "));
-        ui.add(egui::Slider::new(&mut m.osc3_level, 0.0..=1.0).text("Lvl"));
-    });
-    ui.add(egui::Slider::new(&mut m.osc3_detune, -50.0..=50.0).suffix(" ¢").text("Osc 3 Detune"));
-    ui.add(egui::Slider::new(&mut m.noise_level, 0.0..=0.6).text("Noise"));
-    ui.add(egui::Slider::new(&mut m.drive, 0.0..=1.0).text("CP3 Drive"));
+    if m.engine == SynthEngine::Analog {
+        ui.separator();
+        ui.label(RichText::new("OSCILLATORS & CP3 MIXER").strong().size(11.5).color(tc));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Osc 1:");
+            egui::ComboBox::from_id_salt((id, "w1"))
+                .width(86.0)
+                .selected_text(m.osc1_wave.name())
+                .show_ui(ui, |ui| {
+                    for &w in &MoogWave::ALL {
+                        ui.selectable_value(&mut m.osc1_wave, w, w.name());
+                    }
+                });
+            ui.add(egui::Slider::new(&mut m.osc1_level, 0.0..=1.0).text("Lvl"));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Osc 2:");
+            egui::ComboBox::from_id_salt((id, "w2"))
+                .width(86.0)
+                .selected_text(m.osc2_wave.name())
+                .show_ui(ui, |ui| {
+                    for &w in &MoogWave::ALL {
+                        ui.selectable_value(&mut m.osc2_wave, w, w.name());
+                    }
+                });
+            ui.add(egui::DragValue::new(&mut m.osc2_octave).range(-2..=2).prefix("Oct "));
+            ui.add(egui::Slider::new(&mut m.osc2_level, 0.0..=1.0).text("Lvl"));
+        });
+        ui.add(egui::Slider::new(&mut m.osc2_detune, -50.0..=50.0).suffix(" ¢").text("Osc 2 Detune"));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Osc 3:");
+            egui::ComboBox::from_id_salt((id, "w3"))
+                .width(86.0)
+                .selected_text(m.osc3_wave.name())
+                .show_ui(ui, |ui| {
+                    for &w in &MoogWave::ALL {
+                        ui.selectable_value(&mut m.osc3_wave, w, w.name());
+                    }
+                });
+            ui.add(egui::DragValue::new(&mut m.osc3_octave).range(-2..=2).prefix("Oct "));
+            ui.add(egui::Slider::new(&mut m.osc3_level, 0.0..=1.0).text("Lvl"));
+        });
+        ui.add(egui::Slider::new(&mut m.osc3_detune, -50.0..=50.0).suffix(" ¢").text("Osc 3 Detune"));
+        ui.add(egui::Slider::new(&mut m.noise_level, 0.0..=0.6).text("Noise"));
+    }
+    ui.add(egui::Slider::new(&mut m.drive, 0.0..=1.0).text("Drive"));
 
     ui.separator();
-    ui.label(RichText::new("24dB LADDER FILTER & FILTER ENV").strong().size(11.5).color(tc));
+    ui.label(RichText::new("FILTER & FILTER ENV").strong().size(11.5).color(tc));
     ui.add(egui::Slider::new(&mut m.cutoff, 30.0..=16_000.0).logarithmic(true).suffix(" Hz").text("Cutoff"));
     ui.add(egui::Slider::new(&mut m.resonance, 0.0..=0.94).text("Resonance"));
     ui.add(egui::Slider::new(&mut m.env_amount, -1.0..=1.0).text("Env Amount"));
@@ -5523,36 +6716,48 @@ fn moog_controls(ui: &mut egui::Ui, m: &mut crate::model::MoogParams, id: &str, 
 }
 
 fn monologue_controls(ui: &mut egui::Ui, m: &mut crate::model::MonologueParams, tc: Color32) {
-    ui.label(RichText::new("VCO 1 & VCO 2 (SYNC / RING)").strong().size(11.5).color(tc));
-    ui.horizontal_wrapped(|ui| {
-        ui.label("VCO 1:");
-        for &w in &MonologueOscWave::ALL {
-            ui.selectable_value(&mut m.vco1_wave, w, w.name());
-        }
-    });
-    ui.add(egui::Slider::new(&mut m.vco1_shape, 0.0..=1.0).text("VCO 1 Shape"));
-    ui.add(egui::Slider::new(&mut m.vco1_level, 0.0..=1.0).text("VCO 1 Level"));
+    engine_selector_controls(
+        ui,
+        &mut m.engine,
+        &mut m.engine_bank,
+        &mut m.engine_morph,
+        &mut m.phaser_mix,
+        &mut m.amp_cab,
+        "monologue",
+        tc,
+    );
+    if m.engine == SynthEngine::Analog {
+        ui.label(RichText::new("VCO 1 & VCO 2 (SYNC / RING)").strong().size(11.5).color(tc));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("VCO 1:");
+            for &w in &MonologueOscWave::ALL {
+                ui.selectable_value(&mut m.vco1_wave, w, w.name());
+            }
+        });
+        ui.add(egui::Slider::new(&mut m.vco1_shape, 0.0..=1.0).text("VCO 1 Shape"));
+        ui.add(egui::Slider::new(&mut m.vco1_level, 0.0..=1.0).text("VCO 1 Level"));
 
-    ui.horizontal_wrapped(|ui| {
-        ui.label("VCO 2:");
-        for &w in &MonologueOscWave::ALL {
-            ui.selectable_value(&mut m.vco2_wave, w, w.name());
-        }
-        ui.add(egui::DragValue::new(&mut m.vco2_octave).range(-2..=2).prefix("Oct "));
-    });
-    ui.add(egui::Slider::new(&mut m.vco2_pitch, -12.0..=12.0).suffix(" st").text("VCO 2 Pitch"));
-    ui.add(egui::Slider::new(&mut m.vco2_shape, 0.0..=1.0).text("VCO 2 Shape"));
-    ui.add(egui::Slider::new(&mut m.vco2_level, 0.0..=1.0).text("VCO 2 Level"));
-    ui.horizontal_wrapped(|ui| {
-        ui.label("VCO 2 Mod:");
-        for &mm in &Osc2ModMode::ALL {
-            ui.selectable_value(&mut m.mod_mode, mm, mm.name());
-        }
-    });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("VCO 2:");
+            for &w in &MonologueOscWave::ALL {
+                ui.selectable_value(&mut m.vco2_wave, w, w.name());
+            }
+            ui.add(egui::DragValue::new(&mut m.vco2_octave).range(-2..=2).prefix("Oct "));
+        });
+        ui.add(egui::Slider::new(&mut m.vco2_pitch, -12.0..=12.0).suffix(" st").text("VCO 2 Pitch"));
+        ui.add(egui::Slider::new(&mut m.vco2_shape, 0.0..=1.0).text("VCO 2 Shape"));
+        ui.add(egui::Slider::new(&mut m.vco2_level, 0.0..=1.0).text("VCO 2 Level"));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("VCO 2 Mod:");
+            for &mm in &Osc2ModMode::ALL {
+                ui.selectable_value(&mut m.mod_mode, mm, mm.name());
+            }
+        });
+    }
     ui.add(egui::Slider::new(&mut m.glide, 0.0..=0.5).text("Glide"));
 
     ui.separator();
-    ui.label(RichText::new("12dB FILTER, DRIVE & ENVELOPE").strong().size(11.5).color(tc));
+    ui.label(RichText::new("FILTER, DRIVE & ENVELOPE").strong().size(11.5).color(tc));
     ui.add(egui::Slider::new(&mut m.cutoff, 30.0..=16_000.0).logarithmic(true).suffix(" Hz").text("Cutoff"));
     ui.add(egui::Slider::new(&mut m.resonance, 0.0..=0.94).text("Resonance"));
     ui.add(egui::Slider::new(&mut m.drive, 0.0..=1.0).text("Drive"));
@@ -5567,27 +6772,29 @@ fn monologue_controls(ui: &mut egui::Ui, m: &mut crate::model::MonologueParams, 
     ui.add(egui::Slider::new(&mut m.eg_int, -1.0..=1.0).text("EG Intensity"));
     ui.checkbox(&mut m.amp_sustain, "Amp Gate Sustain (off = punchy AD)");
 
-    ui.separator();
-    ui.label(RichText::new("LFO MODULATION").strong().size(11.5).color(tc));
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Wave:");
-        for &w in &LfoWave::ALL {
-            ui.selectable_value(&mut m.lfo_wave, w, w.name());
-        }
+    if m.engine == SynthEngine::Analog {
         ui.separator();
-        ui.label("Mode:");
-        for &lm in &LfoMode::ALL {
-            ui.selectable_value(&mut m.lfo_mode, lm, lm.name());
-        }
-    });
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Target:");
-        for &lt in &LfoTarget::ALL {
-            ui.selectable_value(&mut m.lfo_target, lt, lt.name());
-        }
-    });
-    ui.add(egui::Slider::new(&mut m.lfo_rate, 0.0..=1.0).text("LFO Rate"));
-    ui.add(egui::Slider::new(&mut m.lfo_int, -1.0..=1.0).text("LFO Intensity"));
+        ui.label(RichText::new("LFO MODULATION").strong().size(11.5).color(tc));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Wave:");
+            for &w in &LfoWave::ALL {
+                ui.selectable_value(&mut m.lfo_wave, w, w.name());
+            }
+            ui.separator();
+            ui.label("Mode:");
+            for &lm in &LfoMode::ALL {
+                ui.selectable_value(&mut m.lfo_mode, lm, lm.name());
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Target:");
+            for &lt in &LfoTarget::ALL {
+                ui.selectable_value(&mut m.lfo_target, lt, lt.name());
+            }
+        });
+        ui.add(egui::Slider::new(&mut m.lfo_rate, 0.0..=1.0).text("LFO Rate"));
+        ui.add(egui::Slider::new(&mut m.lfo_int, -1.0..=1.0).text("LFO Intensity"));
+    }
 }
 
 fn format_hz(hz: f32) -> String {
@@ -5659,10 +6866,10 @@ fn ui_instrument_filter_bar(
                     );
                 });
                 ui.label(RichText::new(format!("{:.0}%", f.resonance * 100.0)).size(11.0).weak());
-                if (!f.enabled || f.is_active())
+                if (f.enabled || f.cutoff < 17_900.0 || f.resonance > 0.01 || f.mode != GlobalFilterMode::LowPass)
                     && ui
-                        .small_button("Reset")
-                        .on_hover_text("Reset instrument filter to open bypass")
+                        .small_button("Clear (Thru)")
+                        .on_hover_text("Clear instrument channel filter to clean bypass")
                         .clicked()
                 {
                     *f = TrackFilterParams::default();
@@ -6172,8 +7379,9 @@ mod ui_layout_tests {
             assert_no_overlap_or_overflow(&ctx, &mut app, "Tab-Sampler-Armed", w, h);
             app.armed_record = None;
 
-            // 10. Sound Lab tab across all track types
+            // 10. Sound Lab tab across all track types (including open Preset Browser)
             app.tab = StudioTab::SoundLab;
+            app.show_preset_browser = true;
             {
                 let mut g = app.engine.project.lock().unwrap();
                 g.party_mode = false;
@@ -6194,6 +7402,7 @@ mod ui_layout_tests {
                     h,
                 );
             }
+            app.show_preset_browser = false;
         }
 
         // Tall viewport regression check: verify below-the-fold Vibe Macros ("Warmth", "Glitch", "Master")
@@ -6391,6 +7600,151 @@ mod ui_layout_tests {
         let st = &proj.current_pattern().extra_seqs[0].steps[0];
         assert!(st.active);
         assert_eq!(st.note, 64);
+    }
+
+    #[test]
+    fn keyboard_auto_repeat_does_not_retrigger_held_chords_or_arp() {
+        let ctx = egui::Context::default();
+        let mut app = FunKeySynthApp::new_for_test(&ctx);
+        let mut proj = Project::default();
+        proj.arp.enabled = true;
+        let pads = build_auto_chord_pads(proj.root_note, proj.scale);
+
+        let key_ev = |key: Key, pressed: bool, repeat: bool| -> egui::Event {
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat,
+                modifiers: egui::Modifiers::NONE,
+            }
+        };
+
+        // 1) Held Chord key: ignore OS auto-repeat & X11 synthetic Release+Press within <35ms
+        app.keyboard_mode = KeyboardMode::Chords;
+        app.rec_replace = true;
+        app.toggle_arm_record(&ctx, &mut proj, RecordTarget::Core(TrackId::MoogPad));
+
+        let mut raw = egui::RawInput::default();
+        raw.time = Some(1.000);
+        raw.events = vec![key_ev(Key::A, true, false)];
+        let _ = ctx.run(raw, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert_eq!(app.held_chord_key, Some(Key::A));
+        assert_eq!(app.step_rec_cursor, 1);
+
+        // Repeat=true frames must not re-trigger
+        for t in [1.040, 1.080] {
+            let mut r = egui::RawInput::default();
+            r.time = Some(t);
+            r.events = vec![key_ev(Key::A, true, true)];
+            let _ = ctx.run(r, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+            assert_eq!(app.held_chord_key, Some(Key::A));
+            assert_eq!(app.step_rec_cursor, 1);
+        }
+
+        // X11 synthetic Release followed 15ms later by non-repeat Press must cancel release & NOT re-trigger
+        let mut r_rel = egui::RawInput::default();
+        r_rel.time = Some(1.100);
+        r_rel.events = vec![key_ev(Key::A, false, false)];
+        let _ = ctx.run(r_rel, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert_eq!(app.held_chord_key, Some(Key::A));
+
+        let mut r_rep = egui::RawInput::default();
+        r_rep.time = Some(1.115);
+        r_rep.events = vec![key_ev(Key::A, true, false)];
+        let _ = ctx.run(r_rep, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert_eq!(app.held_chord_key, Some(Key::A));
+        assert_eq!(app.pending_chord_release, None);
+        assert_eq!(app.step_rec_cursor, 1, "Synthetic X11 repeat must not re-trigger chord");
+
+        // Real release > 35ms cleanly releases chord
+        let mut r_real_rel = egui::RawInput::default();
+        r_real_rel.time = Some(1.200);
+        r_real_rel.events = vec![key_ev(Key::A, false, false)];
+        let _ = ctx.run(r_real_rel, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert_eq!(app.held_chord_key, Some(Key::A));
+
+        let mut r_done = egui::RawInput::default();
+        r_done.time = Some(1.245);
+        let _ = ctx.run(r_done, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert_eq!(app.held_chord_key, None);
+
+        // 2) Held Scale / Arp note key: only 1 trigger across repeats + X11 release/press glitch
+        app.keyboard_mode = KeyboardMode::Scale;
+        app.toggle_arm_record(&ctx, &mut proj, RecordTarget::Core(TrackId::Monologue));
+        let start_cur = app.step_rec_cursor;
+
+        let mut r_down = egui::RawInput::default();
+        r_down.time = Some(2.000);
+        r_down.events = vec![key_ev(Key::S, true, false)];
+        let _ = ctx.run(r_down, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert_eq!(app.held_keys.len(), 1);
+        assert_eq!(app.step_rec_cursor, (start_cur + 1) % 16);
+
+        for t in [2.040, 2.080, 2.120] {
+            let mut r = egui::RawInput::default();
+            r.time = Some(t);
+            r.events = vec![key_ev(Key::S, true, true)];
+            let _ = ctx.run(r, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+            assert_eq!(app.step_rec_cursor, (start_cur + 1) % 16);
+        }
+
+        let mut s_rel = egui::RawInput::default();
+        s_rel.time = Some(2.140);
+        s_rel.events = vec![key_ev(Key::S, false, false)];
+        let _ = ctx.run(s_rel, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+
+        let mut s_rep = egui::RawInput::default();
+        s_rep.time = Some(2.155);
+        s_rep.events = vec![key_ev(Key::S, true, false)];
+        let _ = ctx.run(s_rep, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert_eq!(app.held_keys.len(), 1);
+        assert!(app.pending_key_releases.is_empty());
+        assert_eq!(app.step_rec_cursor, (start_cur + 1) % 16);
+
+        let mut s_real_rel = egui::RawInput::default();
+        s_real_rel.time = Some(2.200);
+        s_real_rel.events = vec![key_ev(Key::S, false, false)];
+        let _ = ctx.run(s_real_rel, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+
+        let mut s_done = egui::RawInput::default();
+        s_done.time = Some(2.245);
+        let _ = ctx.run(s_done, |c| app.handle_keyboard(c, &mut proj, &pads, false, 0));
+        assert!(app.held_keys.is_empty());
+    }
+
+    #[test]
+    fn undo_and_redo_restore_project_and_bump_sample_generation() {
+        let ctx = egui::Context::default();
+        let mut app = FunKeySynthApp::new_for_test(&ctx);
+
+        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1280.0, 720.0));
+        let orig_proj = Project::default();
+        let orig_bpm = orig_proj.bpm;
+        let orig_gen = orig_proj.sample_generation;
+        app.undo_stack.push_back(orig_proj);
+
+        let mut edited = app.engine.project.lock().unwrap().clone();
+        edited.bpm = 148.0;
+        edited.sample_generation = orig_gen + 5;
+        assert!(app.perform_undo(&ctx, &mut edited));
+        assert!((edited.bpm - orig_bpm).abs() < 0.01);
+        assert!(edited.sample_generation > orig_gen + 5);
+        assert_eq!(app.redo_stack.len(), 1);
+
+        assert!(app.perform_redo(&ctx, &mut edited));
+        assert!((edited.bpm - 148.0).abs() < 0.01);
+        assert_eq!(app.undo_stack.len(), 1);
+
+        *app.engine.project.lock().unwrap() = edited;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(0.1),
+                ..Default::default()
+            },
+            |c| app.render_ui(c),
+        );
     }
 }
 

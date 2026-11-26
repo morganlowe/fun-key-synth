@@ -5,13 +5,13 @@ pub mod vibe;
 use serde::{Deserialize, Serialize};
 
 pub use project::{
-    load_pattern, load_project, save_pattern, save_project, DelayDivision, DropMacroConfig,
-    DrumKitParams, DrumModel, DrumVoiceParams, EgTarget, ExtraTrack, FactoryPreset,
-    FilterEnvTrigger, FxParams, GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode,
-    MidiSettings, MixerParams, MonologueOscWave, MonologueParams, MoogParams, MoogWave,
-    Osc2ModMode, PartyMixMode, PartyPace, Project, SamplePart, SamplerMode, SamplerParams,
-    SavedSample, SongSection, Tb303Params, Tb303Wave, TrackFilterParams, TrackMixerChannel,
-    MAX_EXTRA_TRACKS,
+    load_pattern, load_project, save_pattern, save_project, ArpMode, ArpParams, ArpRate,
+    DelayDivision, DropMacroConfig, DrumKitParams, DrumModel, DrumVoiceParams, EgTarget,
+    ExtraTrack, FactoryPreset, FilterEnvTrigger, FxParams, GlobalFilterMode, LfoMode, LfoTarget,
+    LfoWave, LoopMode, MidiSettings, MixerParams, MonologueOscWave, MonologueParams, MoogParams,
+    MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project, SamplePart, SamplerMode,
+    SamplerParams, SavedSample, SongSection, SynthEngine, Tb303Params, Tb303Wave,
+    TrackFilterParams, TrackMixerChannel, MAX_EXTRA_TRACKS,
 };
 pub use sequencer::{
     detect_chord_from_notes, euclidean_rhythm, ChordType, DrumLane, DrumStep, DrumTrackSeq,
@@ -19,12 +19,15 @@ pub use sequencer::{
     MotionLocks, Pattern,
 };
 pub use vibe::{
-    apply_extra_track_preset, apply_vibe_to_project, apply_voice_preset, arp_tones_for,
-    bass_midi_for, build_auto_chord_pads, build_party_song_rig, build_party_song_rig_with_reroll,
-    chord_symbol, default_vibe_sections, generate_auto_beat, generate_extra_track_seq,
-    generate_melodic_tracks, party_palette_label, party_song_title, pick_party_vibe,
-    progression_at, vibe_neighbors, vibe_progressions, voice_led_chord, voice_preset_names,
-    AutoChordPad, ChordProgression, ChordSlot, PartySongRig, Vibe, PROGRESSIONS,
+    apply_extra_track_preset, apply_philharmonia_instrument, apply_vibe_to_project,
+    apply_voice_preset, arp_tones_for, auto_arrange_project_song, bass_midi_for,
+    build_auto_chord_pads, build_party_song_rig, build_party_song_rig_with_reroll,
+    capture_party_song_to_project, chord_symbol, default_vibe_sections, generate_auto_beat,
+    generate_extra_track_seq, generate_melodic_tracks, generate_philharmonia_track_seq,
+    party_crate_vibes, party_palette_label, party_song_title, pick_party_vibe,
+    pick_party_vibe_crate, progression_at, vibe_neighbors, vibe_progressions, voice_led_chord,
+    voice_led_chord_near, voice_preset_category, voice_preset_names, AutoChordPad,
+    ChordProgression, ChordSlot, PartySongRig, Vibe, PROGRESSIONS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
