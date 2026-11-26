@@ -1,6 +1,6 @@
 %global debug_package %{nil}
 %global _build_id_links none
-%{!?_version:%define _version 1.4.2}
+%{!?_version:%define _version 1.5.0}
 %{!?_source_dir:%define _source_dir %{_builddir}}
 %{!?_binary_path:%define _binary_path %{_source_dir}/target/release/fun-key-synth}
 

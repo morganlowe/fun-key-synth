@@ -11,3 +11,6 @@
 *.ogg
 *.tmp
 .DS_Store
+
+/target/
+/pkg/
