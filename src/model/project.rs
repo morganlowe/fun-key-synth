@@ -1127,11 +1127,11 @@ impl Default for MixerParams {
     fn default() -> Self {
         let mut channels = [TrackMixerChannel::default(); 6];
         channels[0] = TrackMixerChannel {
-            volume: 1.12,
-            pan: -0.08,
-            width: 1.0,
-            delay_send: 0.20,
-            reverb_send: 0.06,
+            volume: 0.72,
+            pan: 0.0,
+            width: 0.85,
+            delay_send: 0.05,
+            reverb_send: 0.04,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -1139,11 +1139,11 @@ impl Default for MixerParams {
             filter: TrackFilterParams::default(),
         }; // Moog
         channels[1] = TrackMixerChannel {
-            volume: 0.78,
-            pan: 0.12,
+            volume: 0.80,
+            pan: 0.14,
             width: 1.0,
-            delay_send: 0.42,
-            reverb_send: 0.36,
+            delay_send: 0.34,
+            reverb_send: 0.28,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -1151,11 +1151,11 @@ impl Default for MixerParams {
             filter: TrackFilterParams::default(),
         }; // Monologue
         channels[2] = TrackMixerChannel {
-            volume: 0.82,
-            pan: 0.0,
+            volume: 0.68,
+            pan: -0.10,
             width: 1.0,
-            delay_send: 0.34,
-            reverb_send: 0.18,
+            delay_send: 0.30,
+            reverb_send: 0.16,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -1163,7 +1163,7 @@ impl Default for MixerParams {
             filter: TrackFilterParams::default(),
         }; // 303
         channels[3] = TrackMixerChannel {
-            volume: 0.58,
+            volume: 0.82,
             pan: 0.0,
             width: 1.0,
             delay_send: 0.06,
@@ -1175,11 +1175,11 @@ impl Default for MixerParams {
             filter: TrackFilterParams::default(),
         }; // Drums
         channels[4] = TrackMixerChannel {
-            volume: 0.80,
-            pan: -0.14,
+            volume: 0.64,
+            pan: -0.18,
             width: 1.0,
-            delay_send: 0.34,
-            reverb_send: 0.36,
+            delay_send: 0.30,
+            reverb_send: 0.32,
             delay_enabled: true,
             reverb_enabled: true,
             mute: false,
@@ -1200,8 +1200,8 @@ impl Default for MixerParams {
         }; // MIDI
         Self {
             channels,
-            master_volume: 0.88,
-            moog_pad_volume: 0.80,
+            master_volume: 0.90,
+            moog_pad_volume: 0.74,
             moog_pad_width: 1.0,
             moog_pad_reverb_send: 0.56,
             moog_pad_delay_send: 0.24,
@@ -1563,18 +1563,20 @@ pub enum PartyMixMode {
     ChillCrate,
     RetroCrate,
     BassCrate,
+    HipHopCrate,
     CustomCrate,
     AllVibes,
 }
 
 impl PartyMixMode {
-    pub const ALL: [PartyMixMode; 8] = [
+    pub const ALL: [PartyMixMode; 9] = [
         PartyMixMode::SingleVibe,
         PartyMixMode::RelatedVibes,
         PartyMixMode::ClubCrate,
         PartyMixMode::ChillCrate,
         PartyMixMode::RetroCrate,
         PartyMixMode::BassCrate,
+        PartyMixMode::HipHopCrate,
         PartyMixMode::CustomCrate,
         PartyMixMode::AllVibes,
     ];
@@ -1587,8 +1589,9 @@ impl PartyMixMode {
             PartyMixMode::ChillCrate => "Chill / Lo-Fi",
             PartyMixMode::RetroCrate => "80s / Synth",
             PartyMixMode::BassCrate => "Heavy Bass",
+            PartyMixMode::HipHopCrate => "Hip-Hop & Rap",
             PartyMixMode::CustomCrate => "Custom Crate",
-            PartyMixMode::AllVibes => "All 24",
+            PartyMixMode::AllVibes => "All Vibes",
         }
     }
 }
@@ -1634,7 +1637,7 @@ fn default_true() -> bool {
 }
 
 fn default_party_crate_mask() -> u32 {
-    0x00FF_FFFF
+    0xFFFF_FFFF
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]

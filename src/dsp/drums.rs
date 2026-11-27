@@ -1132,14 +1132,14 @@ impl DrumMachine {
         let (base_hz, punch_hz, body_sweep_hz, decay_s, punch_dec_s, pitch_dec_s, drive, beater_amt) =
             match vp.model {
                 DrumModel::Tr808 => (
-                    47.0 * tune_mult,
-                    82.0 * tune_mult,
-                    22.0 * tune_mult,
-                    0.14 + vp.decay * 0.44,
-                    0.0055,
-                    0.022 + vp.tone * 0.012,
-                    1.18 + vp.tone * 0.55,
-                    0.14 + vp.snappy * 0.22,
+                    48.0 * tune_mult,
+                    108.0 * tune_mult,
+                    28.0 * tune_mult,
+                    0.13 + vp.decay * 0.42,
+                    0.0115,
+                    0.026 + vp.tone * 0.012,
+                    1.38 + vp.tone * 0.65,
+                    0.26 + vp.snappy * 0.28,
                 ),
                 DrumModel::Tr909 => (
                     52.5 * tune_mult,
@@ -1186,10 +1186,10 @@ impl DrumMachine {
         // Dynamic analog kick-body low-pass contour: crisp transient punch -> velvety pure sub tail
         let body_lp_hz = 200.0
             + vp.tone * 220.0
-            + 2900.0 * self.kick_punch_env
-            + 620.0 * self.kick_pitch_env;
+            + 2200.0 * self.kick_punch_env
+            + 560.0 * self.kick_pitch_env;
         self.kick_tone_lp += one_pole_coeff(body_lp_hz, sr) * (sat - self.kick_tone_lp);
-        let sub_clean = body * amp * 0.16;
+        let sub_clean = body * amp * 0.30;
 
         self.kick_amp *= (-1.0 / (decay_s * sr)).exp();
         self.kick_punch_env *= (-1.0 / (punch_dec_s * sr)).exp();
@@ -1198,7 +1198,7 @@ impl DrumMachine {
         if self.kick_amp < 0.0005 {
             self.kick_active = false;
         }
-        let raw = self.kick_tone_lp * 0.58 + sub_clean + beater * 1.15;
+        let raw = self.kick_tone_lp * 0.68 + sub_clean + beater * 0.38;
         self.kick_dc += one_pole_coeff(22.0, sr) * (raw - self.kick_dc);
         soft_ceiling(raw - self.kick_dc, 1.15, 0.35)
     }
@@ -1210,46 +1210,46 @@ impl DrumMachine {
         let vel_tone = (vp.tone + (self.snare_vel - 0.85) * 0.20).clamp(0.0, 1.0);
         let (f1, body_dec, over_dec, noise_dec, hp_hz, lp_hz) = match vp.model {
             DrumModel::Tr808 => (
-                184.0 * tune_mult,
-                0.085 + vp.decay * 0.11,
-                0.026,
-                0.075 + vp.decay * 0.20,
-                1150.0,
-                5400.0 + vel_tone * 6800.0,
+                182.0 * tune_mult,
+                0.095 + vp.decay * 0.12,
+                0.028,
+                0.068 + vp.decay * 0.16,
+                980.0,
+                6400.0 + vel_tone * 6200.0,
             ),
             DrumModel::Tr909 => (
                 198.0 * tune_mult,
-                0.092 + vp.decay * 0.13,
+                0.100 + vp.decay * 0.14,
                 0.030,
-                0.100 + vp.decay * 0.28,
-                1020.0,
-                5200.0 + vel_tone * 7400.0,
+                0.082 + vp.decay * 0.22,
+                1040.0,
+                7600.0 + vel_tone * 6600.0,
             ),
             DrumModel::Acoustic => (
                 210.0 * tune_mult,
-                0.095 + vp.decay * 0.14,
+                0.105 + vp.decay * 0.15,
                 0.036,
-                0.115 + vp.decay * 0.30,
-                880.0,
-                6000.0 + vel_tone * 7800.0,
+                0.095 + vp.decay * 0.24,
+                900.0,
+                8000.0 + vel_tone * 6600.0,
             ),
             DrumModel::Linn80s => (
                 178.0 * tune_mult,
-                0.110 + vp.decay * 0.16,
+                0.118 + vp.decay * 0.17,
                 0.042,
-                0.140 + vp.decay * 0.34,
-                760.0,
-                5600.0 + vel_tone * 7200.0,
+                0.115 + vp.decay * 0.26,
+                800.0,
+                9600.0 + vel_tone * 6800.0,
             ),
         };
-        let pitch_bend = 1.0 + 0.11 * self.snare_pitch_env;
+        let pitch_bend = 1.0 + 0.16 * self.snare_pitch_env;
         self.snare_p1 = (self.snare_p1 + (f1 * pitch_bend) / sr).fract();
         self.snare_p2 = (self.snare_p2 + (f1 * 1.59 * pitch_bend) / sr).fract();
         self.snare_p3 = (self.snare_p3 + (f1 * 2.14 * pitch_bend) / sr).fract();
 
-        let shell = (self.snare_p1 * TAU).sin() * self.snare_body_env * 0.72
+        let shell = (self.snare_p1 * TAU).sin() * self.snare_body_env * 0.74
             + (self.snare_p2 * TAU).sin() * self.snare_over_env * 0.24
-            + (self.snare_p3 * TAU).sin() * self.snare_over_env * 0.14;
+            + (self.snare_p3 * TAU).sin() * self.snare_over_env * 0.12;
 
         // Broadband crisp snare wires (12dB SVF HPF + exact 1-pole LPF)
         let wire_hp = self.snare_wire_hp_svf.process_hp(noise, hp_hz, 0.03);
@@ -1258,26 +1258,26 @@ impl DrumMachine {
 
         let t_s = self.snare_samples as f32 / sr;
         let wire_bloom = 1.0 - (-t_s / 0.0024).exp();
-        let wires = self.snare_wire_lp * self.snare_noise_env * wire_bloom * (0.36 + vp.snappy * 0.96);
+        let wires = self.snare_wire_lp * self.snare_noise_env * wire_bloom * (0.36 + vp.snappy * 0.82);
 
         // Coupled wooden drum-shell cavity resonance (~360-400 Hz) excited by skin + bottom wire rattle
         let shell_wood = self.snare_shell_bp.process_bp(
-            noise * self.snare_body_env * 0.55 + shell * 0.50 + wires * 0.16,
+            noise * self.snare_body_env * 0.55 + shell * 0.50 + wires * 0.14,
             (f1 * 1.92).clamp(280.0, 560.0),
             0.36,
-        ) * 0.24;
-        let body = 1.4 * soft_tanh((shell + shell_wood) * 1.25 / 1.4);
+        ) * 0.28;
+        let body = 1.4 * soft_tanh((shell + shell_wood) * 1.26 / 1.4);
 
         let crack_idx = self.snare_samples as usize;
         let base_crack = if crack_idx < self.pcm.snare_crack_pcm.len() {
-            self.pcm.snare_crack_pcm[crack_idx] * (0.46 + vp.snappy * 0.55)
+            self.pcm.snare_crack_pcm[crack_idx] * (0.54 + vp.snappy * 0.56)
         } else {
             0.0
         };
         let crack = match vp.model {
             DrumModel::Acoustic => {
                 let shell_hit = if crack_idx < self.pcm.acoustic_shell_pcm.len() {
-                    self.pcm.acoustic_shell_pcm[crack_idx] * (0.42 + vp.snappy * 0.45)
+                    self.pcm.acoustic_shell_pcm[crack_idx] * (0.48 + vp.snappy * 0.48)
                 } else {
                     0.0
                 };
@@ -1285,7 +1285,7 @@ impl DrumMachine {
             }
             DrumModel::Linn80s => {
                 let linn_hit = if crack_idx < self.pcm.linn_crack_pcm.len() {
-                    self.pcm.linn_crack_pcm[crack_idx] * (0.50 + vp.snappy * 0.52)
+                    self.pcm.linn_crack_pcm[crack_idx] * (0.58 + vp.snappy * 0.54)
                 } else {
                     0.0
                 };
@@ -1294,9 +1294,9 @@ impl DrumMachine {
             _ => base_crack,
         };
         let air = if vp.model != DrumModel::Tr808 {
-            air_noise * self.snare_noise_env * (0.15 + vel_tone * 0.20) * (0.35 + vp.snappy * 0.65)
+            air_noise * self.snare_noise_env * (0.29 + vel_tone * 0.31) * (0.35 + vp.snappy * 0.65)
         } else {
-            0.0
+            air_noise * self.snare_noise_env * (0.14 + vel_tone * 0.16) * (0.35 + vp.snappy * 0.60)
         };
 
         self.snare_samples = self.snare_samples.saturating_add(1);
@@ -1310,13 +1310,13 @@ impl DrumMachine {
         let base_body_w = match vp.model {
             DrumModel::Tr909 => 0.78,
             DrumModel::Acoustic => 0.80,
-            DrumModel::Linn80s => 0.82,
-            DrumModel::Tr808 => 0.73,
+            DrumModel::Linn80s => 0.75,
+            DrumModel::Tr808 => 0.74,
         };
         let body_w = base_body_w + 0.08 * (self.snare_vel - 0.85).clamp(-0.3, 0.3);
         let center = body * body_w + crack;
         // Mid/Side stereo snare wire decorrelation: 3D stereo width with 100% phase-clean mono sum!
-        let wire_mid = (wires + air) * 0.96;
+        let wire_mid = (wires + air) * 0.92;
         let wire_side = self.snare_wire_ap_r.process(wires + air, 0.55) * 0.28;
         (
             soft_ceiling(center + wire_mid + wire_side, 1.15, 0.35),
@@ -1330,65 +1330,65 @@ impl DrumMachine {
         let t_ms = (self.clap_samples as f32 / sr) * 1000.0;
         self.clap_samples = self.clap_samples.saturating_add(1);
 
-        // True decorrelated stereo multi-hand clap bursts (zero comb filtering!)
-        let burst_l = if t_ms < 9.4 {
-            (-t_ms / 4.0).exp()
-        } else if t_ms < 20.1 {
-            (-(t_ms - 9.4) / 4.2).exp()
-        } else if t_ms < 31.8 {
-            (-(t_ms - 20.1) / 4.2).exp()
-        } else if t_ms < 47.0 {
-            (-(t_ms - 31.8) / 5.2).exp()
+        // Tight, snappy stereo multi-hand clap bursts (crisp hip-hop/club slap!)
+        let burst_l = if t_ms < 6.2 {
+            (-t_ms / 2.8).exp()
+        } else if t_ms < 13.5 {
+            (-(t_ms - 6.2) / 3.0).exp()
+        } else if t_ms < 21.5 {
+            (-(t_ms - 13.5) / 3.2).exp()
+        } else if t_ms < 33.0 {
+            (-(t_ms - 21.5) / 4.2).exp()
         } else {
             0.0
         };
-        let burst_r = if t_ms >= 1.2 && t_ms < 10.7 {
-            (-(t_ms - 1.2) / 4.0).exp()
-        } else if t_ms >= 10.7 && t_ms < 21.5 {
-            (-(t_ms - 10.7) / 4.2).exp()
-        } else if t_ms >= 21.5 && t_ms < 33.2 {
-            (-(t_ms - 21.5) / 4.2).exp()
-        } else if t_ms >= 33.2 && t_ms < 48.5 {
-            (-(t_ms - 33.2) / 5.2).exp()
+        let burst_r = if t_ms >= 0.9 && t_ms < 7.1 {
+            (-(t_ms - 0.9) / 2.8).exp()
+        } else if t_ms >= 7.1 && t_ms < 14.4 {
+            (-(t_ms - 7.1) / 3.0).exp()
+        } else if t_ms >= 14.4 && t_ms < 22.5 {
+            (-(t_ms - 14.4) / 3.2).exp()
+        } else if t_ms >= 22.5 && t_ms < 34.2 {
+            (-(t_ms - 22.5) / 4.2).exp()
         } else {
             0.0
         };
 
         let tail_dec = match vp.model {
-            DrumModel::Tr808 => 0.044 + vp.decay * 0.15,
-            DrumModel::Tr909 => 0.038 + vp.decay * 0.14,
-            DrumModel::Acoustic => 0.052 + vp.decay * 0.18,
-            DrumModel::Linn80s => 0.046 + vp.decay * 0.16,
+            DrumModel::Tr808 => 0.032 + vp.decay * 0.095,
+            DrumModel::Tr909 => 0.030 + vp.decay * 0.095,
+            DrumModel::Acoustic => 0.036 + vp.decay * 0.11,
+            DrumModel::Linn80s => 0.034 + vp.decay * 0.105,
         };
-        if t_ms >= 31.8 {
+        if t_ms >= 21.5 {
             self.clap_tail_env *= (-1.0 / (tail_dec * sr)).exp();
         }
-        let env_l = (burst_l * 0.92 + self.clap_tail_env * 0.56).min(1.0);
-        let env_r = (burst_r * 0.92 + self.clap_tail_env * 0.56).min(1.0);
+        let env_l = (burst_l * 0.96 + self.clap_tail_env * 0.42).min(1.0);
+        let env_r = (burst_r * 0.96 + self.clap_tail_env * 0.42).min(1.0);
 
         let noise_r = self.rng.next_bipolar();
-        let hp_a = one_pole_coeff(520.0, sr);
+        let hp_a = one_pole_coeff(460.0, sr);
         self.clap_hp += hp_a * (noise - self.clap_hp);
         self.clap_hp_r += hp_a * (noise_r - self.clap_hp_r);
         let wide_l = noise - self.clap_hp;
         let wide_r = noise_r - self.clap_hp_r;
         let bp_freq = match vp.model {
-            DrumModel::Tr808 => 1120.0 + vp.tone * 780.0,
-            DrumModel::Tr909 => 1260.0 + vp.tone * 880.0,
-            DrumModel::Acoustic => 1060.0 + vp.tone * 740.0,
-            DrumModel::Linn80s => 1180.0 + vp.tone * 820.0,
+            DrumModel::Tr808 => 1080.0 + vp.tone * 580.0,
+            DrumModel::Tr909 => 1160.0 + vp.tone * 620.0,
+            DrumModel::Acoustic => 1050.0 + vp.tone * 540.0,
+            DrumModel::Linn80s => 1120.0 + vp.tone * 560.0,
         };
-        let filt_l = self.clap_bp.process_bp(wide_l, bp_freq, 0.025) * 1.25;
-        let palm_l = self.clap_body.process_bp(wide_l, 750.0, 0.02) * 0.55;
-        let filt_r = self.clap_bp_r.process_bp(wide_r, bp_freq * 1.03, 0.025) * 1.25;
-        let palm_r = self.clap_body_r.process_bp(wide_r, 780.0, 0.02) * 0.55;
-        let crisp_air_l = air_noise * burst_l * (0.20 + vp.tone * 0.24) * (0.5 + vp.snappy * 0.5);
-        let crisp_air_r = air_noise * burst_r * (0.18 + vp.tone * 0.22) * (0.5 + vp.snappy * 0.5);
+        let filt_l = self.clap_bp.process_bp(wide_l, bp_freq, 0.24) * 1.45;
+        let palm_l = self.clap_body.process_bp(wide_l, 590.0 + vp.tone * 80.0, 0.20) * 0.95;
+        let filt_r = self.clap_bp_r.process_bp(wide_r, bp_freq * 1.03, 0.24) * 1.45;
+        let palm_r = self.clap_body_r.process_bp(wide_r, 610.0 + vp.tone * 80.0, 0.20) * 0.95;
+        let crisp_air_l = air_noise * (burst_l * 0.12 + self.clap_tail_env * 0.08) * (0.50 + vp.tone * 0.30) * (0.45 + vp.snappy * 0.45);
+        let crisp_air_r = air_noise * (burst_r * 0.11 + self.clap_tail_env * 0.08) * (0.50 + vp.tone * 0.30) * (0.45 + vp.snappy * 0.45);
 
-        let sl = soft_ceiling(((filt_l + palm_l) * env_l * (0.76 + vp.snappy * 0.36)) + crisp_air_l, 1.15, 0.35);
-        let sr_v = soft_ceiling(((filt_r + palm_r) * env_r * (0.76 + vp.snappy * 0.36)) + crisp_air_r, 1.15, 0.35);
+        let sl = soft_ceiling(((filt_l + palm_l) * env_l * (0.80 + vp.snappy * 0.30)) + crisp_air_l, 1.15, 0.35);
+        let sr_v = soft_ceiling(((filt_r + palm_r) * env_r * (0.80 + vp.snappy * 0.30)) + crisp_air_r, 1.15, 0.35);
 
-        if t_ms > 48.5 && self.clap_tail_env < 0.0008 {
+        if t_ms > 34.5 && self.clap_tail_env < 0.0008 {
             self.clap_active = false;
         }
         (sl, sr_v)
@@ -1553,13 +1553,13 @@ impl DrumMachine {
         self.tom_p3 = (self.tom_p3 + (f1 * 2.14) / sr).fract();
 
         let head = (self.tom_p1 * TAU).sin() * self.tom_amp * 0.80
-            + (self.tom_p2 * TAU).sin() * self.tom_over_env * 0.24
-            + (self.tom_p3 * TAU).sin() * self.tom_over_env * 0.12;
-        let body = 1.35 * soft_tanh((head * (1.18 + vp.tone * 0.38) + 0.06 * head * head) / 1.35);
+            + (self.tom_p2 * TAU).sin() * self.tom_over_env * 0.16
+            + (self.tom_p3 * TAU).sin() * self.tom_over_env * 0.08;
+        let body = 1.35 * soft_tanh((head * (1.14 + vp.tone * 0.32) + 0.05 * head * head) / 1.35);
         let stick = if self.tom_crack_pos < self.pcm.snare_crack_pcm.len() {
             let s = self.pcm.snare_crack_pcm[self.tom_crack_pos];
             self.tom_crack_pos += 1;
-            s * (0.24 + vp.snappy * 0.40)
+            s * (0.14 + vp.snappy * 0.22)
         } else {
             0.0
         };
@@ -1571,7 +1571,7 @@ impl DrumMachine {
         if self.tom_amp < 0.0005 {
             self.tom_active = false;
         }
-        soft_ceiling(body + stick, 1.15, 0.35)
+        soft_ceiling((body + stick) * 0.78, 1.15, 0.35)
     }
 
     #[inline]

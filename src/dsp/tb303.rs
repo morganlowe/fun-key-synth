@@ -29,6 +29,7 @@ pub struct Tb303Synth {
     sub_lp: f32,
     dc_state: f32,
     sq_lp: f32,
+    post_lp: f32,
     od_up: HalfBandUp2x,
     od_decim: HalfBandDecim2x,
     thermal: AnalogDrift,
@@ -55,11 +56,12 @@ impl Tb303Synth {
             sample_rate: sr,
             motion_locks: MotionLocks::default(),
             slew_cutoff: 420.0,
-            slew_res: 0.72,
-            slew_drive: 0.38,
+            slew_res: 0.62,
+            slew_drive: 0.28,
             sub_lp: 0.0,
             dc_state: 0.0,
             sq_lp: 0.0,
+            post_lp: 0.0,
             od_up: HalfBandUp2x::new(),
             od_decim: HalfBandDecim2x::new(),
             thermal: AnalogDrift::new(0x0303_AC1D),
@@ -193,21 +195,24 @@ impl Tb303Synth {
         };
 
         let acc_boost = self.accent_env * params.accent;
-        let mod_oct = env_mod * self.vcf_env * 4.2 + acc_boost * 2.0;
-        let cutoff = self.slew_cutoff * (1.0 + therm * 0.015) * 2.0_f32.powf(mod_oct);
-        let filtered = self.filter.process(raw_osc * 0.95, cutoff, self.slew_res);
+        let mod_oct = env_mod.clamp(0.0, 1.0) * self.vcf_env * 2.8 + acc_boost * 1.15;
+        let max_cut = 7_500.0_f32.min(sr * 0.32);
+        let cutoff = (self.slew_cutoff * (1.0 + therm * 0.015) * 2.0_f32.powf(mod_oct))
+            .clamp(45.0, max_cut);
+        let res = (self.slew_res.clamp(0.0, 0.72) + acc_boost * 0.04).clamp(0.0, 0.76);
+        let filtered = self.filter.process(raw_osc * 0.95, cutoff, res);
 
-        // VCA + Accent gain + half-band 2x-oversampled asymmetric Boss/Roland overdrive + clean sub floor retention
-        let vca_gain = self.vca_env * self.vca_attack_env * (self.velocity + acc_boost * 0.55);
+        // VCA + Accent gain + half-band 2x-oversampled warm Boss/Roland overdrive + clean sub floor retention
+        let vca_gain = self.vca_env * self.vca_attack_env * (self.velocity + acc_boost * 0.45);
         let clean_vca = filtered * vca_gain;
         let sub_alpha = one_pole_coeff(140.0, sr);
         self.sub_lp += sub_alpha * (clean_vca - self.sub_lp);
 
-        let drive_gain = 1.0 + self.slew_drive * 7.5;
+        let drive_gain = 1.0 + self.slew_drive.clamp(0.0, 1.0) * 3.2;
         let od_step = |x: f32| -> f32 {
             let r = x * drive_gain;
-            let rc = r.clamp(-3.0, 3.0);
-            soft_tanh(r + 0.08 * rc * rc)
+            let rc = r.clamp(-2.6, 2.6);
+            soft_tanh(r + 0.06 * rc * rc)
         };
         let up = self.od_up.process(clean_vca);
         let od = self.od_decim.process(od_step(up[0]), od_step(up[1]));
@@ -215,7 +220,11 @@ impl Tb303Synth {
         self.dc_state += dc_alpha * (od - self.dc_state);
         let od_clean = od - self.dc_state;
 
-        let blend = od_clean * 0.80 + self.sub_lp * 0.42;
-        soft_ceiling(blend * (0.88 / (1.0 + self.slew_drive * 0.35)), 1.0, 0.35)
+        // Warm 5.5 kHz post-drive smoothing prevents razor-like clipped top-end fizz
+        let post_a = one_pole_coeff(5_500.0_f32.min(sr * 0.42), sr);
+        self.post_lp += post_a * (od_clean - self.post_lp);
+
+        let blend = self.post_lp * 0.78 + self.sub_lp * 0.46;
+        soft_ceiling(blend * (0.86 / (1.0 + self.slew_drive * 0.25)), 1.0, 0.35)
     }
 }

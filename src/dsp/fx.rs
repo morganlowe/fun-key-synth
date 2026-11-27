@@ -90,7 +90,9 @@ pub struct MasterFx {
     last_eq_punch: f32,
     last_eq_crisp: f32,
     comp_sc_hp: f32,
+    comp_sc_hp_r: f32,
     comp_env: f32,
+    wet_duck: f32,
     tape_up_l: HalfBandUp2x,
     tape_up_r: HalfBandUp2x,
     tape_decim_l: HalfBandDecim2x,
@@ -236,7 +238,9 @@ impl MasterFx {
             last_eq_punch: -1.0,
             last_eq_crisp: -1.0,
             comp_sc_hp: 0.0,
+            comp_sc_hp_r: 0.0,
             comp_env: 0.0,
+            wet_duck: 1.0,
             tape_up_l: HalfBandUp2x::new(),
             tape_up_r: HalfBandUp2x::new(),
             tape_decim_l: HalfBandDecim2x::new(),
@@ -277,6 +281,11 @@ impl MasterFx {
             delay_active: true,
             reverb_active: true,
         }
+    }
+
+    #[inline]
+    pub fn set_wet_duck(&mut self, duck: f32) {
+        self.wet_duck = duck.clamp(0.4, 1.0);
     }
 
     pub fn process_stereo(
@@ -516,8 +525,9 @@ impl MasterFx {
             0.0
         };
 
-        let mut xl = in_l + self.delay_tone_l * delay_mix + wet_l * reverb_mix;
-        let mut xr = in_r + self.delay_tone_r * delay_mix + wet_r * reverb_mix;
+        let wd = self.wet_duck.clamp(0.4, 1.0);
+        let mut xl = in_l + (self.delay_tone_l * delay_mix + wet_l * reverb_mix) * wd;
+        let mut xr = in_r + (self.delay_tone_r * delay_mix + wet_r * reverb_mix) * wd;
 
         // 3. Stereo Chop (rhythmic gate)
         let chop = params.chop.clamp(0.0, 1.0);
@@ -625,8 +635,8 @@ impl MasterFx {
         if (crisp - self.last_eq_crisp).abs() > 0.0005 {
             self.last_eq_crisp = crisp;
             let mud_db = -1.8 * crisp;
-            let pres_db = 2.5 * crisp;
-            let air_db = 3.0 * crisp;
+            let pres_db = 1.6 * crisp;
+            let air_db = 2.0 * crisp;
             self.eq_mud_l.set_peaking(sr, 235.0, 0.95, mud_db);
             self.eq_mud_r.set_peaking(sr, 235.0, 0.95, mud_db);
             self.eq_pres_l.set_peaking(sr, 3_000.0, 0.75, pres_db);
@@ -673,10 +683,10 @@ impl MasterFx {
 
         // 7d) SSL G-Bus Style Soft-Knee Linked Stereo Glue Compressor (24 ms attack / 95 ms release)
         if punch > 0.001 {
-            let sc_in = (xl + xr) * 0.5;
             let sc_hp_a = one_pole_coeff(120.0, sr);
-            self.comp_sc_hp += sc_hp_a * (sc_in - self.comp_sc_hp);
-            let sc_det = (sc_in - self.comp_sc_hp).abs();
+            self.comp_sc_hp += sc_hp_a * (xl - self.comp_sc_hp);
+            self.comp_sc_hp_r += sc_hp_a * (xr - self.comp_sc_hp_r);
+            let sc_det = (xl - self.comp_sc_hp).abs().max((xr - self.comp_sc_hp_r).abs());
             let env_c = if sc_det > self.comp_env {
                 1.0 - (-1.0 / (0.024 * sr)).exp()
             } else {
@@ -685,7 +695,7 @@ impl MasterFx {
             self.comp_env += env_c * (sc_det - self.comp_env);
 
             let env_db = 20.0 * self.comp_env.max(1e-6).log10();
-            let thresh_db = -6.5_f32;
+            let thresh_db = -8.0_f32;
             let knee_db = 4.0_f32;
             let ratio = 1.0 + punch * 1.5;
             let slope = 1.0 - 1.0 / ratio;
@@ -699,7 +709,7 @@ impl MasterFx {
                 -slope * over_db
             };
             let gr = 10.0_f32.powf(gr_db / 20.0);
-            let makeup = 1.0 + punch * 0.14;
+            let makeup = 1.0 + punch * 0.10;
             let glue = gr * makeup;
             xl *= glue;
             xr *= glue;
@@ -738,7 +748,7 @@ impl MasterFx {
         }
 
         // 7f) True Studio 2.5 ms Lookahead Peak Limiter
-        let punch_gain = 1.18 + crisp * 0.06 + punch * 0.08;
+        let punch_gain = 1.10 + crisp * 0.04 + punch * 0.06;
         let pre_l = xl * punch_gain;
         let pre_r = xr * punch_gain;
 
@@ -772,7 +782,7 @@ impl MasterFx {
         let lim_c = if target_g < self.lim_gain_smooth {
             one_pole_coeff(280.0, sr)
         } else {
-            one_pole_coeff(2.4, sr)
+            one_pole_coeff(4.5, sr)
         };
         self.lim_gain_smooth += lim_c * (target_g - self.lim_gain_smooth);
 

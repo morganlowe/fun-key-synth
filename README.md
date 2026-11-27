@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/morganlowe/fun-key-synth/releases/latest"><strong>⬇ Download Latest Release (v1.5.0)</strong></a>
+  <a href="https://github.com/morganlowe/fun-key-synth/releases/latest"><strong>⬇ Download Latest Release (v1.7.0)</strong></a>
   &nbsp;·&nbsp;
   <a href="#visual-tour">Screenshots</a>
   &nbsp;·&nbsp;
@@ -30,7 +30,7 @@
 
 Most DAWs and grooveboxes bury beginners under empty timelines, raw MIDI numbers, and 50 unlabeled knobs. Fun Key Synth flips that around:
 
-- **Start in a Vibe, Not a Blank Screen:** Pick one of **24 curated musical vibes** (*Deep House, Heavy Electro Funk, Lo-Fi Chill, Electro-Soul, Night Drive, Acid Club, Ambient Dub, Eurobeat, Imperial Bass, Euphoric Trance, Future Bass*, and more) and press **`Space`**. You immediately have a balanced, true-stereo, sidechained groove playing in real time.
+- **Start in a Vibe, Not a Blank Screen:** Pick one of **26 curated musical vibes** (*Deep House, Heavy Electro Funk, Lo-Fi Chill, Electro-Soul, Night Drive, Acid Club, Ambient Dub, Eurobeat, Imperial Bass, Euphoric Trance, Future Bass, Atlanta Trap, LA Hip Hop*, and more) and press **`Space`**. You immediately have a balanced, true-stereo, sidechained groove playing in real time.
 - **Impossible to Hit a Wrong Note:** Turn on **Auto-Chord** and press any key from **`A` to `K`** to play lush, voice-led 7th/9th/11th chords in key — and with **Band Follow**, the Bass and Arp automatically lock to the chords you play live.
 - **100% Local & Real-Time:** Every synth voice, drum hit, reverb tail, sample chop, and **Party DJ Mode** song arrangement is synthesized locally on your CPU with zero cloud APIs, zero subscriptions, and zero latency bloat.
 - **5 Synth Engines, 4 Drum Models & 156+ Presets:** Stay on the main **Studio** screen for 1-click presets and Vibe Macros, add up to **10 dynamic Extra Synth/Orchestral Tracks**, or dive into the **8-Part Volca Sampler** and **Sound Lab** (`Analog`, `FM-DX7`, `Mipmapped Wavetable`, `26-Bank Philharmonia Orchestra`, `SF2 SoundFont`, `808 / 909 / Acoustic / 80s Linn` drums, searchable preset browser, favorites & custom User Patch saving, plus `Ctrl+Z` / `Ctrl+Y` Undo/Redo).
@@ -42,11 +42,11 @@ Most DAWs and grooveboxes bury beginners under empty timelines, raw MIDI numbers
 Prebuilt packages for **Debian/Ubuntu (`.deb`)**, **Fedora / RHEL / openSUSE (`.rpm`)**, **Arch Linux / CachyOS (`.pkg.tar.zst`)**, **Windows (`.zip`)**, and **Generic Linux (`.tar.gz`)** are available on the **[GitHub Releases](https://github.com/morganlowe/fun-key-synth/releases/latest)** page.
 
 - **Download & full release notes:** [github.com/morganlowe/fun-key-synth/releases](https://github.com/morganlowe/fun-key-synth/releases/latest)
-- **Debian / Ubuntu:** `sudo apt install ./fun-key-synth_1.5.0-1_amd64.deb`
-- **Fedora / RHEL / openSUSE:** `sudo dnf install ./fun-key-synth-1.5.0-1.x86_64.rpm` (or `sudo zypper install ./fun-key-synth-1.5.0-1.x86_64.rpm`)
-- **Arch / CachyOS:** `sudo pacman -U fun-key-synth-1.5.0-1-x86_64.pkg.tar.zst`
+- **Debian / Ubuntu:** `sudo apt install ./fun-key-synth_1.7.0-1_amd64.deb`
+- **Fedora / RHEL / openSUSE:** `sudo dnf install ./fun-key-synth-1.7.0-1.x86_64.rpm` (or `sudo zypper install ./fun-key-synth-1.7.0-1.x86_64.rpm`)
+- **Arch / CachyOS:** `sudo pacman -U fun-key-synth-1.7.0-1-x86_64.pkg.tar.zst`
 - **Windows:** Unzip `fun-key-synth-windows-x86_64.zip` and run `fun-key-synth.exe`
-- **Generic Linux:** Extract `fun-key-synth-v1.5.0-linux-x86_64.tar.gz` and run `./fun-key-synth`
+- **Generic Linux:** Extract `fun-key-synth-v1.7.0-linux-x86_64.tar.gz` and run `./fun-key-synth`
 
 <details>
 <summary><strong>Building from source (Rust / Cargo)</strong></summary>
@@ -59,7 +59,7 @@ cd fun-key-synth
 cargo run --release
 ```
 
-To run the audio engine unit tests (which render stereo buffers across all 24 vibes and Party Mode and verify zero NaNs or hard clipping):
+To run the audio engine unit tests (which render stereo buffers across all 26 vibes and Party Mode and verify zero NaNs or hard clipping):
 
 ```sh
 cargo test --release
@@ -83,7 +83,7 @@ Inspired by the **Korg Volca Sample 2**: load **MP3, WAV, FLAC, or OGG** files o
 
 ### 3. Arrange & Party — Local DJ Mixer, Up-Next Deck & Full Song Arranger
 ![Arrange and Party Mode](docs/screenshots/arrange-party.png)
-Flip on **Party DJ Mode** to let Fun Key Synth act as a local live DJ/producer — mixing smoothly across **Genre Crates** (*Club 4x4, Chill / Lo-Fi, 80s / Synth, Heavy Bass, Related, Custom Crate, All 24*) with **Smart Tempo Bridging**, an **Up Next** preview & queue deck, and **Capture Song → Studio** to save any generated banger into your editable arrangement — or hit **Auto-Arrange Loop → Song** to turn your Studio groove into a multi-pattern, multi-section track ready for WAV or **Stereo Stem Export**.
+Flip on **Party DJ Mode** to let Fun Key Synth act as a local live DJ/producer — mixing smoothly across **Genre Crates** (*Club 4x4, Chill / Lo-Fi, 80s / Synth, Heavy Bass, Hip-Hop & Rap, Related, Custom Crate, All Vibes*) with **Smart Tempo Bridging**, an **Up Next** preview & queue deck, and **Capture Song → Studio** to save any generated banger into your editable arrangement — or hit **Auto-Arrange Loop → Song** to turn your Studio groove into a multi-pattern, multi-section track ready for WAV or **Stereo Stem Export**.
 
 ### 4. Sound Lab — Multi-Engine Hardware Synths, Preset Browser & Stereo FX Rack
 ![Sound Lab View](docs/screenshots/sound-lab.png)
@@ -94,7 +94,7 @@ Dive under the hood for full synthesis controls across **5 Engines** (`Analog`, 
 ## What It Does
 
 <details open>
-<summary><strong>Curated Musical Vibes (24 Genres Including Imperial Bass & Eurobeat)</strong></summary>
+<summary><strong>Curated Musical Vibes (26 Genres Including Atlanta Trap, LA Hip Hop, Imperial Bass & Eurobeat)</strong></summary>
 
 Each Vibe configures tempo, swing, musical scale, a curated 4-bar chord progression, voice presets across all 6 tracks, stereo panning, sidechain depth, and delay/reverb sweet spots:
 
@@ -108,6 +108,8 @@ Each Vibe configures tempo, swing, musical scale, a curated 4-bar chord progress
 | **Acid Club** | 128 | 54% | Hypnotic TB-303 accented & slided acid lines, crisp 909 hats/rides, driving club kick, dark dub stabs |
 | **Ambient Dub** | 108 | 53% | Spacious offbeat dub chords echoing through ping-pong dotted-8th delay and huge stereo reverb over a deep sub pulse |
 | **Imperial Bass** | 126 | 51% | Cinematic bass / melodic techno in E minor — colossal orchestral brass stabs, rolling 16th sub gallop, staccato strings & crisp 909 highs |
+| **Atlanta Trap** | 138 | 52% | Half-time ATL trap in F harmonic minor — beat-3 snare/clap crack, 32nd hi-hat rolls, dark tape bed, flute lead & sliding 808 sub |
+| **LA Hip Hop** | 94 | 60% | West Coast G-Funk bounce in G Dorian — singing portamento Triangle whistle lead, fat Moog sub, Wurlitzer stabs & crisp clap |
 
 Click **`Fresh Groove`** anytime to roll a brand-new beat and chord/melody variation inside your current Vibe.
 
@@ -219,7 +221,7 @@ Every audio sample is rendered in real time by the lock-minimal stereo engine in
 | :--- | :--- |
 | [`src/main.rs`](src/main.rs) | Native `eframe` entry point, Tokio reactor for Linux `xdg-portal` dialogs, Wayland `app_id`, embedded Bear Paw icon |
 | [`src/engine.rs`](src/engine.rs) | Real-time stereo audio engine, swing clock, sidechain ducking, Party Mode director, live event queue, offline WAV export |
-| [`src/model/vibe.rs`](src/model/vibe.rs) | The musical brain: 7 Vibes, 8 voice-led chord progressions, Auto-Beat & Auto-Chord generators, instant voice presets |
+| [`src/model/vibe.rs`](src/model/vibe.rs) | The musical brain: 26 Vibes, 23 voice-led chord progressions, Auto-Beat & Auto-Chord generators, instant voice presets |
 | [`src/model/project.rs`](src/model/project.rs) | Serializable project state, synth/drum/sampler/Volca 8-part params, Song Sections, JSON save/load |
 | [`src/model/sequencer.rs`](src/model/sequencer.rs) | 64-step melodic & drum/sample patterns, 9th/11th chord types, motion locks, step ratchets |
 | [`src/dsp/`](src/dsp/mod.rs) | Moog, Monologue, TB-303, 808/909 Drums, Volca/SK-1 Sampler, and Stereo Master FX |

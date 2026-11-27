@@ -442,6 +442,7 @@ impl WavetableSynth {
 
         let mut mix_l = 0.0_f32;
         let mut mix_r = 0.0_f32;
+        let mut poly_env_sum = 0.0_f32;
 
         for v in &mut self.voices {
             if !v.active {
@@ -568,7 +569,7 @@ impl WavetableSynth {
             let cl = fl - v.dc_l;
             let cr = fr - v.dc_r;
 
-            let amp = a_env * (v.velocity + v.accent * 0.22) * if poly_mode { 0.50 } else { 0.72 };
+            let amp = a_env * (v.velocity + v.accent * 0.22) * if poly_mode { 0.56 } else { 0.72 };
             if !poly_mode {
                 let mid = (cl + cr) * 0.5;
                 let side = (cl - cr) * 0.5;
@@ -580,9 +581,16 @@ impl WavetableSynth {
                 let p = (v.pan * 0.4 + 0.5).clamp(0.0, 1.0);
                 let pl = (1.0 - p).sqrt() * 1.4142;
                 let pr = p.sqrt() * 1.4142;
+                poly_env_sum += a_env;
                 mix_l += cl * amp * pl;
                 mix_r += cr * amp * pr;
             }
+        }
+
+        if poly_mode && poly_env_sum > 1.0 {
+            let norm = 1.0 / poly_env_sum.powf(0.20);
+            mix_l *= norm;
+            mix_r *= norm;
         }
 
         let (mut out_l, mut out_r) = (mix_l, mix_r);

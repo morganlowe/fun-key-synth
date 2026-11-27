@@ -13,7 +13,8 @@ use crate::{
         capture_party_song_to_project, detect_chord_from_notes, generate_auto_beat,
         generate_extra_track_seq, generate_melodic_tracks, generate_philharmonia_track_seq,
         load_pattern, load_project, note_name, root_name, save_pattern, save_project,
-        voice_preset_category, voice_preset_names, ArpMode, ArpRate, AutoChordPad, ChordType,
+        vibe_progressions, voice_preset_category, voice_preset_names, ArpMode, ArpRate,
+        AutoChordPad, ChordType,
         ClockDiv, DelayDivision, DrumModel, DrumVoiceId, EgTarget, ExtraTrack, FilterEnvTrigger,
         GlobalFilterMode, LfoMode, LfoTarget, LfoWave, LoopMode, MidiCcMapping, MidiCcTarget,
         MonologueOscWave, MoogWave, Osc2ModMode, PartyMixMode, PartyPace, Project, SamplerMode,
@@ -124,6 +125,8 @@ pub struct FunKeySynthApp {
     midi_bend_val: f32,
     midi_aftertouch_val: f32,
     last_midi_cc: Option<(u8, f32)>,
+    vibe_category: usize,
+    last_seen_vibe: Vibe,
 }
 
 fn key_pressed_no_repeat(i: &egui::InputState, key: Key) -> bool {
@@ -294,6 +297,8 @@ impl FunKeySynthApp {
             midi_bend_val: 0.0,
             midi_aftertouch_val: 0.0,
             last_midi_cc: None,
+            vibe_category: 0,
+            last_seen_vibe: Vibe::DeepHouse,
         }
     }
 
@@ -3203,11 +3208,94 @@ impl FunKeySynthApp {
         accent: Color32,
         theme: StudioTheme,
     ) {
-        // 1. VIBE PICKER STRIP
+        const VIBE_CATEGORIES: [(&str, &[Vibe]); 6] = [
+            (
+                "Club",
+                &[
+                    Vibe::DeepHouse,
+                    Vibe::AcidClub,
+                    Vibe::DetroitTechno,
+                    Vibe::UkGarage,
+                    Vibe::BigRoomEdm,
+                    Vibe::EuphoricTrance,
+                    Vibe::Eurobeat,
+                ],
+            ),
+            (
+                "Hip-Hop",
+                &[
+                    Vibe::BoomBap,
+                    Vibe::Trap808,
+                    Vibe::AtlantaTrap,
+                    Vibe::LaWestCoast,
+                ],
+            ),
+            (
+                "Chill",
+                &[
+                    Vibe::LofiChill,
+                    Vibe::NeoSoul,
+                    Vibe::ElectroSoul,
+                    Vibe::DreamPop,
+                    Vibe::AmbientDub,
+                ],
+            ),
+            (
+                "80s / Funk",
+                &[
+                    Vibe::ElectroFunk,
+                    Vibe::Synthwave,
+                    Vibe::Disco70s,
+                    Vibe::Arena80s,
+                    Vibe::ItaloCosmic,
+                    Vibe::IndieRock,
+                ],
+            ),
+            (
+                "Heavy Bass",
+                &[
+                    Vibe::ImperialBass,
+                    Vibe::Dubstep,
+                    Vibe::FutureBass,
+                    Vibe::JungleDnb,
+                ],
+            ),
+            ("All", &Vibe::ALL),
+        ];
+        if self.last_seen_vibe != proj.vibe {
+            self.last_seen_vibe = proj.vibe;
+            if self.vibe_category < 5 {
+                if let Some(cat_i) = VIBE_CATEGORIES[..5]
+                    .iter()
+                    .position(|(_, list)| list.contains(&proj.vibe))
+                {
+                    self.vibe_category = cat_i;
+                }
+            }
+        }
+        let cat_idx = self.vibe_category.min(VIBE_CATEGORIES.len() - 1);
+
+        // 1. VIBE PICKER STRIP (Categorized for fast, clutter-free Studio layout)
         card_frame(ui, theme, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("VIBE:").strong().size(12.5).color(Color32::from_rgb(175, 185, 208)));
-                for &vibe in &Vibe::ALL {
+                for (ci, &(cname, _)) in VIBE_CATEGORIES.iter().enumerate() {
+                    let sel = cat_idx == ci;
+                    let cbtn = egui::Button::new(
+                        RichText::new(cname)
+                            .strong()
+                            .size(11.5)
+                            .color(if sel { Color32::from_rgb(12, 14, 20) } else { Color32::from_rgb(170, 182, 205) }),
+                    )
+                    .fill(if sel { accent } else { Color32::from_rgb(22, 26, 38) })
+                    .stroke(Stroke::new(1.0_f32, if sel { accent } else { Color32::from_rgb(40, 48, 66) }));
+                    if ui.add(cbtn).clicked() {
+                        self.vibe_category = ci;
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for &vibe in VIBE_CATEGORIES[cat_idx].1 {
                     let active = proj.vibe == vibe;
                     let vc = vibe_color(vibe);
                     let btn = egui::Button::new(
@@ -3221,10 +3309,17 @@ impl FunKeySynthApp {
                     if ui.add(btn).on_hover_text(vibe.tagline()).clicked() {
                         let seed = self.next_seed();
                         apply_vibe_to_project(proj, vibe, None, seed);
+                        self.last_seen_vibe = vibe;
                     }
                 }
-                ui.separator();
-
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("CHORD:")
+                        .strong()
+                        .size(12.0)
+                        .color(Color32::from_rgb(165, 178, 204)),
+                );
                 // Chord Progression Picker
                 egui::ComboBox::from_id_salt("prog_picker")
                     .width(210.0)
@@ -3252,7 +3347,7 @@ impl FunKeySynthApp {
                         }
                     });
 
-                // 1-Click Roll Fresh Vibe!
+                // 1-Click Roll Fresh Vibe! (Cycles curated genre-matched progressions)
                 let roll_btn = egui::Button::new(
                     RichText::new("Fresh Groove")
                         .strong()
@@ -3266,7 +3361,12 @@ impl FunKeySynthApp {
                     .clicked()
                 {
                     let seed = self.next_seed();
-                    let next_prog = (proj.progression_idx + 1) % PROGRESSIONS.len();
+                    let v_progs = vibe_progressions(proj.vibe);
+                    let cur_pos = v_progs
+                        .iter()
+                        .position(|&pi| pi == proj.progression_idx)
+                        .unwrap_or(0);
+                    let next_prog = v_progs[(cur_pos + 1) % v_progs.len().max(1)];
                     apply_vibe_to_project(proj, proj.vibe, Some(next_prog), seed);
                 }
             });
@@ -3342,6 +3442,7 @@ impl FunKeySynthApp {
             let mut add_phil_bank: Option<u8> = None;
             let mut add_core = false;
 
+            let dj_trim_active = proj.party_mode && proj.party_sound_morph;
             let show_header_title = |ui: &mut egui::Ui| {
                 ui.label(
                     RichText::new(format!("STUDIO TRACKS ({total_tracks}/{})", 6 + MAX_EXTRA_TRACKS))
@@ -3349,6 +3450,15 @@ impl FunKeySynthApp {
                         .size(12.5)
                         .color(accent),
                 );
+                if dj_trim_active {
+                    ui.label(
+                        RichText::new("[DJ TRIM]")
+                            .strong()
+                            .size(10.5)
+                            .color(Color32::from_rgb(244, 148, 212)),
+                    )
+                    .on_hover_text("Party DJ morphs instruments automatically — faders, Mute & Solo stay live as mix trims");
+                }
             };
             if ui.available_width() >= 330.0 {
                 ui.horizontal(|ui| {
@@ -5748,7 +5858,7 @@ impl FunKeySynthApp {
                     ui.spacing_mut().item_spacing = Vec2::new(4.0, 3.0);
                     ui.label(RichText::new("Custom Crate:").size(11.0).weak());
                     if ui.small_button("All").clicked() {
-                        proj.party_crate_mask = 0x00FF_FFFF;
+                        proj.party_crate_mask = 0xFFFF_FFFF;
                     }
                     if ui.small_button("None").clicked() {
                         proj.party_crate_mask = 0;

@@ -184,16 +184,6 @@ enum PendingTrigger {
         vel: f32,
         accent: bool,
     },
-    MonoNote {
-        note: u8,
-        prev_note: Option<u8>,
-        vel: f32,
-        accent: bool,
-        slide: bool,
-        motion: MotionLocks,
-        party_rig_cut: bool,
-        gate_samples: f32,
-    },
     Melodic32 {
         target: ArpTarget,
         note: u8,
@@ -321,6 +311,8 @@ struct StudioChannelEq {
     samp_air: BiquadPair,
     pad_hp: BiquadPair,
     pad_carve: BiquadPair,
+    drum_mud: BiquadPair,
+    drum_snap: BiquadPair,
 }
 
 impl StudioChannelEq {
@@ -340,6 +332,8 @@ impl StudioChannelEq {
             samp_air: BiquadPair::new(),
             pad_hp: BiquadPair::new(),
             pad_carve: BiquadPair::new(),
+            drum_mud: BiquadPair::new(),
+            drum_snap: BiquadPair::new(),
         };
         eq.configure(sr);
         eq
@@ -352,18 +346,21 @@ impl StudioChannelEq {
 
         self.lead_hp.set_highpass(sr, 130.0, 0.7071);
         self.lead_body.set_peaking(sr, 480.0, 1.0, 1.2);
-        self.lead_pres_cut.set_peaking(sr, 3400.0, 1.6, -1.6);
-        self.lead_shelf.set_high_shelf(sr, 8500.0, 0.7071, -1.6);
+        self.lead_pres_cut.set_peaking(sr, 3200.0, 1.3, -2.6);
+        self.lead_shelf.set_high_shelf(sr, 7500.0, 0.7071, -2.4);
 
         self.acid_hp.set_highpass(sr, 110.0, 0.7071);
-        self.acid_bite.set_peaking(sr, 1600.0, 1.2, 1.1);
+        self.acid_bite.set_peaking(sr, 2800.0, 1.2, -2.0);
 
         self.samp_hp.set_highpass(sr, 90.0, 0.7071);
         self.samp_warmth.set_peaking(sr, 240.0, 1.0, 0.8);
         self.samp_air.set_peaking(sr, 7500.0, 0.9, 0.8);
 
         self.pad_hp.set_highpass(sr, 120.0, 0.7071);
-        self.pad_carve.set_peaking(sr, 1800.0, 1.1, -1.8);
+        self.pad_carve.set_peaking(sr, 2200.0, 1.0, -2.4);
+
+        self.drum_mud.set_peaking(sr, 300.0, 1.1, -1.6);
+        self.drum_snap.set_high_shelf(sr, 5500.0, 0.75, 0.6);
     }
 
     #[inline]
@@ -402,20 +399,34 @@ impl StudioChannelEq {
         let side = (l - r) * 0.5 * 1.10;
         (mid + side, mid - side)
     }
+
+    #[inline]
+    fn process_drums(&mut self, s: (f32, f32)) -> (f32, f32) {
+        let s = self.drum_mud.process(s);
+        self.drum_snap.process(s)
+    }
 }
 
 #[inline]
 fn groove_pocket_scale(vibe: Vibe) -> f32 {
     match vibe {
+        // Quantized club, EDM, and modern trap/Atlanta grooves lock tightly to the grid
         Vibe::DetroitTechno
         | Vibe::Eurobeat
         | Vibe::EuphoricTrance
         | Vibe::BigRoomEdm
-        | Vibe::ImperialBass => 0.45,
-        Vibe::Arena80s | Vibe::Synthwave | Vibe::ItaloCosmic | Vibe::Disco70s | Vibe::Dubstep => {
-            0.75
-        }
-        _ => 1.0,
+        | Vibe::ImperialBass
+        | Vibe::Trap808
+        | Vibe::AtlantaTrap
+        | Vibe::AcidClub => 0.0,
+        // Laid-back hip-hop, West Coast, Neo-Soul, and Funk have a subtle cohesive pocket
+        Vibe::BoomBap
+        | Vibe::LaWestCoast
+        | Vibe::LofiChill
+        | Vibe::NeoSoul
+        | Vibe::ElectroFunk
+        | Vibe::UkGarage => 0.35,
+        _ => 0.18,
     }
 }
 
@@ -555,7 +566,7 @@ const PARTY_TMPL_CLUB: [PartySectionDef; 7] = [
         snare_build_last_bar: false,
         drop_on_start: false,
         energy_mul: 0.55,
-        evolve_progression: true,
+        evolve_progression: false,
         space_throw: 0.14,
         lead_brightness: 0.45,
         acid_intensity: 0.25,
@@ -657,7 +668,7 @@ const PARTY_TMPL_GROOVE_SOLO: [PartySectionDef; 6] = [
         snare_build_last_bar: false,
         drop_on_start: false,
         energy_mul: 0.78,
-        evolve_progression: true,
+        evolve_progression: false,
         space_throw: 0.08,
         lead_brightness: 0.55,
         acid_intensity: 0.35,
@@ -745,7 +756,7 @@ const PARTY_TMPL_HYPNOTIC: [PartySectionDef; 7] = [
         snare_build_last_bar: false,
         drop_on_start: false,
         energy_mul: 0.48,
-        evolve_progression: true,
+        evolve_progression: false,
         space_throw: 0.38,
         lead_brightness: 0.48,
         acid_intensity: 0.20,
@@ -847,7 +858,7 @@ const PARTY_TMPL_VERSE_HOOK: [PartySectionDef; 6] = [
         snare_build_last_bar: false,
         drop_on_start: false,
         energy_mul: 0.90,
-        evolve_progression: true,
+        evolve_progression: false,
         space_throw: 0.04,
         lead_brightness: 0.82,
         acid_intensity: 0.55,
@@ -925,12 +936,238 @@ const PARTY_TMPL_VERSE_HOOK: [PartySectionDef; 6] = [
     },
 ];
 
-const PARTY_TEMPLATES: [&[PartySectionDef]; 4] = [
+// Template 4: Hip-Hop / Trap / Pocket (20 bars at Normal pace — lean space for groove & hooks)
+const PARTY_TMPL_HIPHOP_POCKET: [PartySectionDef; 7] = [
+    PartySectionDef {
+        name: "INTRO",
+        bars: 2,
+        mask: 0b000101,
+        filter_sweep: PartyFilterSweep::LowPassOpen,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.55,
+        evolve_progression: false,
+        space_throw: 0.12,
+        lead_brightness: 0.48,
+        acid_intensity: 0.20,
+        turnaround_fx: false,
+    },
+    PartySectionDef {
+        name: "HOOK 1",
+        bars: 4,
+        mask: 0b001111,
+        filter_sweep: PartyFilterSweep::None,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.92,
+        evolve_progression: false,
+        space_throw: 0.04,
+        lead_brightness: 0.82,
+        acid_intensity: 0.30,
+        turnaround_fx: false,
+    },
+    PartySectionDef {
+        name: "VERSE",
+        bars: 4,
+        mask: 0b000111,
+        filter_sweep: PartyFilterSweep::None,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.78,
+        evolve_progression: false,
+        space_throw: 0.08,
+        lead_brightness: 0.55,
+        acid_intensity: 0.25,
+        turnaround_fx: true,
+    },
+    PartySectionDef {
+        name: "PRE-HOOK",
+        bars: 2,
+        mask: 0b001101,
+        filter_sweep: PartyFilterSweep::LowPassOpen,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.86,
+        evolve_progression: true,
+        space_throw: 0.24,
+        lead_brightness: 0.78,
+        acid_intensity: 0.35,
+        turnaround_fx: true,
+    },
+    PartySectionDef {
+        name: "HOOK 2",
+        bars: 4,
+        mask: 0b101111,
+        filter_sweep: PartyFilterSweep::None,
+        snare_build_last_bar: false,
+        drop_on_start: true,
+        energy_mul: 1.04,
+        evolve_progression: false,
+        space_throw: 0.0,
+        lead_brightness: 0.96,
+        acid_intensity: 0.45,
+        turnaround_fx: true,
+    },
+    PartySectionDef {
+        name: "BRIDGE",
+        bars: 2,
+        mask: 0b001100,
+        filter_sweep: PartyFilterSweep::AtmosBreath,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.48,
+        evolve_progression: true,
+        space_throw: 0.34,
+        lead_brightness: 0.54,
+        acid_intensity: 0.25,
+        turnaround_fx: false,
+    },
+    PartySectionDef {
+        name: "OUTRO",
+        bars: 2,
+        mask: 0b000111,
+        filter_sweep: PartyFilterSweep::LowPassClose,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.58,
+        evolve_progression: false,
+        space_throw: 0.30,
+        lead_brightness: 0.40,
+        acid_intensity: 0.20,
+        turnaround_fx: false,
+    },
+];
+
+// Template 5: Minimal Acid / Techno (20 bars at Normal pace — hypnotic 303 + drums lock)
+const PARTY_TMPL_MINIMAL_ACID: [PartySectionDef; 7] = [
+    PartySectionDef {
+        name: "INTRO",
+        bars: 2,
+        mask: 0b000101,
+        filter_sweep: PartyFilterSweep::LowPassOpen,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.55,
+        evolve_progression: false,
+        space_throw: 0.16,
+        lead_brightness: 0.45,
+        acid_intensity: 0.35,
+        turnaround_fx: false,
+    },
+    PartySectionDef {
+        name: "HYPNO LOCK",
+        bars: 4,
+        mask: 0b010011,
+        filter_sweep: PartyFilterSweep::None,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.84,
+        evolve_progression: false,
+        space_throw: 0.06,
+        lead_brightness: 0.65,
+        acid_intensity: 0.72,
+        turnaround_fx: false,
+    },
+    PartySectionDef {
+        name: "ACID BUILD",
+        bars: 2,
+        mask: 0b010101,
+        filter_sweep: PartyFilterSweep::HighPassRise,
+        snare_build_last_bar: true,
+        drop_on_start: false,
+        energy_mul: 0.92,
+        evolve_progression: true,
+        space_throw: 0.34,
+        lead_brightness: 0.82,
+        acid_intensity: 0.85,
+        turnaround_fx: true,
+    },
+    PartySectionDef {
+        name: "ACID DROP",
+        bars: 4,
+        mask: 0b010111,
+        filter_sweep: PartyFilterSweep::None,
+        snare_build_last_bar: false,
+        drop_on_start: true,
+        energy_mul: 1.04,
+        evolve_progression: false,
+        space_throw: 0.0,
+        lead_brightness: 0.94,
+        acid_intensity: 0.95,
+        turnaround_fx: true,
+    },
+    PartySectionDef {
+        name: "STRIP BREAK",
+        bars: 2,
+        mask: 0b010100,
+        filter_sweep: PartyFilterSweep::AtmosBreath,
+        snare_build_last_bar: true,
+        drop_on_start: false,
+        energy_mul: 0.48,
+        evolve_progression: true,
+        space_throw: 0.40,
+        lead_brightness: 0.52,
+        acid_intensity: 0.65,
+        turnaround_fx: false,
+    },
+    PartySectionDef {
+        name: "PEAK CLIMAX",
+        bars: 4,
+        mask: 0b011111,
+        filter_sweep: PartyFilterSweep::None,
+        snare_build_last_bar: false,
+        drop_on_start: true,
+        energy_mul: 1.08,
+        evolve_progression: false,
+        space_throw: 0.0,
+        lead_brightness: 1.0,
+        acid_intensity: 1.0,
+        turnaround_fx: true,
+    },
+    PartySectionDef {
+        name: "OUTRO",
+        bars: 2,
+        mask: 0b000011,
+        filter_sweep: PartyFilterSweep::LowPassClose,
+        snare_build_last_bar: false,
+        drop_on_start: false,
+        energy_mul: 0.56,
+        evolve_progression: false,
+        space_throw: 0.34,
+        lead_brightness: 0.38,
+        acid_intensity: 0.40,
+        turnaround_fx: true,
+    },
+];
+
+const PARTY_TEMPLATES: [&[PartySectionDef]; 6] = [
     &PARTY_TMPL_CLUB,
     &PARTY_TMPL_GROOVE_SOLO,
     &PARTY_TMPL_HYPNOTIC,
     &PARTY_TMPL_VERSE_HOOK,
+    &PARTY_TMPL_HIPHOP_POCKET,
+    &PARTY_TMPL_MINIMAL_ACID,
 ];
+
+const fn vibe_party_templates(vibe: Vibe) -> &'static [usize] {
+    match vibe {
+        Vibe::AtlantaTrap
+        | Vibe::Trap808
+        | Vibe::LaWestCoast
+        | Vibe::BoomBap
+        | Vibe::LofiChill
+        | Vibe::NeoSoul => &[4, 3],
+        Vibe::AcidClub | Vibe::DetroitTechno => &[5, 1, 2],
+        Vibe::AmbientDub | Vibe::DreamPop => &[2, 4],
+        Vibe::DeepHouse
+        | Vibe::UkGarage
+        | Vibe::ElectroSoul
+        | Vibe::Synthwave
+        | Vibe::IndieRock
+        | Vibe::JungleDnb => &[0, 2, 3],
+        _ => &[0, 1, 2, 3],
+    }
+}
 
 #[inline]
 fn scaled_section_bars(base_bars: usize, pace: PartyPace) -> usize {
@@ -1080,6 +1317,9 @@ struct Runtime {
     party_acid_target: f32,
     party_repeat_fx: f32,
     party_glitch_fx: f32,
+    sec_track_gain: [f32; 6],
+    sec_track_target: [f32; 6],
+    party_fader_ref: [f32; 6],
     // Motion automation live playback overrides
     auto_filter: Option<f32>,
     auto_space: Option<f32>,
@@ -1214,6 +1454,9 @@ impl Runtime {
             party_acid_target: 0.35,
             party_repeat_fx: 0.0,
             party_glitch_fx: 0.0,
+            sec_track_gain: [1.0; 6],
+            sec_track_target: [1.0; 6],
+            party_fader_ref: [0.72, 0.80, 0.68, 0.82, 0.64, 0.74],
             auto_filter: None,
             auto_space: None,
             auto_sidechain: None,
@@ -1323,19 +1566,21 @@ impl Runtime {
             self.party_rig_reroll,
         );
 
-        // Pick a fresh song arrangement template that differs from the previous song
+        // Pick a fresh genre-matched song arrangement template that differs from the previous song
         let prev_tmpl = self.party_template_idx;
+        let pool = vibe_party_templates(song_vibe);
         let h = p
             .party_seed
             .wrapping_add(self.party_cycle.wrapping_mul(2654435761))
             ^ ((song_vibe as u32).wrapping_mul(193));
         let mut tmpl_idx = if self.party_cycle == 0 {
-            0
+            pool[0]
         } else {
-            (h as usize) % PARTY_TEMPLATES.len()
+            pool[(h as usize) % pool.len()]
         };
-        if self.party_cycle > 0 && tmpl_idx == prev_tmpl {
-            tmpl_idx = (tmpl_idx + 1) % PARTY_TEMPLATES.len();
+        if self.party_cycle > 0 && pool.len() > 1 && tmpl_idx == prev_tmpl {
+            let pos = pool.iter().position(|&idx| idx == tmpl_idx).unwrap_or(0);
+            tmpl_idx = pool[(pos + 1) % pool.len()];
         }
         self.party_template_idx = tmpl_idx;
 
@@ -1812,6 +2057,7 @@ impl Runtime {
                             rig.tb303 = tmp.tb303;
                             rig.voice_presets[4] = tmp.voice_presets[4];
                             rig.enable_303 = true;
+                            rig.ensemble_mask |= 0b010000;
                             self.acid.clear_motion_locks();
                         }
                         TrackId::Sampler => {
@@ -1819,6 +2065,7 @@ impl Runtime {
                             rig.sampler_builtin_id = tmp.sample_data.builtin_id;
                             rig.voice_presets[5] = tmp.voice_presets[5];
                             rig.enable_sampler = true;
+                            rig.ensemble_mask |= 0b100000;
                             self.sampler.clear_motion_locks();
                         }
                         TrackId::MidiOut => {}
@@ -2357,7 +2604,7 @@ impl Runtime {
             (p.bpm, p.swing)
         };
         let base_step = (60.0 / bpm.clamp(40.0, 240.0) / 4.0) * self.sr;
-        let swing_ratio = (swing * 0.64).clamp(0.0, 0.30);
+        let swing_ratio = (swing * 0.58).clamp(0.0, 0.28);
         if step_index % 2 == 0 {
             base_step * (1.0 + swing_ratio)
         } else {
@@ -2396,6 +2643,14 @@ impl Runtime {
                 self.party_rig_custom = false;
                 self.party_rig = None;
                 self.party_forced_vibe = None;
+                self.party_fader_ref = [
+                    p.mixer.channels[0].volume.max(0.15),
+                    p.mixer.channels[1].volume.max(0.15),
+                    p.mixer.channels[2].volume.max(0.15),
+                    p.mixer.channels[3].volume.max(0.15),
+                    p.mixer.channels[4].volume.max(0.15),
+                    p.mixer.moog_pad_volume.max(0.15),
+                ];
             }
             self.last_base_vibe = Some(p.vibe);
             self.ensure_party_rig(p);
@@ -2420,18 +2675,25 @@ impl Runtime {
                         self.party_rig_custom = false;
                         self.party_rig = None;
                         self.ensure_party_rig(p);
-                        let new_root = self.party_dj_root(p);
-                        let drums_p = self
-                            .party_rig
-                            .as_ref()
-                            .map(|r| r.drums.clone())
-                            .unwrap_or_else(|| p.drums.clone());
-                        self.trigger_drop_impact(
-                            new_root,
-                            p.drop_macro.impact_intensity.max(0.8),
-                            &drums_p,
-                            true,
-                        );
+                        let new_tmpl = PARTY_TEMPLATES[self.party_template_idx % PARTY_TEMPLATES.len()];
+                        let new_first = &new_tmpl[0];
+                        if new_first.drop_on_start || new_first.energy_mul >= 0.85 {
+                            let new_root = self.party_dj_root(p);
+                            let drums_p = self
+                                .party_rig
+                                .as_ref()
+                                .map(|r| r.drums.clone())
+                                .unwrap_or_else(|| p.drums.clone());
+                            self.trigger_drop_impact(
+                                new_root,
+                                p.drop_macro.impact_intensity.max(0.8),
+                                &drums_p,
+                                true,
+                            );
+                        } else {
+                            self.drop_whoosh_env = self.drop_whoosh_env.max(0.45);
+                            self.party_space_boost = self.party_space_boost.max(0.36);
+                        }
                     }
                     let next_tmpl = PARTY_TEMPLATES[self.party_template_idx % PARTY_TEMPLATES.len()];
                     let next_sec = &next_tmpl[self.party_section_idx % next_tmpl.len()];
@@ -2501,6 +2763,11 @@ impl Runtime {
             }
             active_bpm = self.party_live_bpm.clamp(40.0, 240.0);
             section_mask = sec.mask;
+            if p.party_sound_morph || self.party_rig_custom {
+                if let Some(rig) = &self.party_rig {
+                    section_mask &= rig.ensemble_mask;
+                }
+            }
             party_section_energy = (p.party_energy * sec.energy_mul).clamp(0.18, 1.0);
             sec_lead_bright = sec.lead_brightness;
             if p.party_energy < 0.35 {
@@ -2510,22 +2777,22 @@ impl Runtime {
                 PartyFilterSweep::LowPassOpen => {
                     self.party_filter_target_hz = 750.0 * (18_000.0_f32 / 750.0).powf(bar_progress);
                     self.party_filter_mode = GlobalFilterMode::LowPass;
-                    self.party_filter_res_boost = 0.24;
+                    self.party_filter_res_boost = 0.08;
                 }
                 PartyFilterSweep::LowPassClose => {
-                    self.party_filter_target_hz = 16_000.0 * (700.0_f32 / 16_000.0).powf(bar_progress);
+                    self.party_filter_target_hz = 16_000.0 * (1100.0_f32 / 16_000.0).powf(bar_progress);
                     self.party_filter_mode = GlobalFilterMode::LowPass;
-                    self.party_filter_res_boost = 0.26;
+                    self.party_filter_res_boost = 0.08;
                 }
                 PartyFilterSweep::HighPassRise => {
-                    self.party_filter_target_hz = 55.0 * (950.0_f32 / 55.0).powf(bar_progress);
+                    self.party_filter_target_hz = 55.0 * (750.0_f32 / 55.0).powf(bar_progress);
                     self.party_filter_mode = GlobalFilterMode::HighPass;
-                    self.party_filter_res_boost = 0.30;
+                    self.party_filter_res_boost = 0.10;
                 }
                 PartyFilterSweep::AtmosBreath => {
-                    self.party_filter_target_hz = 1100.0 * (14_000.0_f32 / 1100.0).powf(bar_progress);
+                    self.party_filter_target_hz = 1200.0 * (14_000.0_f32 / 1200.0).powf(bar_progress);
                     self.party_filter_mode = GlobalFilterMode::LowPass;
-                    self.party_filter_res_boost = 0.18;
+                    self.party_filter_res_boost = 0.06;
                 }
                 PartyFilterSweep::None => {
                     self.party_filter_target_hz = 18_000.0;
@@ -2536,9 +2803,9 @@ impl Runtime {
 
             // Smooth 2-bar analog timbre breathing across Bass, Chords, Lead, and 303
             let wave = ((global as f32 / 32.0) * std::f32::consts::TAU).sin();
-            self.party_bass_cut_target = (0.75 + party_section_energy * 0.38 + wave * 0.18).clamp(0.60, 1.45);
-            self.party_pad_cut_target = (0.95 + sec.lead_brightness * 0.55 + wave * 0.25).clamp(0.85, 2.05);
-            self.party_lead_cut_target = (1.05 + sec.lead_brightness * 0.60 - wave * 0.22).clamp(0.92, 2.20);
+            self.party_bass_cut_target = (0.82 + party_section_energy * 0.24 + wave * 0.10).clamp(0.72, 1.22);
+            self.party_pad_cut_target = (0.80 + sec.lead_brightness * 0.28 + wave * 0.12).clamp(0.72, 1.24);
+            self.party_lead_cut_target = (0.84 + sec.lead_brightness * 0.28 - wave * 0.10).clamp(0.76, 1.24);
             self.party_acid_target =
                 (sec.acid_intensity * (0.65 + 0.35 * (0.5 + 0.5 * wave)) * party_section_energy.max(0.45))
                     .clamp(0.0, 1.0);
@@ -2556,25 +2823,20 @@ impl Runtime {
             if p.party_sound_morph
                 && sec.turnaround_fx
                 && self.party_bar_in_sec + 1 == sec_bars
-                && p.party_energy >= 0.60
-                && (global % 16) >= 12
+                && p.party_energy >= 0.72
+                && (global % 16) >= 14
+                && matches!(
+                    song_vibe,
+                    Vibe::Eurobeat | Vibe::EuphoricTrance | Vibe::BigRoomEdm | Vibe::ImperialBass
+                )
             {
                 let fx_roll = hash_f32(
                     p.party_seed,
                     (self.party_cycle as usize) * 17 + sec_idx,
                     777,
                 );
-                if matches!(
-                    song_vibe,
-                    Vibe::Eurobeat | Vibe::EuphoricTrance | Vibe::ImperialBass
-                ) {
-                    if fx_roll < 0.65 {
-                        self.party_repeat_fx = 0.72;
-                    }
-                } else if fx_roll < 0.45 {
-                    self.party_repeat_fx = 0.72;
-                } else if fx_roll < 0.72 && (global % 16) >= 14 {
-                    self.party_glitch_fx = 0.38;
+                if fx_roll < 0.45 {
+                    self.party_repeat_fx = 0.38;
                 }
             }
 
@@ -2701,10 +2963,8 @@ impl Runtime {
         let pat = &p.patterns[pat_idx];
         let party_phrase = (global / 64) as u32;
         let party_evolve_active = p.party_mode && (self.party_cycle > 0 || (p.party_auto_evolve && self.party_evolution > 0));
-        let song_seed = p
-            .party_seed
-            .wrapping_add(self.party_cycle.wrapping_mul(7919))
-            .wrapping_add(self.party_evolution.wrapping_mul(2053));
+        let song_identity_seed = p.party_seed.wrapping_add(self.party_cycle.wrapping_mul(7919));
+        let song_seed = song_identity_seed.wrapping_add(self.party_evolution.wrapping_mul(2053));
         let seed = if p.party_mode {
             song_seed
                 .wrapping_add((self.party_section_idx as u32).wrapping_mul(1031))
@@ -2714,10 +2974,12 @@ impl Runtime {
         };
 
         // Refresh Party DJ Melodic Song Cache whenever a new song / progression / vibe starts!
+        // Keep melodic motif/groove identity locked to song_identity_seed across sections.
         if p.party_mode {
-            let msig = (song_vibe as u8, dj_root, prog_offset, song_seed);
+            let msig = (song_vibe as u8, dj_root, prog_offset, song_identity_seed);
             if self.party_melodic_sig != msig {
-                self.party_melodic = generate_melodic_tracks(song_vibe, dj_root, prog_offset, song_seed);
+                self.party_melodic =
+                    generate_melodic_tracks(song_vibe, dj_root, prog_offset, song_identity_seed);
                 self.party_melodic_sig = msig;
             }
         }
@@ -2886,6 +3148,18 @@ impl Runtime {
             }
         }
 
+        if p.party_mode || p.song_mode {
+            for b in 0..6 {
+                self.sec_track_target[b] = if (section_mask & (1 << b)) != 0 {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+        } else {
+            self.sec_track_target = [1.0; 6];
+        }
+
         // --- 1. DRUMS (bit 0) ---
         if !drum_cut && !drop_cut_drums_groove && !drop_in_gap && (section_mask & 0b000001) != 0 {
             // Refresh Auto-Beat cache if needed
@@ -2910,6 +3184,12 @@ impl Runtime {
             };
 
             let pocket_scale = groove_pocket_scale(song_vibe);
+            // Shared cohesive backbeat layback so layered Snare + Clap NEVER flam against each other
+            let shared_backbeat_ms = if pocket_scale > 0.01 {
+                (1.1 + hash_f32(seed, global, 305) * 0.9) * pocket_scale
+            } else {
+                0.0
+            };
             let phase = global % 16;
             for lane in 0..8 {
                 let d_lane = &drum_seq.lanes[lane];
@@ -2927,8 +3207,8 @@ impl Runtime {
                         && (st.probability >= 0.999 || hash_f32(seed, global, lane as u32) <= st.probability)
                     {
                         if let Some(voice) = DrumVoiceId::from_index(lane) {
-                            // Subtle velocity humanization + per-step Pitch/Pan P-Locks + studio groove pocket
-                            let human = 0.94 + hash_f32(seed, global, lane as u32 + 99) * 0.12;
+                            // Subtle velocity humanization + per-step Pitch/Pan P-Locks + tight cohesive pocket
+                            let human = 0.96 + hash_f32(seed, global, lane as u32 + 99) * 0.08;
                             let vel = (st.velocity * human).clamp(0.1, 1.0);
                             let drums_p = if use_rig {
                                 self.party_rig.as_ref().map(|r| &r.drums).unwrap_or(&p.drums)
@@ -2937,17 +3217,15 @@ impl Runtime {
                             };
                             let delay_ms = match voice {
                                 DrumVoiceId::Kick => 0.0,
-                                DrumVoiceId::Snare | DrumVoiceId::Clap => {
-                                    (3.5 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
-                                }
+                                DrumVoiceId::Snare | DrumVoiceId::Clap => shared_backbeat_ms,
                                 DrumVoiceId::ClosedHat | DrumVoiceId::OpenHat => {
-                                    (0.6 + hash_f32(seed, global, lane as u32 + 301) * 3.0) * pocket_scale
+                                    (0.3 + hash_f32(seed, global, lane as u32 + 301) * 0.9) * pocket_scale
                                 }
                                 DrumVoiceId::CowbellRim | DrumVoiceId::Tom | DrumVoiceId::Cymbal => {
-                                    (1.2 + hash_f32(seed, global, lane as u32 + 301) * 2.5) * pocket_scale
+                                    (0.5 + hash_f32(seed, global, lane as u32 + 301) * 1.1) * pocket_scale
                                 }
                             };
-                            let delay_samples = (delay_ms * 0.001 * self.sr).min(base_step_samples * 0.22);
+                            let delay_samples = (delay_ms * 0.001 * self.sr).min(base_step_samples * 0.10);
                             if delay_samples > 1.0 {
                                 self.pending_triggers.push((
                                     delay_samples,
@@ -3049,25 +3327,70 @@ impl Runtime {
                 }
             }
 
-            // Automatic or manual turnaround Fill!
+            // Automatic or manual genre-aware turnaround Fill!
             if section_fill || self.force_fill_steps > 0 {
                 if self.force_fill_steps > 0 {
                     self.force_fill_steps -= 1;
                 }
                 if matches!(phase, 12 | 13 | 14 | 15) {
-                    let voice = if phase >= 14 {
-                        DrumVoiceId::Snare
-                    } else {
-                        DrumVoiceId::Tom
-                    };
-                    let vel = 0.58 + (phase - 12) as f32 * 0.11;
                     let drums_p = if use_rig {
                         self.party_rig.as_ref().map(|r| &r.drums).unwrap_or(&p.drums)
                     } else {
                         &p.drums
                     };
-                    self.drums
-                        .trigger(voice, vel, phase == 15, false, drums_p);
+                    match song_vibe {
+                        Vibe::Trap808 | Vibe::AtlantaTrap | Vibe::FutureBass | Vibe::Dubstep => {
+                            if phase == 14 || phase == 15 {
+                                let n = if phase == 14 { 3 } else { 2 };
+                                let sub_len = base_step_samples / n as f32;
+                                self.drums
+                                    .trigger(DrumVoiceId::ClosedHat, 0.78, false, false, drums_p);
+                                for r in 1..n {
+                                    self.ratchets.push(RatchetEvent {
+                                        lane: DrumVoiceId::ClosedHat.index(),
+                                        samples_left: sub_len * r as f32,
+                                        vel: (0.76 - r as f32 * 0.10).max(0.42),
+                                        accent: false,
+                                        tune_offset: 0.0,
+                                    });
+                                }
+                            }
+                            if phase == 15 {
+                                self.drums
+                                    .trigger(DrumVoiceId::Snare, 0.78, true, false, drums_p);
+                            }
+                        }
+                        Vibe::BoomBap | Vibe::LofiChill | Vibe::NeoSoul | Vibe::LaWestCoast => {
+                            match phase {
+                                13 => self.drums.trigger(DrumVoiceId::Snare, 0.46, false, false, drums_p),
+                                14 => self.drums.trigger(DrumVoiceId::Kick, 0.68, false, false, drums_p),
+                                15 => self.drums.trigger(DrumVoiceId::Snare, 0.72, false, false, drums_p),
+                                _ => {}
+                            }
+                        }
+                        Vibe::DeepHouse
+                        | Vibe::DetroitTechno
+                        | Vibe::AcidClub
+                        | Vibe::AmbientDub
+                        | Vibe::UkGarage => {
+                            match phase {
+                                12 | 13 => self.drums.trigger(DrumVoiceId::CowbellRim, 0.55, false, false, drums_p),
+                                14 => self.drums.trigger(DrumVoiceId::OpenHat, 0.65, false, false, drums_p),
+                                15 => self.drums.trigger(DrumVoiceId::Clap, 0.76, true, false, drums_p),
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            let voice = if phase >= 14 {
+                                DrumVoiceId::Snare
+                            } else {
+                                DrumVoiceId::Tom
+                            };
+                            let vel = 0.56 + (phase - 12) as f32 * 0.10;
+                            self.drums
+                                .trigger(voice, vel, phase == 15, false, drums_p);
+                        }
+                    }
                 }
             }
         }
@@ -3084,7 +3407,17 @@ impl Runtime {
             let m_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
             let (prim_idx, sub_idx, gate_scale) = clock_div_indices(m_div, global, seq.step_count.as_usize());
             let mut st = prim_idx.map(|i| seq.steps[i]).unwrap_or_default();
-            if p.party_mode {
+            if p.party_mode && !matches!(
+                song_vibe,
+                Vibe::BoomBap
+                    | Vibe::Trap808
+                    | Vibe::AtlantaTrap
+                    | Vibe::LaWestCoast
+                    | Vibe::LofiChill
+                    | Vibe::Dubstep
+                    | Vibe::NeoSoul
+                    | Vibe::AmbientDub
+            ) {
                 let step16 = global % 16;
                 let bass_style = (party_phrase + self.party_section_idx as u32) % 4;
                 let straight_drive_bass = matches!(
@@ -3098,6 +3431,18 @@ impl Runtime {
                         | Vibe::ItaloCosmic
                         | Vibe::Arena80s
                         | Vibe::Disco70s
+                );
+                let preserve_pocket_bass = matches!(
+                    song_vibe,
+                    Vibe::BoomBap
+                        | Vibe::Trap808
+                        | Vibe::AtlantaTrap
+                        | Vibe::LaWestCoast
+                        | Vibe::LofiChill
+                        | Vibe::Dubstep
+                        | Vibe::FutureBass
+                        | Vibe::NeoSoul
+                        | Vibe::AmbientDub
                 );
                 if straight_drive_bass {
                     if matches!(song_vibe, Vibe::Eurobeat)
@@ -3115,7 +3460,7 @@ impl Runtime {
                             ..Default::default()
                         };
                     }
-                } else {
+                } else if !preserve_pocket_bass {
                     // Clean, grounded musical groove support (no chromatic fart slides or resonant auto-wah locks)
                     if bass_style == 2 && party_section_energy >= 0.78 && step16 % 4 == 2 && !st.active {
                         st = MelodicStep {
@@ -3202,7 +3547,10 @@ impl Runtime {
             let p_div = if p.party_mode { ClockDiv::Sixteenth } else { seq.clock_div };
             let (pad_prim, pad_sub, pad_gscale) = clock_div_indices(p_div, global, seq.step_count.as_usize());
             let mut st = pad_prim.map(|i| seq.steps[i]).unwrap_or_default();
-            if p.party_mode {
+            if p.party_mode && matches!(
+                song_vibe,
+                Vibe::ElectroFunk | Vibe::Disco70s | Vibe::UkGarage
+            ) {
                 let step16 = global % 16;
                 let chord_rhythm = (party_phrase + self.party_section_idx as u32) % 3;
                 if !st.active && (step16 == 3 || step16 == 7 || step16 == 15) && party_section_energy >= 0.55 && hash_f32(seed, global, 21) < 0.48 {
@@ -3458,46 +3806,20 @@ impl Runtime {
                 let vel = (st.velocity * phrase_vel_mul(global, seed, 511)).clamp(0.15, 1.0);
                 let gate_samples = base_step_samples * mono_gscale * st.gate.clamp(0.15, 8.0);
                 let apply_party_cut = p.party_mode && p.party_sound_morph;
-                let pocket_scale = groove_pocket_scale(song_vibe);
-                let mono_delay = if global % 4 != 0 && !st.slide {
-                    let delay_ms = (0.8 + hash_f32(seed, global, 521) * 2.4) * pocket_scale;
-                    (delay_ms * 0.001 * self.sr).min(base_step_samples * 0.20)
-                } else {
-                    0.0
-                };
-                self.pending_triggers
-                    .retain(|(_, ev)| !matches!(ev, PendingTrigger::MonoNote { .. }));
                 let prev_note = self.last_mono_note.take();
                 self.last_mono_note = Some(note);
-                if mono_delay > 1.0 {
-                    self.gate_mono = gate_samples + mono_delay;
-                    self.pending_triggers.push((
-                        mono_delay,
-                        PendingTrigger::MonoNote {
-                            note,
-                            prev_note,
-                            vel,
-                            accent: st.accent,
-                            slide: st.slide,
-                            motion: st.motion,
-                            party_rig_cut: apply_party_cut,
-                            gate_samples,
-                        },
-                    ));
-                } else {
-                    self.dispatch_mono_note(
-                        p,
-                        use_rig,
-                        note,
-                        prev_note,
-                        vel,
-                        st.accent,
-                        st.slide,
-                        st.motion,
-                        apply_party_cut,
-                        gate_samples,
-                    );
-                }
+                self.dispatch_mono_note(
+                    p,
+                    use_rig,
+                    note,
+                    prev_note,
+                    vel,
+                    st.accent,
+                    st.slide,
+                    st.motion,
+                    apply_party_cut,
+                    gate_samples,
+                );
             }
             if let Some(st2) = st2_opt {
                 if st2.active
@@ -3724,6 +4046,14 @@ impl Runtime {
             self.party_rig_custom = false;
             self.party_rig = None;
             self.party_live_bpm = p.bpm;
+            self.party_fader_ref = [
+                p.mixer.channels[0].volume.max(0.15),
+                p.mixer.channels[1].volume.max(0.15),
+                p.mixer.channels[2].volume.max(0.15),
+                p.mixer.channels[3].volume.max(0.15),
+                p.mixer.channels[4].volume.max(0.15),
+                p.mixer.moog_pad_volume.max(0.15),
+            ];
         }
         self.was_party_mode = p.party_mode;
 
@@ -3768,14 +4098,21 @@ impl Runtime {
             self.drop_macro_progress = 0.0;
             self.drop_macro_target_prog = 0.0;
         }
+        if !playing || (!p.party_mode && !p.song_mode) {
+            self.sec_track_target = [1.0; 6];
+        }
+        if !playing && !self.was_playing {
+            self.sec_track_gain = [1.0; 6];
+        }
         self.was_playing = playing;
 
         // Advance step sequencer with real swing
         if playing {
             if self.tick_left <= 0.0 {
                 self.trigger_step(p, drum_cut, snare_build, telemetry);
-                self.tick_left = self.step_duration_samples(p, self.step);
-                self.last_step_dur = self.tick_left.max(1.0);
+                let next_dur = self.step_duration_samples(p, self.step);
+                self.tick_left = (self.tick_left + next_dur).max(1.0);
+                self.last_step_dur = next_dur.max(1.0);
                 self.step = self.step.wrapping_add(1);
             }
             self.tick_left -= 1.0;
@@ -3850,29 +4187,6 @@ impl Runtime {
                                 &p.moog_pad
                             };
                             self.pad_moog.note_on(note, vel, accent, false, pad_p);
-                        }
-                        PendingTrigger::MonoNote {
-                            note,
-                            prev_note,
-                            vel,
-                            accent,
-                            slide,
-                            motion,
-                            party_rig_cut,
-                            gate_samples,
-                        } => {
-                            self.dispatch_mono_note(
-                                p,
-                                use_rig_pending,
-                                note,
-                                prev_note,
-                                vel,
-                                accent,
-                                slide,
-                                motion,
-                                party_rig_cut,
-                                gate_samples,
-                            );
                         }
                         PendingTrigger::Melodic32 {
                             target,
@@ -4009,12 +4323,18 @@ impl Runtime {
                 sc_base = rig.sidechain_amount;
                 enable_303_override = rig.enable_303;
                 enable_samp_override = rig.enable_sampler;
-                vol_bass = rig.bass_vol;
-                vol_lead = rig.lead_vol;
-                vol_303 = rig.tb303_vol;
-                vol_drums = rig.drums_vol;
-                vol_samp = rig.sampler_vol;
-                vol_pad = rig.pad_vol;
+                let trim_bass = (p.mixer.channels[0].volume / self.party_fader_ref[0].max(0.15)).clamp(0.0, 1.6);
+                let trim_lead = (p.mixer.channels[1].volume / self.party_fader_ref[1].max(0.15)).clamp(0.0, 1.6);
+                let trim_303 = (p.mixer.channels[2].volume / self.party_fader_ref[2].max(0.15)).clamp(0.0, 1.6);
+                let trim_drums = (p.mixer.channels[3].volume / self.party_fader_ref[3].max(0.15)).clamp(0.0, 1.6);
+                let trim_samp = (p.mixer.channels[4].volume / self.party_fader_ref[4].max(0.15)).clamp(0.0, 1.6);
+                let trim_pad = (p.mixer.moog_pad_volume / self.party_fader_ref[5].max(0.15)).clamp(0.0, 1.6);
+                vol_bass = rig.bass_vol * trim_bass;
+                vol_lead = rig.lead_vol * trim_lead;
+                vol_303 = rig.tb303_vol * trim_303;
+                vol_drums = rig.drums_vol * trim_drums;
+                vol_samp = rig.sampler_vol * trim_samp;
+                vol_pad = rig.pad_vol * trim_pad;
             } else {
                 moog_p = p.moog.clone();
                 pad_p = p.moog_pad.clone();
@@ -4026,9 +4346,9 @@ impl Runtime {
             moog_p.cutoff = (moog_p.cutoff * self.party_bass_cut_mul).clamp(80.0, 16_000.0);
             pad_p.cutoff = (pad_p.cutoff * self.party_pad_cut_mul).clamp(160.0, 16_500.0);
             mono_p.cutoff = (mono_p.cutoff * self.party_lead_cut_mul).clamp(220.0, 17_500.0);
-            acid_p.cutoff = (acid_p.cutoff * (0.65 + self.party_acid_morph * 1.55)).clamp(90.0, 9_500.0);
-            acid_p.resonance = (acid_p.resonance + self.party_acid_morph * 0.16).clamp(0.1, 0.92);
-            acid_p.env_mod = (acid_p.env_mod + self.party_acid_morph * 0.18).clamp(0.1, 0.96);
+            acid_p.cutoff = (acid_p.cutoff * (0.72 + self.party_acid_morph * 0.62)).clamp(110.0, 3_600.0);
+            acid_p.resonance = (acid_p.resonance + self.party_acid_morph * 0.08).clamp(0.12, 0.68);
+            acid_p.env_mod = (acid_p.env_mod + self.party_acid_morph * 0.10).clamp(0.12, 0.72);
         } else {
             moog_p = p.moog.clone();
             pad_p = p.moog_pad.clone();
@@ -4146,6 +4466,20 @@ impl Runtime {
             p.fx.stereo_chorus
         };
 
+        // Smooth per-track section entrance/exit gain ramps (zero hard cuts!)
+        let drum_atk_c = one_pole_coeff(45.0, self.sr);
+        let mel_atk_c = one_pole_coeff(10.0, self.sr);
+        let sec_rel_c = one_pole_coeff(2.2, self.sr);
+        for i in 0..6 {
+            let tgt = self.sec_track_target[i];
+            let c = if tgt > self.sec_track_gain[i] {
+                if i == 0 { drum_atk_c } else { mel_atk_c }
+            } else {
+                sec_rel_c
+            };
+            self.sec_track_gain[i] += c * (tgt - self.sec_track_gain[i]);
+        }
+
         // Render all studio voices (6 core + up to 10 dynamic extra tracks!)
         let any_solo = p.mixer.channels.iter().any(|c| c.solo)
             || p.mixer.moog_pad_solo
@@ -4167,8 +4501,8 @@ impl Runtime {
         self.track_peaks[0] *= 0.9990;
         if audible(ch[0].mute, ch[0].solo) {
             let (gl, gr) = pan_gains(ch[0].pan);
-            let sl = moog_l * vol_bass * gl * 0.56;
-            let sr_v = moog_r * vol_bass * gr * 0.56;
+            let sl = moog_l * vol_bass * gl * 0.68;
+            let sr_v = moog_r * vol_bass * gr * 0.68;
             let (sl, sr_v) = self.channel_eq.process_bass((sl, sr_v));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[0].0,
@@ -4179,6 +4513,8 @@ impl Runtime {
                 self.sr,
             );
             let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[0].width);
+            let sl = sl * self.sec_track_gain[1];
+            let sr_v = sr_v * self.sec_track_gain[1];
             self.track_peaks[0] = self.track_peaks[0].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
@@ -4201,8 +4537,8 @@ impl Runtime {
         self.track_peaks[1] *= 0.9990;
         if audible(ch[1].mute, ch[1].solo) {
             let (gl, gr) = pan_gains(ch[1].pan);
-            let sl_raw = wl * vol_lead * gl * 0.82;
-            let sr_raw = wr * vol_lead * gr * 0.82;
+            let sl_raw = wl * vol_lead * gl * 0.72;
+            let sr_raw = wr * vol_lead * gr * 0.72;
             let (eq_l, eq_r) = self.channel_eq.process_lead((sl_raw, sr_raw));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[1].0,
@@ -4213,6 +4549,8 @@ impl Runtime {
                 self.sr,
             );
             let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[1].width);
+            let sl = sl * self.sec_track_gain[3];
+            let sr_v = sr_v * self.sec_track_gain[3];
             self.track_peaks[1] = self.track_peaks[1].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
@@ -4228,12 +4566,16 @@ impl Runtime {
 
         // 2: Acid / 303 — present acid/funk counter-line + 110Hz HPF & 1.6kHz bite console strip
         let acid_s = self.acid.process_sample(&acid_p) * (0.55 + 0.45 * duck);
-        let acid_mute = ch[2].mute && !enable_303_override;
+        let acid_mute = if use_morph {
+            !enable_303_override
+        } else {
+            ch[2].mute
+        };
         self.track_peaks[2] *= 0.9990;
         if audible(acid_mute, ch[2].solo) {
             let (gl, gr) = pan_gains(ch[2].pan);
-            let sl = acid_s * vol_303 * gl * 0.80;
-            let sr_v = acid_s * vol_303 * gr * 0.80;
+            let sl = acid_s * vol_303 * gl * 0.66;
+            let sr_v = acid_s * vol_303 * gr * 0.66;
             let (eq_l, eq_r) = self.channel_eq.process_acid((sl, sr_v));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[2].0,
@@ -4244,6 +4586,8 @@ impl Runtime {
                 self.sr,
             );
             let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[2].width);
+            let sl = sl * self.sec_track_gain[4];
+            let sr_v = sr_v * self.sec_track_gain[4];
             self.track_peaks[2] = self.track_peaks[2].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
@@ -4257,13 +4601,14 @@ impl Runtime {
             }
         }
 
-        // 3: Drums — TRUE STEREO preserved, punchy studio snap!
+        // 3: Drums — TRUE STEREO preserved, console polish & punchy studio snap!
         let (dl, dr) = self.drums.process_sample(&drums_p);
         self.track_peaks[3] *= 0.9990;
         if audible(ch[3].mute, ch[3].solo) {
             let (gl, gr) = pan_gains(ch[3].pan);
-            let sl = dl * vol_drums * gl * 0.62;
-            let sr_v = dr * vol_drums * gr * 0.62;
+            let sl = dl * vol_drums * gl * 0.55;
+            let sr_v = dr * vol_drums * gr * 0.55;
+            let (sl, sr_v) = self.channel_eq.process_drums((sl, sr_v));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[3].0,
                 &mut self.track_filters[3].1,
@@ -4273,6 +4618,8 @@ impl Runtime {
                 self.sr,
             );
             let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[3].width);
+            let sl = sl * self.sec_track_gain[0];
+            let sr_v = sr_v * self.sec_track_gain[0];
             self.track_peaks[3] = self.track_peaks[3].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
@@ -4300,12 +4647,16 @@ impl Runtime {
             self.volca
                 .process_stereo(&p.sample_parts, iso_b, iso_t);
         let v_duck = 0.55 + 0.45 * duck;
-        let samp_mute = ch[4].mute && !enable_samp_override;
+        let samp_mute = if use_morph {
+            !enable_samp_override
+        } else {
+            ch[4].mute
+        };
         self.track_peaks[4] *= 0.9990;
         if audible(samp_mute, ch[4].solo) {
             let (gl, gr) = pan_gains(ch[4].pan);
-            let sl_raw = (swl * gl * 0.82 + vl * v_duck * 0.80) * vol_samp;
-            let sr_raw = (swr * gr * 0.82 + vr * v_duck * 0.80) * vol_samp;
+            let sl_raw = (swl * gl * 0.76 + vl * v_duck * 0.78) * vol_samp;
+            let sr_raw = (swr * gr * 0.76 + vr * v_duck * 0.78) * vol_samp;
             let (eq_l, eq_r) = self.channel_eq.process_sampler((sl_raw, sr_raw));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.track_filters[4].0,
@@ -4316,6 +4667,8 @@ impl Runtime {
                 self.sr,
             );
             let (sl, sr_v) = apply_stereo_width(sl, sr_v, ch[4].width);
+            let sl = sl * self.sec_track_gain[5];
+            let sr_v = sr_v * self.sec_track_gain[5];
             self.track_peaks[4] = self.track_peaks[4].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
@@ -4324,8 +4677,8 @@ impl Runtime {
                 del_r += sr_v * ch[4].delay_send;
             }
             if ch[4].reverb_enabled {
-                rev_l += sl * ch[4].reverb_send + vrev_l * vol_samp * 0.55;
-                rev_r += sr_v * ch[4].reverb_send + vrev_r * vol_samp * 0.55;
+                rev_l += sl * ch[4].reverb_send + vrev_l * vol_samp * 0.55 * self.sec_track_gain[5];
+                rev_r += sr_v * ch[4].reverb_send + vrev_r * vol_samp * 0.55 * self.sec_track_gain[5];
             }
         }
 
@@ -4337,8 +4690,8 @@ impl Runtime {
             .process_stereo(pad_l * pad_duck, pad_r * pad_duck, chorus_amt.max(0.32));
         self.track_peaks[5] *= 0.9990;
         if audible(p.mixer.moog_pad_mute, p.mixer.moog_pad_solo) {
-            let sl_raw = pwl * vol_pad * 0.88;
-            let sr_raw = pwr * vol_pad * 0.88;
+            let sl_raw = pwl * vol_pad * 0.82;
+            let sr_raw = pwr * vol_pad * 0.82;
             let (eq_l, eq_r) = self.channel_eq.process_pad((sl_raw, sr_raw));
             let (sl, sr_v) = apply_track_filter(
                 &mut self.pad_filter.0,
@@ -4349,6 +4702,8 @@ impl Runtime {
                 self.sr,
             );
             let (sl, sr_v) = apply_stereo_width(sl, sr_v, p.mixer.moog_pad_width);
+            let sl = sl * self.sec_track_gain[2];
+            let sr_v = sr_v * self.sec_track_gain[2];
             self.track_peaks[5] = self.track_peaks[5].max(sl.abs().max(sr_v.abs()));
             mix_l += sl;
             mix_r += sr_v;
@@ -4515,6 +4870,7 @@ impl Runtime {
             p.bpm
         };
 
+        self.fx.set_wet_duck(0.68 + 0.32 * duck);
         let (fx_l, fx_r) = self.fx.process_stereo(
             mix_l,
             mix_r,
@@ -5370,8 +5726,9 @@ mod tests {
 
             let (_full_rms, full_peak) = render_rms_and_peak(&p, 8);
 
+            // Punchy, weighty drums now anchor the mix while synths stay clearly audible inside the pocket (>= 0.45x drums, > 0.04 per layer).
             assert!(
-                melodic_rms >= drums_rms * 0.65,
+                melodic_rms >= drums_rms * 0.45,
                 "[{:?}] Synths too quiet vs drums: melodic_rms={melodic_rms}, drums_rms={drums_rms}",
                 vibe
             );
@@ -7430,5 +7787,333 @@ mod tests {
         }
         assert!(max_side < 0.01, "Width 0.0 should collapse stereo side diff, got {max_side}");
         assert!(tel.track_peaks[5] > 0.01, "Expected track_peaks[5] (MoogPad) > 0, got {}", tel.track_peaks[5]);
+    }
+
+    #[test]
+    fn atlanta_trap_la_hiphop_rhythm_and_mix_balance_are_tight() {
+        use crate::model::{apply_vibe_to_project, party_crate_vibes, PartyMixMode};
+
+        let hh_pool = party_crate_vibes(PartyMixMode::HipHopCrate, Vibe::BoomBap, 0xFFFF_FFFF);
+        assert!(hh_pool.contains(&Vibe::AtlantaTrap));
+        assert!(hh_pool.contains(&Vibe::LaWestCoast));
+
+        for &vibe in &[Vibe::AtlantaTrap, Vibe::LaWestCoast] {
+            let mut p = Project::default();
+            apply_vibe_to_project(&mut p, vibe, None, 0x2026_1126);
+            // Drums must render clear punch alongside bass & melodic layers, zero clipping
+            let (full_rms, full_peak) = render_rms_and_peak(&p, 4);
+            assert!(full_rms > 0.05 && full_peak <= 1.0, "{vibe:?}: rms={full_rms} peak={full_peak}");
+
+            let mut solo_drums = p.clone();
+            solo_drums.mixer.channels[3].solo = true;
+            let (drums_rms, _) = render_rms_and_peak(&solo_drums, 4);
+            assert!(drums_rms > 0.025, "{vibe:?} drums too quiet: {drums_rms}");
+
+            let pat_hats = &p.current_pattern().drums.lanes[DrumVoiceId::ClosedHat.index()];
+            if vibe == Vibe::AtlantaTrap {
+                assert!(
+                    pat_hats.steps[..64].iter().any(|s| s.active && s.ratchet >= 3),
+                    "Atlanta Trap should retain 3x/4x hi-hat rolls"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_26_vibes_have_balanced_track_rms_and_headroom() {
+        use crate::model::apply_vibe_to_project;
+
+        for &vibe in &Vibe::ALL {
+            let mut p = Project::default();
+            apply_vibe_to_project(&mut p, vibe, None, 0x2026_1126);
+            let (full_rms, full_peak) = render_rms_and_peak(&p, 2);
+            assert!(
+                (0.06..=0.55).contains(&full_rms) && full_peak <= 0.985,
+                "{vibe:?} full mix out of headroom/range: rms={full_rms:.4} peak={full_peak:.4}"
+            );
+
+            let mut solo_drums = p.clone();
+            solo_drums.mixer.channels[3].solo = true;
+            let (drums_rms, _) = render_rms_and_peak(&solo_drums, 2);
+
+            let mut solo_bass = p.clone();
+            solo_bass.mixer.channels[0].solo = true;
+            let (bass_rms, _) = render_rms_and_peak(&solo_bass, 2);
+
+            let mut solo_pad = p.clone();
+            solo_pad.mixer.moog_pad_solo = true;
+            let (pad_rms, _) = render_rms_and_peak(&solo_pad, 2);
+
+            let mut solo_lead = p.clone();
+            solo_lead.mixer.channels[1].solo = true;
+            let (lead_rms, _) = render_rms_and_peak(&solo_lead, 2);
+
+            assert!(
+                drums_rms >= 0.032,
+                "{vibe:?} drums_rms too quiet: {drums_rms:.4}"
+            );
+            assert!(
+                bass_rms >= 0.025,
+                "{vibe:?} bass_rms too quiet: {bass_rms:.4}"
+            );
+            assert!(
+                pad_rms / drums_rms <= 1.85,
+                "{vibe:?} pad_rms/drums_rms too hot: pad={pad_rms:.4} drums={drums_rms:.4} ratio={:.2}",
+                pad_rms / drums_rms
+            );
+            assert!(
+                lead_rms / drums_rms <= 1.65,
+                "{vibe:?} lead_rms/drums_rms too hot: lead={lead_rms:.4} drums={drums_rms:.4} ratio={:.2}",
+                lead_rms / drums_rms
+            );
+            assert!(
+                bass_rms / drums_rms <= 2.4,
+                "{vibe:?} bass_rms/drums_rms too hot: bass={bass_rms:.4} drums={drums_rms:.4} ratio={:.2}",
+                bass_rms / drums_rms
+            );
+        }
+    }
+
+    #[test]
+    fn audio_overhaul_guardrails_keep_kicks_fat_303_musical_la_pocket_tight_and_no_stray_toms() {
+        use crate::dsp::{one_pole_coeff, Tb303Synth};
+        use crate::model::{apply_vibe_to_project, apply_voice_preset, generate_auto_beat, DrumVoiceId};
+
+        let sr = 44_100.0_f32;
+
+        // 1. Kick sub-to-click balance: low-band (<180 Hz) clearly dominates high-band (>2 kHz)
+        let low_a = one_pole_coeff(180.0, sr);
+        let hi_a = one_pole_coeff(2_000.0, sr);
+        for &kit_idx in &[0usize, 1, 8, 14] {
+            let mut p = Project::default();
+            apply_voice_preset(&mut p, TrackId::Drums, kit_idx);
+            let mut dm = DrumMachine::new(sr);
+            dm.trigger(DrumVoiceId::Kick, 1.0, false, false, &p.drums);
+            let n = (0.30 * sr) as usize;
+            let (mut lp_state, mut hp_lp_state) = (0.0_f32, 0.0_f32);
+            let (mut low_sq, mut hi_sq) = (0.0_f64, 0.0_f64);
+            for _ in 0..n {
+                let (l, r) = dm.process_sample(&p.drums);
+                let m = 0.5 * (l + r);
+                lp_state += low_a * (m - lp_state);
+                hp_lp_state += hi_a * (m - hp_lp_state);
+                let hi = m - hp_lp_state;
+                low_sq += (lp_state as f64) * (lp_state as f64);
+                hi_sq += (hi as f64) * (hi as f64);
+            }
+            let low_rms = (low_sq / n as f64).sqrt() as f32;
+            let hi_rms = (hi_sq / n as f64).sqrt() as f32;
+            assert!(
+                low_rms > hi_rms * 2.5,
+                "Kit {kit_idx} kick lacks warm sub vs click: low={low_rms:.4}, hi={hi_rms:.4}"
+            );
+        }
+
+        // 2. TB-303 AcidClub has controlled HF harshness (>3.5 kHz RMS < 0.45 * total RMS)
+        let mut acid_p = Project::default();
+        apply_vibe_to_project(&mut acid_p, Vibe::AcidClub, None, 0xAC1D_2026);
+        let mut tb = Tb303Synth::new(sr);
+        let acid_hi_a = one_pole_coeff(3_500.0, sr);
+        let mut acid_hi_lp = 0.0_f32;
+        let mut tot_sq = 0.0_f64;
+        let mut acid_hi_sq = 0.0_f64;
+        let step_samples = (60.0 / acid_p.bpm / 4.0 * sr) as usize;
+        let mut total_n = 0usize;
+        for step_idx in 0..16 {
+            let st = acid_p.current_pattern().tb303.steps[step_idx];
+            if st.active {
+                tb.set_motion_locks(st.motion);
+                tb.note_on(st.note, st.velocity, st.accent, st.slide);
+            }
+            let gate_n = ((st.gate * step_samples as f32) as usize).clamp(64, step_samples * 2);
+            for i in 0..step_samples {
+                if st.active && i == gate_n {
+                    tb.note_off(st.note);
+                }
+                let s = tb.process_sample(&acid_p.tb303);
+                tot_sq += (s as f64) * (s as f64);
+                acid_hi_lp += acid_hi_a * (s - acid_hi_lp);
+                let hi = s - acid_hi_lp;
+                acid_hi_sq += (hi as f64) * (hi as f64);
+                total_n += 1;
+            }
+        }
+        let acid_tot_rms = (tot_sq / total_n as f64).sqrt() as f32;
+        let acid_hi_rms = (acid_hi_sq / total_n as f64).sqrt() as f32;
+        assert!(
+            acid_tot_rms > 0.02 && acid_hi_rms < acid_tot_rms * 0.45,
+            "AcidClub 303 too harsh: tot={acid_tot_rms:.4}, hi3.5k={acid_hi_rms:.4}"
+        );
+
+        // 3. LaWestCoast has strong bass, punchy drums, controlled lead, and no static drone notes (gate <= 3.0)
+        let mut la = Project::default();
+        apply_vibe_to_project(&mut la, Vibe::LaWestCoast, None, 0x1A20_2601);
+        let mut solo_la_drums = la.clone();
+        solo_la_drums.mixer.channels[3].solo = true;
+        let (la_drums_rms, _) = render_rms_and_peak(&solo_la_drums, 4);
+        let mut solo_la_bass = la.clone();
+        solo_la_bass.mixer.channels[0].solo = true;
+        let (la_bass_rms, _) = render_rms_and_peak(&solo_la_bass, 4);
+        let mut solo_la_lead = la.clone();
+        solo_la_lead.mixer.channels[1].solo = true;
+        let (la_lead_rms, _) = render_rms_and_peak(&solo_la_lead, 4);
+        assert!(la_bass_rms >= 0.035, "LaWestCoast bass too weak: {la_bass_rms:.4}");
+        assert!(
+            la_lead_rms <= la_drums_rms * 1.25,
+            "LaWestCoast lead too loud over drums: lead={la_lead_rms:.4}, drums={la_drums_rms:.4}"
+        );
+        let max_la_gate = la
+            .current_pattern()
+            .monologue
+            .steps
+            .iter()
+            .filter(|s| s.active)
+            .map(|s| s.gate)
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_la_gate <= 3.0,
+            "LaWestCoast lead has static drone gate={max_la_gate:.2}"
+        );
+
+        // 4. No random Tom steps injected on LaWestCoast, AtlantaTrap, AcidClub, or DeepHouse across seeds
+        for &vibe in &[Vibe::LaWestCoast, Vibe::AtlantaTrap, Vibe::AcidClub, Vibe::DeepHouse] {
+            for seed_i in 0..8u32 {
+                let beat = generate_auto_beat(vibe, 0.85, 0x1000_0001 + seed_i * 0x9E37);
+                assert!(
+                    beat.lanes[DrumVoiceId::Tom.index()]
+                        .steps
+                        .iter()
+                        .all(|s| !s.active),
+                    "{vibe:?} seed {seed_i} generated stray Tom hits!"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn party_identity_fader_trims_and_section_ramps_work() {
+        use crate::model::{apply_vibe_to_project, build_party_song_rig_with_reroll};
+
+        // 1) Cycle-0 Party Rig preserves muted sampler & exact user mixer balance on AtlantaTrap
+        let mut trap = Project::default();
+        apply_vibe_to_project(&mut trap, Vibe::AtlantaTrap, None, 0x1234_5678);
+        assert!(trap.mixer.channels[4].mute);
+        let rig = build_party_song_rig_with_reroll(&trap, Vibe::AtlantaTrap, 0, 0x1234_5678, true, 0);
+        assert!(!rig.enable_sampler, "Cycle-0 rig must respect muted sampler on AtlantaTrap");
+        assert!((rig.drums_vol - trap.mixer.channels[3].volume).abs() < 1e-5);
+        assert!((rig.bass_vol - trap.mixer.channels[0].volume).abs() < 1e-5);
+
+        // 2) Party Mode keeps melodic motif identity stable across sections and respects fader trims
+        let mut p = Project::default();
+        apply_vibe_to_project(&mut p, Vibe::DeepHouse, None, 0x55AA_1122);
+        p.party_mode = true;
+        p.party_sound_morph = true;
+        let mut rt = Runtime::new(44_100.0);
+        let mut tel = EngineTelemetry::default();
+        // Start playing at cycle 0
+        for _ in 0..2048 {
+            let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+            assert!(l.is_finite() && r.is_finite());
+        }
+        let first_sig = rt.party_melodic_sig;
+        // Advance through sections within cycle 0
+        rt.handle_live_event(LiveEvent::NextPartySection, &p);
+        for _ in 0..2048 {
+            let (l, r) = rt.process_sample(&p, true, false, false, 0, &mut tel);
+            assert!(l.is_finite() && r.is_finite());
+        }
+        assert_eq!(first_sig.3, rt.party_melodic_sig.3, "Song identity seed must stay fixed across sections");
+
+        // User fader trim to 0.0 silences Lead even in sound_morph Party Mode
+        p.mixer.channels[1].volume = 0.0;
+        for _ in 0..4096 {
+            let _ = rt.process_sample(&p, true, false, false, 0, &mut tel);
+        }
+        assert!(tel.track_peaks[1] < 0.01, "Expected lead peak near 0 when fader is 0.0, got {}", tel.track_peaks[1]);
+    }
+
+    #[test]
+    fn party_dj_picks_genre_authentic_kits_and_ensemble_density() {
+        use crate::model::{apply_vibe_to_project, build_party_song_rig_with_reroll};
+
+        let mut base = Project::default();
+        apply_vibe_to_project(&mut base, Vibe::AtlantaTrap, None, 0x2026_1126);
+
+        // 1) Purge misfit woodwind/plucked presets across modern electronic/hip-hop/rock pools
+        let checked_vibes = [
+            Vibe::AtlantaTrap,
+            Vibe::Trap808,
+            Vibe::LaWestCoast,
+            Vibe::LofiChill,
+            Vibe::AmbientDub,
+            Vibe::IndieRock,
+            Vibe::Arena80s,
+            Vibe::EuphoricTrance,
+            Vibe::Eurobeat,
+            Vibe::ImperialBass,
+        ];
+        for &vibe in &checked_vibes {
+            for cycle in 1..=8u32 {
+                let rig = build_party_song_rig_with_reroll(&base, vibe, cycle, 0xFACE_0000 + cycle, true, cycle % 3);
+                let mono_p = rig.voice_presets[3];
+                let pad_p = rig.voice_presets[2];
+                assert!(
+                    ![24, 25, 27, 28].contains(&mono_p),
+                    "{vibe:?} cycle {cycle} picked misfit Monologue preset {mono_p}"
+                );
+                assert_ne!(
+                    pad_p, 24,
+                    "{vibe:?} cycle {cycle} picked Concert Flute Pad (24)"
+                );
+            }
+        }
+
+        // 2) AtlantaTrap picks Trap 808 kits only, lean 4-instrument density, and Hip-Hop/Verse-Hook template
+        let mut p = Project::default();
+        apply_vibe_to_project(&mut p, Vibe::AtlantaTrap, None, 0x7777_8888);
+        assert!(![24, 25, 27, 28].contains(&p.voice_presets[3]));
+        for cycle in 1..=6u32 {
+            let rig = build_party_song_rig_with_reroll(&p, Vibe::AtlantaTrap, cycle, 0x7777_8888, true, 0);
+            assert!(
+                matches!(rig.voice_presets[0], 8 | 20),
+                "AtlantaTrap cycle {cycle} picked non-trap kit {}",
+                rig.voice_presets[0]
+            );
+            assert!(!rig.enable_303 && !rig.enable_sampler);
+            assert_eq!(rig.ensemble_mask, 0b001111);
+        }
+
+        // 3) Switching Party DJ from AcidClub / ElectroFunk (303+Sampler unmuted) into AtlantaTrap silences 303 & Sampler
+        let mut from_club = Project::default();
+        apply_vibe_to_project(&mut from_club, Vibe::AcidClub, None, 0x1122_3344);
+        from_club.mixer.channels[2].mute = false;
+        from_club.mixer.channels[4].mute = false;
+        from_club.party_mode = true;
+        from_club.party_sound_morph = true;
+        let mut rt = Runtime::new(44_100.0);
+        let mut tel = EngineTelemetry::default();
+        rt.handle_live_event(LiveEvent::QueueNextPartyVibe(Some(Vibe::AtlantaTrap)), &from_club);
+        rt.handle_live_event(LiveEvent::NextPartySong, &from_club);
+        assert!(
+            matches!(rt.party_template_idx, 3 | 4),
+            "Expected Hip-Hop/Verse-Hook template (3 or 4) for AtlantaTrap, got {}",
+            rt.party_template_idx
+        );
+        for _ in 0..8192 {
+            let (l, r) = rt.process_sample(&from_club, true, false, false, 0, &mut tel);
+            assert!(l.is_finite() && r.is_finite());
+        }
+        assert!(
+            tel.track_peaks[2] < 0.005 && tel.track_peaks[4] < 0.005,
+            "Expected 303 and Sampler silenced in AtlantaTrap, got 303={} samp={}",
+            tel.track_peaks[2],
+            tel.track_peaks[4]
+        );
+
+        // 4) Genre ensemble contrast: ImperialBass enables Sampler; AcidClub enables 303 & mutes Sampler
+        let imp_rig = build_party_song_rig_with_reroll(&p, Vibe::ImperialBass, 1, 0x9999, true, 0);
+        assert!(!imp_rig.enable_303 && imp_rig.enable_sampler);
+        let acid_rig = build_party_song_rig_with_reroll(&p, Vibe::AcidClub, 1, 0x9999, true, 0);
+        assert!(acid_rig.enable_303 && !acid_rig.enable_sampler);
     }
 }

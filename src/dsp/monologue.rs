@@ -225,7 +225,16 @@ impl MonologueSynth {
             self.note_age_s = 0.0;
             self.chiff_env = 1.0;
             self.trig_count = self.trig_count.wrapping_add(1);
-            self.pitch_scoop = if self.trig_count % 2 == 0 { 0.022 } else { -0.018 };
+            let is_pure_solo = params.vco2_level <= 0.15
+                && params.vco1_wave == MonologueOscWave::Triangle
+                && params.mod_mode == Osc2ModMode::Off;
+            self.pitch_scoop = if is_pure_solo {
+                0.0
+            } else if self.trig_count % 2 == 0 {
+                0.022
+            } else {
+                -0.018
+            };
             self.eg.trigger();
             self.amp_env.trigger();
             if params.lfo_mode == LfoMode::OneShot {
@@ -505,9 +514,12 @@ impl MonologueSynth {
         self.pwm_phase = (self.pwm_phase + 0.42 / sr).fract();
         let pwm_lfo = (self.pwm_phase * std::f32::consts::TAU).sin();
 
+        let is_pure_solo = params.vco2_level <= 0.15
+            && params.vco1_wave == MonologueOscWave::Triangle
+            && params.mod_mode == Osc2ModMode::Off;
         let vco1 = monologue_wave(params.vco1_wave, self.phase1, dt1, shape1, eg_val, pwm_lfo);
         let vco1_b = monologue_wave(params.vco1_wave, self.phase1_b, dt1_b, shape1, eg_val, pwm_lfo);
-        let (p2_mod, p2_b_mod) = if params.mod_mode == Osc2ModMode::Off {
+        let (p2_mod, p2_b_mod) = if params.mod_mode == Osc2ModMode::Off && !is_pure_solo {
             let xmod_reg = ((self.current_midi - 48.0) / 18.0).clamp(0.2, 1.0);
             let xmod = vco1 * (0.018 + shape1 * 0.028) * xmod_reg;
             (
@@ -519,10 +531,17 @@ impl MonologueSynth {
         };
         let vco2 = monologue_wave(params.vco2_wave, p2_mod, dt2, shape2, eg_val, -pwm_lfo);
         let vco2_b = monologue_wave(params.vco2_wave, p2_b_mod, dt2_b, shape2, eg_val, -pwm_lfo);
-        let sub_scale = ((64.0 - self.current_midi) / 24.0).clamp(0.12, 1.0);
+        let sub_scale = if is_pure_solo {
+            0.0
+        } else {
+            ((64.0 - self.current_midi) / 24.0).clamp(0.12, 1.0)
+        };
         let sub_body = osc_sub_warm(self.sub_phase) * 0.22 * sub_scale;
 
-        let chiff = if self.chiff_env > 0.0005 {
+        let chiff = if is_pure_solo {
+            self.chiff_env = 0.0;
+            0.0
+        } else if self.chiff_env > 0.0005 {
             self.chiff_env *= (-1.0 / (0.0095 * sr)).exp();
             let chiff_hz =
                 (2100.0 + ((self.current_midi - 48.0).max(0.0) * 55.0)).clamp(1800.0, 5200.0);
@@ -554,10 +573,15 @@ impl MonologueSynth {
                 ((core + spread) * 0.58, (core - spread) * 0.58)
             }
             Osc2ModMode::Off => {
-                let core = vco1 * params.vco1_level * 0.56 + vco2 * params.vco2_level * 0.56 + sub_body;
-                let l = (core + vco1_b * params.vco1_level * 0.44 + vco2_b * params.vco2_level * 0.12) * 0.52;
-                let r = (core + vco2_b * params.vco2_level * 0.44 + vco1_b * params.vco1_level * 0.12) * 0.52;
-                (l, r)
+                if is_pure_solo {
+                    let pure = vco1 * params.vco1_level * 0.92;
+                    (pure, pure)
+                } else {
+                    let core = vco1 * params.vco1_level * 0.56 + vco2 * params.vco2_level * 0.56 + sub_body;
+                    let l = (core + vco1_b * params.vco1_level * 0.44 + vco2_b * params.vco2_level * 0.12) * 0.52;
+                    let r = (core + vco2_b * params.vco2_level * 0.44 + vco1_b * params.vco1_level * 0.12) * 0.52;
+                    (l, r)
+                }
             }
         };
         osc_l += chiff;
@@ -649,7 +673,9 @@ impl MonologueSynth {
                     + read_ring_hermite(&self.ens_buf_l, self.ens_pos, d_r2));
 
             let reg_scale = ((self.current_midi - 46.0) / 16.0).clamp(0.25, 1.0);
-            let chorus_wet = if params.mod_mode == Osc2ModMode::Off {
+            let chorus_wet = if is_pure_solo {
+                0.06
+            } else if params.mod_mode == Osc2ModMode::Off {
                 0.22
             } else {
                 0.14
@@ -703,9 +729,14 @@ fn monologue_wave(
         }
         MonologueOscWave::Triangle => {
             let t = osc_tri_aa(phase, dt);
-            let warm = soft_tanh(t * (1.0 + shape * 1.6)) * 0.85;
-            let sparkle = (phase * 2.0 * std::f32::consts::TAU).sin() * shape * eg_val * 0.28;
-            warm + sparkle
+            if shape <= 0.12 {
+                // Smooth singing Minimoog triangle+sine solo purity
+                t * 0.72 + (phase * std::f32::consts::TAU).sin() * 0.28
+            } else {
+                let warm = soft_tanh(t * (1.0 + shape * 1.6)) * 0.85;
+                let sparkle = (phase * 2.0 * std::f32::consts::TAU).sin() * shape * eg_val * 0.28;
+                warm + sparkle
+            }
         }
         MonologueOscWave::Square => {
             let duty = (0.50 - shape * 0.36 + 0.045 * pwm_lfo).clamp(0.10, 0.90);

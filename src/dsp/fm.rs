@@ -252,6 +252,7 @@ impl FmSynth {
 
         let mut mix_l = 0.0_f32;
         let mut mix_r = 0.0_f32;
+        let mut poly_env_sum = 0.0_f32;
 
         for v in &mut self.voices {
             if !v.active {
@@ -322,10 +323,10 @@ impl FmSynth {
             };
 
             let (r0, r1, r2, r3): (f32, f32, f32, f32) = match bank {
-                // 0: DX7 Suitcase Rhodes EP ([Op1(14)->Op0(1)] tine + [Op3(1,fb)->Op2(1.003)] warm body)
-                0 => (1.0, 14.0, 1.003, 1.0),
-                // 1: Glass Bell ([Op1(3.5)->Op0(1)] + [Op3(5.404)->Op2(2.004)])
-                1 => (1.0, 3.5, 2.004, 5.404),
+                // 0: DX7 Suitcase Rhodes EP ([Op1(7)->Op0(1)] warm tine + [Op3(1,fb)->Op2(1.003)] mellow body)
+                0 => (1.0, 7.0, 1.003, 1.0),
+                // 1: Warm Celesta / Atmos Bell ([Op1(2.0)->Op0(1)] + [Op3(3.0)->Op2(1.002)])
+                1 => (1.0, 2.0, 1.002, 3.0),
                 // 2: Woody Marimba / Funk Clav ([Op1(4.0)->Op0(1)] + [Op3(2.76)->Op2(1.0)])
                 2 => (1.0, 4.0, 1.0, 2.76),
                 // 3: FM Slap / Lately Bass ([Op3(1,fb)->Op2(2)->Op1(1)->Op0(1)])
@@ -345,26 +346,29 @@ impl FmSynth {
             let p = v.phases;
             let (sig_l, sig_r) = match bank {
                 0 => {
-                    // DX7 Rhodes EP: crisp tine sparkle + warm feedback body + stereo tremolo
-                    let op1 = (p[1] * TAU).sin() * e_tine * (0.48 + 0.72 * morph) * ratio_atten(r1);
-                    let car_tine = (p[0] * TAU + op1 * vel_bright * 0.65).sin();
+                    // Warm Suitcase Rhodes EP: gentle tine sparkle (tamed on upper keys) + singing tube bark body
+                    let hi_tame = (1.0 - ((v.current_midi - 62.0) / 24.0).clamp(0.0, 0.65)).max(0.25);
+                    let op1 = (p[1] * TAU).sin() * e_tine * (0.32 + 0.42 * morph) * hi_tame * ratio_atten(r1);
+                    let car_tine = (p[0] * TAU + op1 * vel_bright * 0.42).sin();
 
-                    let op3_in = p[3] * TAU + v.fb_prev * 0.34;
+                    let op3_in = p[3] * TAU + v.fb_prev * 0.24;
                     let op3 = op3_in.sin();
                     v.fb_prev = 0.5 * (v.fb_prev + op3);
-                    let idx_body = (1.15 + morph * 1.45) * e_body * vel_bright * ratio_atten(r3);
+                    let idx_body = (0.78 + morph * 0.92) * e_body * vel_bright * ratio_atten(r3);
                     let car_body = (p[2] * TAU + op3 * idx_body).sin();
+                    let warm_body = car_body + 0.12 * car_body * car_body;
 
-                    let s = car_body * 0.76 + car_tine * (0.28 + 0.18 * e_tine);
+                    let s = warm_body * 0.84 + car_tine * (0.14 + 0.12 * e_tine);
                     (s * trem_l, s * trem_r)
                 }
                 1 => {
-                    // Glass Bell: shimmering stereo inharmonic crystal carriers
-                    let op1 = (p[1] * TAU).sin() * (1.55 * e_tine * vel_bright) * ratio_atten(r1);
+                    // Warm Atmos Celesta / Bell: pure grounded fundamental + soft stereo harmonic shimmer
+                    let op1 = (p[1] * TAU).sin() * (0.82 * e_tine * vel_bright) * ratio_atten(r1);
                     let c1 = (p[0] * TAU + op1).sin();
-                    let op3 = (p[3] * TAU).sin() * (1.25 * e_spark * vel_bright) * ratio_atten(r3);
-                    let c2 = (p[2] * TAU + op3).sin() * (0.62 + 0.25 * e_tine);
-                    (c1 * 0.65 + c2 * 0.42, c1 * 0.48 + c2 * 0.65)
+                    let op3 = (p[3] * TAU).sin() * (0.62 * e_spark * vel_bright) * ratio_atten(r3);
+                    let c2 = (p[2] * TAU + op3).sin() * (0.48 + 0.20 * e_tine);
+                    let fund = (p[0] * TAU).sin() * 0.34;
+                    (c1 * 0.56 + c2 * 0.30 + fund, c1 * 0.38 + c2 * 0.48 + fund)
                 }
                 2 => {
                     // Woody Marimba / Funk Clav
@@ -410,9 +414,9 @@ impl FmSynth {
                 }
             };
 
-            let filt_oct = env_amount * e_tine * 1.8 + (v.velocity - 0.55) * 0.7;
-            // Open filter wide enough for FM glass partials to breathe unless cutoff is pulled down
-            let eff_cut = (cutoff.max(1200.0) * 2.0_f32.powf(filt_oct)).clamp(180.0, sr * 0.43);
+            let filt_oct = env_amount * e_tine * 1.4 + (v.velocity - 0.55) * 0.55;
+            // Respect warm/dark cutoff presets while letting bright bells shimmer cleanly
+            let eff_cut = (cutoff.max(380.0) * 2.0_f32.powf(filt_oct)).clamp(180.0, sr * 0.43);
             let fl = v.filter_l.process_lp_analog(sig_l, eff_cut, res, drive);
             let fr = v.filter_r.process_lp_analog(sig_r, eff_cut, res, drive);
 
@@ -433,9 +437,16 @@ impl FmSynth {
                 let p_norm = (v.pan * 0.45 + 0.5).clamp(0.0, 1.0);
                 let pan_l = (1.0 - p_norm).sqrt() * 1.4142;
                 let pan_r = p_norm.sqrt() * 1.4142;
+                poly_env_sum += a_env;
                 mix_l += cl * amp * pan_l;
                 mix_r += cr * amp * pan_r;
             }
+        }
+
+        if poly_mode && poly_env_sum > 1.0 {
+            let norm = 1.0 / poly_env_sum.powf(0.28);
+            mix_l *= norm;
+            mix_r *= norm;
         }
 
         let (mut out_l, mut out_r) = (
